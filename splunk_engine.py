@@ -3,10 +3,22 @@ from __future__ import annotations
 import configparser
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
+try:
+    from PySide6.QtCore import QObject, Signal  # type: ignore
+except Exception:  # PySide6 may not be installed for Tk-only usage
+    class QObject:  # minimal fallback
+        pass
+
+    class Signal:  # minimal fallback that provides an emit() method
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def emit(self, *args, **kwargs):
+            return None
 import requests
 
 
@@ -39,12 +51,19 @@ def load_config(path: str = "config.ini") -> SplunkConfig:
     return SplunkConfig(servers=servers, username=username, password=password)
 
 
-class SplunkClient:
+class SplunkClient(QObject):
+    finished = Signal()
+    error = Signal(str)
+    apps_loaded = Signal(list)
+    searches_loaded = Signal(list, list)
+    dispatch_log = Signal(list)
+
     def __init__(self, base_url: str, username: str, password: str):
+        super().__init__()
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
         self.session.auth = (username, password)
-        # Lab usage: disable SSL verification. Change if you need strict TLS.
+        # For now, do not verify SSL (lab use). You can change this later.
         self.session.verify = False
         self.session.headers.update(
             {
@@ -73,113 +92,66 @@ class SplunkClient:
         except json.JSONDecodeError:
             return {"_raw": resp.text}
 
-    def list_apps(self) -> List[str]:
-        data = self._get("/services/apps/local")
-        apps: List[str] = []
-        for entry in data.get("entry", []):
-            content = entry.get("content", {})
-            if not content.get("visible", False):
-                continue
-            name = entry.get("name")
-            if name in {
-                "launcher",
-                "splunk_instrumentation",
-                "user-prefs",
-                "gettingstarted",
-            }:
-                continue
-            apps.append(name)
-        return sorted(apps)
+    def list_apps(self):
+        try:
+            data = self._get("/services/apps/local")
+            apps: List[str] = []
+            for entry in data.get("entry", []):
+                content = entry.get("content", {})
+                if not content.get("visible", False):
+                    continue
+                name = entry.get("name")
+                # Filter similar to original tool
+                if name in {
+                    "launcher",
+                    "splunk_instrumentation",
+                    "user-prefs",
+                    "gettingstarted",
+                }:
+                    continue
+                apps.append(name)
+            apps_sorted = sorted(apps)
+            self.apps_loaded.emit(apps_sorted)
+            return apps_sorted
+        except Exception as e:
+            self.error.emit(f"Failed to list apps: {e!r}")
+        finally:
+            self.finished.emit()
 
-    def list_saved_searches(self, app: str) -> Tuple[List[str], List[str], List[bool]]:
-        data = self._get(f"/servicesNS/-/{app}/saved/searches")
-        ids: List[str] = []
-        names: List[str] = []
-        email_flags: List[bool] = []
-        for entry in data.get("entry", []):
-            acl = entry.get("acl", {})
-            if acl.get("app") != app:
-                continue
-            ids.append(entry.get("id", ""))
-            names.append(entry.get("name", ""))
-            content = entry.get("content", {})
-            email_value = str(content.get("action.email", "0")).lower()
-            email_flags.append(email_value not in {"0", "", "false", "none"})
-        return ids, names, email_flags
-
-    def get_saved_search_time_range(self, report_id_url: str) -> Dict[str, Optional[str]]:
-        """
-        Read time range fields from a saved search.
-
-        Returns a dict with keys:
-        - earliest_time
-        - latest_time
-        - dispatch.earliest_time
-        - dispatch.latest_time
-        Missing values are returned as None.
-        """
-        path = urlparse(report_id_url).path
-        data = self._get(path)
-        entry = data.get("entry", [{}])[0]
-        content = entry.get("content", {})
-
-        keys = (
-            "earliest_time",
-            "latest_time",
-            "dispatch.earliest_time",
-            "dispatch.latest_time",
-        )
-        original: Dict[str, Optional[str]] = {}
-        for key in keys:
-            value = content.get(key)
-            original[key] = str(value) if value not in (None, "") else None
-        return original
-
-    def set_saved_search_time_range(
-        self, report_id_url: str, start: datetime, end: datetime
-    ) -> None:
-        """
-        Update earliest/latest fields on a saved search for a specific slice.
-        Uses absolute ISO UTC strings so that both the saved search definition
-        and dispatch.* fields see the same window.
-        """
-        def _to_splunk_iso(dt: datetime) -> str:
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            else:
-                dt = dt.astimezone(timezone.utc)
-            return dt.strftime("%Y-%m-%dT%H:%M:%S%z")
-
-        earliest_str = _to_splunk_iso(start)
-        latest_str = _to_splunk_iso(end)
-
-        path = urlparse(report_id_url).path
-        data = {
-            "earliest_time": earliest_str,
-            "latest_time": latest_str,
-            "dispatch.earliest_time": earliest_str,
-            "dispatch.latest_time": latest_str,
-        }
-        self._post(path, data=data)
-
-    def restore_saved_search_time_range(
-        self, report_id_url: str, original: Dict[str, Optional[str]]
-    ) -> None:
-        """
-        Restore earliest/latest fields on a saved search to their original values.
-        """
-        path = urlparse(report_id_url).path
-        data: Dict[str, str] = {}
-        for key in (
-            "earliest_time",
-            "latest_time",
-            "dispatch.earliest_time",
-            "dispatch.latest_time",
-        ):
-            if key in original and original[key] is not None:
-                data[key] = original[key]  # type: ignore[assignment]
-        if data:
-            self._post(path, data=data)
+    def list_saved_searches(self, app: str):
+        try:
+            data = self._get(f"/servicesNS/-/{app}/saved/searches")
+            ids: List[str] = []
+            names: List[str] = []
+            email_flags: List[bool] = []
+            for entry in data.get("entry", []):
+                acl = entry.get("acl", {})
+                if acl.get("app") != app:
+                    continue
+                ids.append(entry.get("id", ""))
+                names.append(entry.get("name", ""))
+                # Detect if the saved search has an email action enabled.
+                content = entry.get("content", {})
+                flag = False
+                # Common Splunk saved search structures may include 'action.email'
+                # or an 'actions' collection indicating enabled actions.
+                ae = content.get("action.email")
+                if ae in (1, "1", True, "true", "True"):
+                    flag = True
+                else:
+                    acts = content.get("actions")
+                    if isinstance(acts, dict) and acts.get("email"):
+                        flag = True
+                    elif isinstance(acts, list) and "email" in acts:
+                        flag = True
+                email_flags.append(flag)
+            # Keep existing signal for compatibility (two-arg signature).
+            self.searches_loaded.emit(ids, names)
+            return ids, names, email_flags
+        except Exception as e:
+            self.error.emit(f"Failed to list saved searches for app '{app}': {e!r}")
+        finally:
+            self.finished.emit()
 
     def dispatch_saved_search(
         self,
@@ -193,21 +165,31 @@ class SplunkClient:
 
         Returns (ok, sid, error_message).
         """
-        path = urlparse(report_id_url).path
+        path = urlparse(report_id_url).path  # /servicesNS/.../saved/searches/<name>
         data: dict = {}
         if trigger_actions:
-            # Splunk expects string values for flags
-            data["trigger_actions"] = "1"
-        # For saved searches, override dispatch.* fields
+            data["trigger_actions"] = 1
         if earliest is not None:
             data["dispatch.earliest_time"] = earliest
         if latest is not None:
             data["dispatch.latest_time"] = latest
 
         try:
-            payload = self._post(path + "/dispatch", data=data)
+            resp = self.session.post(
+                self.base_url + path + "/dispatch",
+                data={"output_mode": "json", **data},
+                timeout=60,
+            )
         except Exception as e:
-            return False, None, f"Request error: {e}"
+            return False, None, f"Request error: {e!r}"
+
+        if resp.status_code not in (200, 201):
+            return False, None, f"HTTP {resp.status_code}: {resp.text[:500]}"
+
+        try:
+            payload = resp.json()
+        except json.JSONDecodeError:
+            return False, None, f"Non-JSON response: {resp.text[:500]}"
 
         sid = payload.get("sid")
         if not sid:
@@ -310,7 +292,7 @@ def run_dispatch_single(
         ok, sid, err = client.dispatch_saved_search(report_id_url)
         if not ok:
             logs.append(f"  FAILED: {err}")
-        else:
+        elif sid is not None:
             state, info = client.check_job_status(sid)
             if state == "SUCCESS":
                 logs.append(f"  OK (sid={sid})")
@@ -320,7 +302,7 @@ def run_dispatch_single(
                 )
             else:
                 logs.append(
-                    f"  UNKNOWN (sid={sid}) - job still running / timeout while checking"
+                    f"  UNKNOWN (sid={sid}) – job still running / timeout while checking"
                 )
         return logs
 
@@ -339,13 +321,17 @@ def run_dispatch_single(
         earliest = to_epoch(s)
         latest = to_epoch(e)
         logs.append(
-            f"  [{i}/{len(starts)}] Earliest: {s}, Latest: {e} - sending..."
+            f"  [{i}/{len(starts)}] Earliest: {s}, Latest: {e} – sending..."
         )
         ok, sid, err = client.dispatch_saved_search(
             report_id_url, earliest=earliest, latest=latest
         )
         if not ok:
             logs.append(f"  [{i}/{len(starts)}] FAILED: {err}")
+            continue
+
+        if sid is None:
+            logs.append(f"  [{i}/{len(starts)}] FAILED: No sid returned")
             continue
 
         state, info = client.check_job_status(sid)
@@ -357,7 +343,7 @@ def run_dispatch_single(
             )
         else:
             logs.append(
-                f"  [{i}/{len(starts)}] UNKNOWN (sid={sid}) - job still running / timeout while checking"
+                f"  [{i}/{len(starts)}] UNKNOWN (sid={sid}) – job still running / timeout while checking"
             )
 
     return logs
@@ -373,50 +359,52 @@ def run_dispatch_multi(
     end: datetime,
     no_change: bool,
 ) -> List[str]:
-    if not selected_indices:
-        raise ValueError("No reports selected.")
+    try:
+        logs: List[str] = []
+        if not selected_indices:
+            raise ValueError("No reports selected.")
 
-    logs: List[str] = []
-    logs.append(
-        f"Starting dispatch for {len(selected_indices)} report(s) - frequency={frequency}, range={start} -> {end}, no_change={no_change}"
-    )
+        logs.append(
+            f"Starting dispatch for {len(selected_indices)} report(s) – frequency={frequency}, range={start} → {end}, no_change={no_change}"
+        )
 
-    ok_count = 0
-    fail_count = 0
-    unknown_count = 0
+        ok_count = 0
+        fail_count = 0
+        unknown_count = 0
 
-    for idx_num, i in enumerate(selected_indices, start=1):
-        report_id_url = report_ids[i]
-        report_name = report_names[i]
+        for idx_num, i in enumerate(selected_indices, start=1):
+            report_id_url = report_ids[i]
+            report_name = report_names[i]
+
+            logs.append("")
+            logs.append(f"=== [{idx_num}/{len(selected_indices)}] {report_name} ===")
+
+            report_logs = run_dispatch_single(
+                client,
+                report_id_url=report_id_url,
+                report_name=report_name,
+                frequency=frequency,
+                start=start,
+                end=end,
+                no_change=no_change,
+            )
+            logs.extend(report_logs)
+
+            if any("FAILED" in line for line in report_logs):
+                fail_count += 1
+            elif any("UNKNOWN" in line for line in report_logs):
+                unknown_count += 1
+            else:
+                ok_count += 1
 
         logs.append("")
-        logs.append(f"=== [{idx_num}/{len(selected_indices)}] {report_name} ===")
-
-        report_logs = run_dispatch_single(
-            client,
-            report_id_url=report_id_url,
-            report_name=report_name,
-            frequency=frequency,
-            start=start,
-            end=end,
-            no_change=no_change,
+        logs.append(
+            f"Summary: {ok_count} OK, {fail_count} failed, {unknown_count} unknown out of {len(selected_indices)} report(s)."
         )
-        logs.extend(report_logs)
-
-        status = "OK"
-        if any("FAILED" in line for line in report_logs):
-            fail_count += 1
-            status = "FAILED"
-        elif any("UNKNOWN" in line for line in report_logs):
-            unknown_count += 1
-            status = "UNKNOWN"
-        else:
-            ok_count += 1
-
-        logs.append(f"Result for '{report_name}': {status}")
-
-    logs.append("")
-    logs.append(
-        f"Summary: {ok_count} OK, {fail_count} failed, {unknown_count} unknown out of {len(selected_indices)} report(s)."
-    )
-    return logs
+        client.dispatch_log.emit(logs)
+        return logs
+    except Exception as e:
+        client.error.emit(f"Error during dispatch: {e!r}")
+        return []
+    finally:
+        client.finished.emit()
