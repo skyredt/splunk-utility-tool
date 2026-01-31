@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import configparser
+import importlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
+# Optional Qt signals support; dynamic import keeps Tk builds from pulling Qt.
 try:
-    from PySide6.QtCore import QObject, Signal  # type: ignore
+    QtCore = importlib.import_module("PySide6.QtCore")
+    QObject = QtCore.QObject
+    Signal = QtCore.Signal
 except Exception:  # PySide6 may not be installed for Tk-only usage
     class QObject:  # minimal fallback
         pass
