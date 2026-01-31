@@ -4,4 +4,8 @@ __pycache__/
 dist/
 build/
 *.spec
+# Track project build specs
+!SplunkUtilityTool.spec
+!SplunkUtilityTool_v3.spec
+!SplunkUtilityTool_v3_tk.spec
 .vscode/
