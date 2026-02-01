@@ -1,11 +1,16 @@
 __pycache__/
 *.pyc
 .venv/
+.env
+config.ini
 dist/
 build/
 *.spec
-# Track project build specs
-!SplunkUtilityTool.spec
-!SplunkUtilityTool_v3.spec
-!SplunkUtilityTool_v3_tk.spec
+.DS_Store
 .vscode/
+!*.spec
+
+# Build outputs (do not commit)
+PRODSplunkUtilityTool*/
+restore-point*/
+*.zip
