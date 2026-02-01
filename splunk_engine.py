@@ -5,7 +5,7 @@ import importlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 # Optional Qt signals support; dynamic import keeps Tk builds from pulling Qt.
@@ -278,6 +278,16 @@ def to_epoch(dt: datetime) -> str:
     return str(int(dt.timestamp()))
 
 
+def _append_log(
+    logs: List[str],
+    line: str,
+    log_callback: Optional[Callable[[str], None]],
+) -> None:
+    logs.append(line)
+    if log_callback:
+        log_callback(line)
+
+
 def run_dispatch_single(
     client: SplunkClient,
     report_id_url: str,
@@ -286,27 +296,38 @@ def run_dispatch_single(
     start: datetime,
     end: datetime,
     no_change: bool,
+    wait_seconds: int = 10,
+    poll_interval: int = 2,
+    log_callback: Optional[Callable[[str], None]] = None,
 ) -> List[str]:
     logs: List[str] = []
 
     if no_change:
-        logs.append(
-            f"Dispatching '{report_name}' with saved search time range..."
+        _append_log(
+            logs,
+            f"Dispatching '{report_name}' with saved search time range...",
+            log_callback,
         )
         ok, sid, err = client.dispatch_saved_search(report_id_url)
         if not ok:
-            logs.append(f"  FAILED: {err}")
+            _append_log(logs, f"  FAILED: {err}", log_callback)
         elif sid is not None:
-            state, info = client.check_job_status(sid)
+            state, info = client.check_job_status(
+                sid, wait_seconds=wait_seconds, poll_interval=poll_interval
+            )
             if state == "SUCCESS":
-                logs.append(f"  OK (sid={sid})")
+                _append_log(logs, f"  OK (sid={sid})", log_callback)
             elif state == "FAILED":
-                logs.append(
-                    f"  FAILED (sid={sid}, state={info.get('dispatchState')})"
+                _append_log(
+                    logs,
+                    f"  FAILED (sid={sid}, state={info.get('dispatchState')})",
+                    log_callback,
                 )
             else:
-                logs.append(
-                    f"  UNKNOWN (sid={sid}) – job still running / timeout while checking"
+                _append_log(
+                    logs,
+                    f"  UNKNOWN (sid={sid}) – job still running / timeout while checking",
+                    log_callback,
                 )
         return logs
 
@@ -317,37 +338,49 @@ def run_dispatch_single(
     if len(starts) > 12:
         raise ValueError("Selected date range generates more than 12 slices/emails.")
 
-    logs.append(
-        f"Dispatching '{report_name}' with {len(starts)} slice(s) ({frequency}) from {start} to {end}."
+    _append_log(
+        logs,
+        f"Dispatching '{report_name}' with {len(starts)} slice(s) ({frequency}) from {start} to {end}.",
+        log_callback,
     )
 
     for i, (s, e) in enumerate(zip(starts, ends), start=1):
         earliest = to_epoch(s)
         latest = to_epoch(e)
-        logs.append(
-            f"  [{i}/{len(starts)}] Earliest: {s}, Latest: {e} – sending..."
+        _append_log(
+            logs,
+            f"  [{i}/{len(starts)}] Earliest: {s}, Latest: {e} – sending...",
+            log_callback,
         )
         ok, sid, err = client.dispatch_saved_search(
             report_id_url, earliest=earliest, latest=latest
         )
         if not ok:
-            logs.append(f"  [{i}/{len(starts)}] FAILED: {err}")
+            _append_log(logs, f"  [{i}/{len(starts)}] FAILED: {err}", log_callback)
             continue
 
         if sid is None:
-            logs.append(f"  [{i}/{len(starts)}] FAILED: No sid returned")
+            _append_log(
+                logs, f"  [{i}/{len(starts)}] FAILED: No sid returned", log_callback
+            )
             continue
 
-        state, info = client.check_job_status(sid)
+        state, info = client.check_job_status(
+            sid, wait_seconds=wait_seconds, poll_interval=poll_interval
+        )
         if state == "SUCCESS":
-            logs.append(f"  [{i}/{len(starts)}] OK (sid={sid})")
+            _append_log(logs, f"  [{i}/{len(starts)}] OK (sid={sid})", log_callback)
         elif state == "FAILED":
-            logs.append(
-                f"  [{i}/{len(starts)}] FAILED (sid={sid}, state={info.get('dispatchState')})"
+            _append_log(
+                logs,
+                f"  [{i}/{len(starts)}] FAILED (sid={sid}, state={info.get('dispatchState')})",
+                log_callback,
             )
         else:
-            logs.append(
-                f"  [{i}/{len(starts)}] UNKNOWN (sid={sid}) – job still running / timeout while checking"
+            _append_log(
+                logs,
+                f"  [{i}/{len(starts)}] UNKNOWN (sid={sid}) – job still running / timeout while checking",
+                log_callback,
             )
 
     return logs
@@ -362,14 +395,19 @@ def run_dispatch_multi(
     start: datetime,
     end: datetime,
     no_change: bool,
+    wait_seconds: int = 10,
+    poll_interval: int = 2,
+    log_callback: Optional[Callable[[str], None]] = None,
 ) -> List[str]:
     try:
         logs: List[str] = []
         if not selected_indices:
             raise ValueError("No reports selected.")
 
-        logs.append(
-            f"Starting dispatch for {len(selected_indices)} report(s) – frequency={frequency}, range={start} → {end}, no_change={no_change}"
+        _append_log(
+            logs,
+            f"Starting dispatch for {len(selected_indices)} report(s) – frequency={frequency}, range={start} → {end}, no_change={no_change}",
+            log_callback,
         )
 
         ok_count = 0
@@ -380,8 +418,12 @@ def run_dispatch_multi(
             report_id_url = report_ids[i]
             report_name = report_names[i]
 
-            logs.append("")
-            logs.append(f"=== [{idx_num}/{len(selected_indices)}] {report_name} ===")
+            _append_log(logs, "", log_callback)
+            _append_log(
+                logs,
+                f"=== [{idx_num}/{len(selected_indices)}] {report_name} ===",
+                log_callback,
+            )
 
             report_logs = run_dispatch_single(
                 client,
@@ -391,6 +433,9 @@ def run_dispatch_multi(
                 start=start,
                 end=end,
                 no_change=no_change,
+                wait_seconds=wait_seconds,
+                poll_interval=poll_interval,
+                log_callback=log_callback,
             )
             logs.extend(report_logs)
 
@@ -401,9 +446,11 @@ def run_dispatch_multi(
             else:
                 ok_count += 1
 
-        logs.append("")
-        logs.append(
-            f"Summary: {ok_count} OK, {fail_count} failed, {unknown_count} unknown out of {len(selected_indices)} report(s)."
+        _append_log(logs, "", log_callback)
+        _append_log(
+            logs,
+            f"Summary: {ok_count} OK, {fail_count} failed, {unknown_count} unknown out of {len(selected_indices)} report(s).",
+            log_callback,
         )
         client.dispatch_log.emit(logs)
         return logs

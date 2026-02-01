@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import queue
 import sys
+import threading
 from datetime import datetime, date
 
 import tkinter as tk
@@ -22,6 +24,9 @@ from splunk_engine import (
 
 
 class ReportsApp(ttk.Frame):
+    DISPATCH_STATUS_WAIT_SECONDS = 60
+    DISPATCH_STATUS_POLL_SECONDS = 2
+
     def __init__(self, master: tk.Tk, cfg: SplunkConfig):
         super().__init__(master)
         self.master = master
@@ -31,6 +36,10 @@ class ReportsApp(ttk.Frame):
         self.report_ids: list[str] = []
         self.report_names: list[str] = []
         self.report_email_flags: list[bool] = []
+        self.filtered_indices: list[int] = []
+        self._dispatch_in_progress = False
+        self._dispatch_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
+        self._dispatch_thread: threading.Thread | None = None
 
         self._build_ui()
         self._set_connected_state(False)
@@ -80,6 +89,17 @@ class ReportsApp(ttk.Frame):
         left.pack(side="left", fill="both", expand=True)
 
         ttk.Label(left, text="Reports:").pack(anchor="w")
+        search_row = ttk.Frame(left)
+        search_row.pack(fill="x", pady=(2, 6))
+
+        ttk.Label(search_row, text="Search:").pack(side="left")
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", self.on_search_changed)
+        self.search_entry = ttk.Entry(search_row, textvariable=self.search_var)
+        self.search_entry.pack(side="left", fill="x", expand=True, padx=(4, 4))
+        self.clear_search_button = ttk.Button(search_row, text="Clear", command=self.on_clear_search)
+        self.clear_search_button.pack(side="left")
+
         self.reports_list = tk.Listbox(
             left,
             selectmode="extended",
@@ -178,6 +198,8 @@ class ReportsApp(ttk.Frame):
             self.server_combo.current(0)
 
     def _set_connected_state(self, connected: bool) -> None:
+        if self._dispatch_in_progress:
+            return
         self.connect_button.configure(text="Disconnect" if connected else "Connect")
         state_app = "readonly" if connected else "disabled"
         state_btn = "normal" if connected else "disabled"
@@ -194,6 +216,8 @@ class ReportsApp(ttk.Frame):
             self.report_ids = []
             self.report_names = []
             self.report_email_flags = []
+            self.filtered_indices = []
+            self.search_var.set("")
 
     def _append_log(self, text: str) -> None:
         self.log_text.configure(state="normal")
@@ -206,6 +230,32 @@ class ReportsApp(ttk.Frame):
         if not value:
             return None
         return value
+
+    def _set_dispatch_state(self, in_progress: bool) -> None:
+        self._dispatch_in_progress = in_progress
+        if in_progress:
+            self.connect_button.configure(state="disabled")
+            self.server_combo.configure(state="disabled")
+            self.app_combo.configure(state="disabled")
+            self.reload_button.configure(state="disabled")
+            self.send_button.configure(state="disabled")
+            self.frequency_combo.configure(state="disabled")
+            self.no_change_chk.configure(state="disabled")
+            self.start_date_widget.configure(state="disabled")
+            self.end_date_widget.configure(state="disabled")
+        else:
+            self._set_connected_state(self.client is not None)
+            self.no_change_chk.configure(state="normal")
+            self.on_no_change_toggled()
+
+    def _apply_search_filter(self) -> None:
+        term = self.search_var.get().strip().lower()
+        self.reports_list.delete(0, "end")
+        self.filtered_indices = []
+        for idx, name in enumerate(self.report_names):
+            if not term or term in name.lower():
+                self.reports_list.insert("end", name)
+                self.filtered_indices.append(idx)
 
     # --------------- Event handlers ---------------
 
@@ -275,10 +325,7 @@ class ReportsApp(ttk.Frame):
             self.report_ids = ids
             self.report_names = names
             self.report_email_flags = email_flags
-
-            self.reports_list.delete(0, "end")
-            for name in names:
-                self.reports_list.insert("end", name)
+            self._apply_search_filter()
 
             self._append_log(f"Loaded {len(names)} report(s).")
         except Exception as e:
@@ -291,8 +338,56 @@ class ReportsApp(ttk.Frame):
             self.report_names = []
             self.report_email_flags = []
             self.reports_list.delete(0, "end")
+            self.filtered_indices = []
+
+    def on_search_changed(self, *args) -> None:
+        if self.report_names:
+            self._apply_search_filter()
+        else:
+            self.reports_list.delete(0, "end")
+            self.filtered_indices = []
+
+    def on_clear_search(self) -> None:
+        self.search_var.set("")
+
+    def _dispatch_worker(self, params: dict) -> None:
+        def log_callback(line: str) -> None:
+            self._dispatch_queue.put(("log", line))
+
+        try:
+            run_dispatch_multi(log_callback=log_callback, **params)
+            self._dispatch_queue.put(("done", None))
+        except Exception as e:
+            self._dispatch_queue.put(("err", e))
+
+    def _poll_dispatch_queue(self) -> None:
+        done = False
+        while True:
+            try:
+                status, payload = self._dispatch_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if status == "log":
+                self._append_log(str(payload))
+            elif status == "err":
+                self._append_log(f"ERROR during dispatch: {payload}")
+                messagebox.showerror(
+                    "Dispatch error",
+                    f"Error while dispatching reports:\n{payload}",
+                )
+                done = True
+            elif status == "done":
+                done = True
+
+        if done:
+            self._set_dispatch_state(False)
+        elif self._dispatch_in_progress:
+            self.after(150, self._poll_dispatch_queue)
 
     def on_no_change_toggled(self) -> None:
+        if self._dispatch_in_progress:
+            return
         # Optional behavior: when "no change" is on, grey out frequency/date,
         # because they won't be used.
         no_change = self.no_change_var.get()
@@ -309,12 +404,20 @@ class ReportsApp(ttk.Frame):
         if self.client is None:
             messagebox.showwarning("Not connected", "Please connect to a server first.")
             return
+        if self._dispatch_in_progress:
+            messagebox.showinfo("Dispatch running", "A dispatch is already in progress.")
+            return
 
         # Selected reports
-        selected_indices = list(self.reports_list.curselection())
-        if not selected_indices:
+        selected_display_indices = list(self.reports_list.curselection())
+        if not selected_display_indices:
             messagebox.showinfo("No reports selected", "Please select at least one report.")
             return
+        selected_indices = [
+            self.filtered_indices[i]
+            for i in selected_display_indices
+            if i < len(self.filtered_indices)
+        ]
 
         # Dates
         if not self.no_change_var.get():
@@ -361,25 +464,31 @@ class ReportsApp(ttk.Frame):
             f"range={start} -> {end}, no_change={no_change}"
         )
 
-        try:
-            logs = run_dispatch_multi(
-                self.client,
-                report_ids=self.report_ids,
-                report_names=self.report_names,
-                selected_indices=selected_indices,
-                frequency=frequency,
-                start=start,
-                end=end,
-                no_change=no_change,
-            )
-            for line in logs:
-                self._append_log(line)
-        except Exception as e:
-            self._append_log(f"ERROR during dispatch: {e}")
-            messagebox.showerror(
-                "Dispatch error",
-                f"Error while dispatching reports:\n{e}",
-            )
+        params = {
+            "client": self.client,
+            "report_ids": self.report_ids,
+            "report_names": self.report_names,
+            "selected_indices": selected_indices,
+            "frequency": frequency,
+            "start": start,
+            "end": end,
+            "no_change": no_change,
+            "wait_seconds": self.DISPATCH_STATUS_WAIT_SECONDS,
+            "poll_interval": self.DISPATCH_STATUS_POLL_SECONDS,
+        }
+        while True:
+            try:
+                self._dispatch_queue.get_nowait()
+            except queue.Empty:
+                break
+        self._set_dispatch_state(True)
+        self._dispatch_thread = threading.Thread(
+            target=self._dispatch_worker,
+            args=(params,),
+            daemon=True,
+        )
+        self._dispatch_thread.start()
+        self.after(150, self._poll_dispatch_queue)
 
 
 def main() -> None:
