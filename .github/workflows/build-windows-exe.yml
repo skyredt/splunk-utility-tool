@@ -1,26 +1,13 @@
-name: Build Windows EXE (PyInstaller)
-
-on:
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: "Branch/tag/commit to build (leave blank = default branch)"
-        required: false
-        default: ""
-  push:
-    branches:
-      - portable-env
-      - main
-
-jobs:
-  build:
-    runs-on: windows-2022
-
     steps:
-      - name: Checkout
+      - name: Checkout (dispatch with ref)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref != '' }}
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Checkout (default)
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.ref == '' }}
+        uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -36,16 +23,14 @@ jobs:
       - name: Build (PyInstaller spec)
         shell: pwsh
         run: |
-          # Pick ONE spec file name you want to build. Adjust if needed.
           pyinstaller --noconfirm --clean SplunkUtilityTool_v3.spec
 
       - name: Package artifact
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force out | Out-Null
-          $src = "dist"
           $zip = "out\SplunkUtilityTool_${{ github.sha }}.zip"
-          Compress-Archive -Path "$src\*" -DestinationPath $zip -Force
+          Compress-Archive -Path "dist\*" -DestinationPath $zip -Force
           Get-ChildItem out
 
       - name: Upload artifact
