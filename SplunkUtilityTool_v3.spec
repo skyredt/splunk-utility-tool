@@ -2,6 +2,8 @@
 # Qt/PySide6 build for lab use; not recommended for hardened servers.
 import os
 import sys
+import os
+import os
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
