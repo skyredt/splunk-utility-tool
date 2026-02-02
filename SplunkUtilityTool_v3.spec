@@ -1,73 +1,93 @@
-# -*- mode: python ; coding: utf-8 -*-
+﻿# -*- mode: python ; coding: utf-8 -*-
 # Qt/PySide6 build for lab use; not recommended for hardened servers.
 import os
 import sys
-import os
-import os
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
 
 def _repo_root():
-    # Prefer Actions workspace if present; otherwise assume current working dir (repo root)
+    """
+    Resolve repo root without using module file variable.
+    Prefer PyInstaller-injected `specpath` (directory containing the spec),
+    then GITHUB_WORKSPACE (Actions), else current working directory.
+    """
+    sp = globals().get("specpath")
+    if sp:
+        return Path(sp).resolve()
+
     ws = os.environ.get("GITHUB_WORKSPACE")
     if ws:
         return Path(ws).resolve()
+
     return Path.cwd().resolve()
 
 
-def _find_vc_runtime():
-    patterns = ("vcruntime140*.dll", "msvcp140*.dll")
+def _find_vc_runtime_bins():
+    """
+    Minimal VC runtime bundle: include only the release DLLs we actually want.
+    We intentionally do NOT scan System32/SysWOW64 here to avoid pulling in
+    debug/CLR variants and duplicates.
+
+    The workflow will populate vc_runtime/ from System32 at build time.
+    """
+    allow = [
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+        "msvcp140.dll",
+        "msvcp140_1.dll",
+        "concrt140.dll",
+        "msvcp140_2.dll",
+    ]
+
     repo_root = _repo_root()
     roots = [
         repo_root / "vc_runtime",
         Path(sys.base_prefix),
         Path(sys.base_prefix) / "DLLs",
         Path(sys.executable).resolve().parent,
-        Path("C:/Windows/System32"),
-        Path("C:/Windows/SysWOW64"),
     ]
-    found = []
-    for root in roots:
-        if not root.exists():
-            continue
-        for pattern in patterns:
-            found.extend(root.glob(pattern))
-    unique = []
-    seen = set()
-    for p in found:
-        try:
-            key = str(p.resolve())
-        except OSError:
-            key = str(p)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(p)
-    return unique
+
+    bins = []
+    for dll in allow:
+        picked = None
+        for root in roots:
+            p = root / dll
+            if p.exists():
+                picked = p
+                break
+        if picked:
+            bins.append((str(picked), "."))
+
+    return bins
+
 
 datas = []
-vc_runtime_bins = [(str(p), ".") for p in _find_vc_runtime()]
-if vc_runtime_bins:
-    print("Bundling VC runtime DLLs:")
-    for p, _ in vc_runtime_bins:
+binaries = _find_vc_runtime_bins()
+if binaries:
+    print("Bundling VC runtime DLLs (minimal):")
+    for p, _ in binaries:
         print(" -", p)
 else:
-    print("Bundling VC runtime DLLs: none found")
-binaries = vc_runtime_bins
+    print("Bundling VC runtime DLLs (minimal): none found")
+
 hiddenimports = []
-tmp_ret = collect_all('PySide6')
+
+tmp_ret = collect_all("PySide6")
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('PySide6_Essentials')
+
+tmp_ret = collect_all("PySide6_Essentials")
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('PySide6_Addons')
+
+tmp_ret = collect_all("PySide6_Addons")
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('shiboken6')
+
+tmp_ret = collect_all("shiboken6")
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['main.py'],
+    ["main.py"],
     pathex=[],
     binaries=binaries,
     datas=datas,
@@ -79,6 +99,7 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -86,7 +107,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='SplunkUtilityTool_v3',
+    name="SplunkUtilityTool_v3",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -98,6 +119,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
+
 coll = COLLECT(
     exe,
     a.binaries,
@@ -105,5 +127,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='SplunkUtilityTool_v3',
+    name="SplunkUtilityTool_v3",
 )

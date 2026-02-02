@@ -1,4 +1,4 @@
-name: Build Windows EXE (PyInstaller)
+﻿name: Build Windows EXE (PyInstaller)
 
 on:
   workflow_dispatch:
@@ -26,20 +26,45 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Diagnostics (prove spec content)
+      - name: Prepare VC runtime folder (minimal allowlist)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force vc_runtime | Out-Null
+
+          $dlls = @(
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "msvcp140.dll",
+            "msvcp140_1.dll",
+            "concrt140.dll",
+            "msvcp140_2.dll"
+          )
+
+          foreach ($d in $dlls) {
+            $src = Join-Path $env:WINDIR "System32\$d"
+            if (Test-Path $src) {
+              Copy-Item $src -Destination vc_runtime -Force
+            } else {
+              Write-Host "WARNING: missing $src"
+            }
+          }
+
+          Write-Host "vc_runtime folder contents:"
+          Get-ChildItem vc_runtime -Force | Select-Object Name,Length | Format-Table -AutoSize
+
+      - name: Diagnostics (prove what Actions is building)
         shell: pwsh
         run: |
           Write-Host "HEAD:"; git rev-parse HEAD
-          Write-Host "Check __file__ in spec:"
-          Select-String -Path .\SplunkUtilityTool_v3.spec -Pattern "__file__" -Quiet | ForEach-Object { $_ }
-          if (Select-String -Path .\SplunkUtilityTool_v3.spec -Pattern "__file__" -Quiet) {
-            Write-Host "FOUND __file__ in spec (bad)"
+          Write-Host "First 60 lines of spec:"
+          Get-Content .\SplunkUtilityTool_v3.spec -TotalCount 60
+
+          $has = Select-String -Path .\SplunkUtilityTool_v3.spec -Pattern "__file__" -Quiet
+          if ($has) {
+            Write-Error "FOUND __file__ in spec (must be absent)"
+            exit 1
           } else {
             Write-Host "No __file__ in spec (good)"
-          }
-          if (Test-Path vc_runtime) {
-            Write-Host "vc_runtime folder contents:"
-            Get-ChildItem vc_runtime -Force | Select-Object Name,Length | Format-Table -AutoSize
           }
 
       - name: Build (PyInstaller spec)
