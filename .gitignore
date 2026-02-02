@@ -14,3 +14,8 @@ build/
 PRODSplunkUtilityTool*/
 restore-point*/
 *.zip
+
+# VC runtime - do not commit DLLs
+vc_runtime/*.dll
+!vc_runtime/.gitkeep
+
