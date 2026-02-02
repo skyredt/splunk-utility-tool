@@ -11,7 +11,6 @@ build/
 !*.spec
 
 # Build outputs (do not commit)
-PRODSplunkUtilityTool_v3/
-PRODSplunkUtilityTool_v3.zip
-restore-point-tk-artifacts/
-restore-point-tk-artifacts.zip
+PRODSplunkUtilityTool*/
+restore-point*/
+*.zip

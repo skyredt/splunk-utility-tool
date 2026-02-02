@@ -1,34 +1,12 @@
-name: Build Windows EXE (PyInstaller)
-
-on:
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: "Branch/tag/commit to build (leave blank = default branch)"
-        required: false
-        default: ""
-  push:
-    branches:
-      - portable-env
-      - main
-
-jobs:
-  build:
-    runs-on: windows-2022
-
     steps:
-      - name: Checkout (dispatch ref override)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.ref != '' }}
+      - name: Checkout (dispatch with ref)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref != '' }}
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ github.event.inputs.ref }}
 
-      - name: Checkout (dispatch default)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.ref == '' }}
-        uses: actions/checkout@v4
-
-      - name: Checkout (push/default)
-        if: ${{ github.event_name != 'workflow_dispatch' }}
+      - name: Checkout (default)
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.ref == '' }}
         uses: actions/checkout@v4
 
       - name: Setup Python
