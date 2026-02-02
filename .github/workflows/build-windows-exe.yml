@@ -1,12 +1,37 @@
+name: Build Windows EXE (PyInstaller)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/tag/commit to build (leave blank = default branch)"
+        required: false
+        default: ""
+  push:
+    branches:
+      - portable-env
+      - main
+
+jobs:
+  build:
+    runs-on: windows-2022
+
     steps:
-      - name: Checkout (dispatch with ref)
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref != '' }}
+      # If workflow_dispatch and ref is provided, checkout that ref
+      - name: Checkout (workflow_dispatch with ref)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.ref != '' }}
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.ref }}
+          ref: ${{ inputs.ref }}
 
-      - name: Checkout (default)
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.ref == '' }}
+      # If workflow_dispatch and ref is blank, checkout default branch for that run context
+      - name: Checkout (workflow_dispatch default)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.ref == '' }}
+        uses: actions/checkout@v4
+
+      # If push event, checkout pushed commit
+      - name: Checkout (push)
+        if: ${{ github.event_name == 'push' }}
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -20,50 +45,20 @@
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Diagnostics (vcruntime)
+      - name: Diagnostics (VC runtime + vc_runtime folder)
         shell: pwsh
         run: |
-          @'
-          import os
-          import sys
-          from pathlib import Path
-          print("sys.executable:", sys.executable)
-          print("sys.base_prefix:", sys.base_prefix)
-          repo_root = Path.cwd()
-          vc_dir = repo_root / "vc_runtime"
-          if vc_dir.exists():
-              print("vc_runtime contents:")
-              for p in sorted(vc_dir.iterdir()):
-                  print(" -", p.name)
-              try:
-                  os.add_dll_directory(str(vc_dir))
-                  print("vc_runtime added to DLL search path")
-              except (AttributeError, OSError) as exc:
-                  print("vc_runtime not added to DLL search path:", exc)
-          else:
-              print("vc_runtime directory not found")
-          roots = [
-              vc_dir,
-              Path(sys.base_prefix),
-              Path(sys.base_prefix) / "DLLs",
-              Path(sys.executable).resolve().parent,
-              Path("C:/Windows/System32"),
-              Path("C:/Windows/SysWOW64"),
-          ]
-          patterns = ("vcruntime140*.dll", "msvcp140*.dll")
-          found = []
-          for root in roots:
-              if not root.exists():
-                  continue
-              for pattern in patterns:
-                  found.extend([str(p) for p in root.glob(pattern)])
-          if found:
-              print("Found VC runtime DLLs:")
-              for p in sorted(set(found)):
-                  print(" -", p)
-          else:
-              print("Found VC runtime DLLs: none")
-          '@ | python -
+          python -c "import sys; print('sys.executable:', sys.executable); print('sys.base_prefix:', sys.base_prefix)"
+          if (Test-Path vc_runtime) {
+            Write-Host "vc_runtime folder exists. Contents:"
+            Get-ChildItem vc_runtime -Force | Format-Table Name,Length
+          } else {
+            Write-Host "vc_runtime folder does NOT exist in repo checkout."
+          }
+          Write-Host "System32 VC runtime candidates:"
+          Get-ChildItem C:\Windows\System32 -Filter "vcruntime140*.dll" -ErrorAction SilentlyContinue | Select-Object Name,Length
+          Get-ChildItem C:\Windows\System32 -Filter "msvcp140*.dll" -ErrorAction SilentlyContinue | Select-Object Name,Length
+          Get-ChildItem C:\Windows\System32 -Filter "concrt140*.dll" -ErrorAction SilentlyContinue | Select-Object Name,Length
 
       - name: Build (PyInstaller spec)
         shell: pwsh
@@ -74,9 +69,8 @@
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force out | Out-Null
-          $src = "dist"
           $zip = "out\SplunkUtilityTool_${{ github.sha }}.zip"
-          Compress-Archive -Path "$src\*" -DestinationPath $zip -Force
+          Compress-Archive -Path "dist\*" -DestinationPath $zip -Force
           Get-ChildItem out
 
       - name: Upload artifact
