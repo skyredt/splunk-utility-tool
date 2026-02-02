@@ -20,6 +20,51 @@
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Diagnostics (vcruntime)
+        shell: pwsh
+        run: |
+          @'
+          import os
+          import sys
+          from pathlib import Path
+          print("sys.executable:", sys.executable)
+          print("sys.base_prefix:", sys.base_prefix)
+          repo_root = Path.cwd()
+          vc_dir = repo_root / "vc_runtime"
+          if vc_dir.exists():
+              print("vc_runtime contents:")
+              for p in sorted(vc_dir.iterdir()):
+                  print(" -", p.name)
+              try:
+                  os.add_dll_directory(str(vc_dir))
+                  print("vc_runtime added to DLL search path")
+              except (AttributeError, OSError) as exc:
+                  print("vc_runtime not added to DLL search path:", exc)
+          else:
+              print("vc_runtime directory not found")
+          roots = [
+              vc_dir,
+              Path(sys.base_prefix),
+              Path(sys.base_prefix) / "DLLs",
+              Path(sys.executable).resolve().parent,
+              Path("C:/Windows/System32"),
+              Path("C:/Windows/SysWOW64"),
+          ]
+          patterns = ("vcruntime140*.dll", "msvcp140*.dll")
+          found = []
+          for root in roots:
+              if not root.exists():
+                  continue
+              for pattern in patterns:
+                  found.extend([str(p) for p in root.glob(pattern)])
+          if found:
+              print("Found VC runtime DLLs:")
+              for p in sorted(set(found)):
+                  print(" -", p)
+          else:
+              print("Found VC runtime DLLs: none")
+          '@ | python -
+
       - name: Build (PyInstaller spec)
         shell: pwsh
         run: |
@@ -29,8 +74,9 @@
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force out | Out-Null
+          $src = "dist"
           $zip = "out\SplunkUtilityTool_${{ github.sha }}.zip"
-          Compress-Archive -Path "dist\*" -DestinationPath $zip -Force
+          Compress-Archive -Path "$src\*" -DestinationPath $zip -Force
           Get-ChildItem out
 
       - name: Upload artifact
