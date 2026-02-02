@@ -1,13 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Qt/PySide6 build for lab use; not recommended for hardened servers.
+import os
 import sys
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
 
+def _repo_root():
+    # Prefer Actions workspace if present; otherwise assume current working dir (repo root)
+    ws = os.environ.get("GITHUB_WORKSPACE")
+    if ws:
+        return Path(ws).resolve()
+    return Path.cwd().resolve()
+
+
 def _find_vc_runtime():
     patterns = ("vcruntime140*.dll", "msvcp140*.dll")
-    repo_root = Path(__file__).resolve().parent
+    repo_root = _repo_root()
     roots = [
         repo_root / "vc_runtime",
         Path(sys.base_prefix),
