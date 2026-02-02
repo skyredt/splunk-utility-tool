@@ -1,27 +1,58 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Qt/PySide6 build for lab use; not recommended for hardened servers.
+
+import os
 import sys
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
 
+def _repo_root() -> Path:
+    """
+    Resolve repo root without __file__ (PyInstaller spec does not guarantee __file__ exists).
+
+    Priority:
+    1) PyInstaller-injected 'specpath' (directory containing the spec)
+    2) GitHub Actions workspace
+    3) Current working directory
+    """
+    sp = globals().get("specpath")
+    if sp:
+        try:
+            return Path(sp).resolve()
+        except Exception:
+            pass
+
+    ws = os.environ.get("GITHUB_WORKSPACE")
+    if ws:
+        return Path(ws).resolve()
+
+    return Path.cwd().resolve()
+
+
 def _find_vc_runtime():
-    patterns = ("vcruntime140*.dll", "msvcp140*.dll")
-    repo_root = Path(__file__).resolve().parent
+    patterns = ("vcruntime140*.dll", "msvcp140*.dll", "concrt140*.dll")
+
+    repo_root = _repo_root()
+    system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+
     roots = [
         repo_root / "vc_runtime",
         Path(sys.base_prefix),
         Path(sys.base_prefix) / "DLLs",
         Path(sys.executable).resolve().parent,
-        Path("C:/Windows/System32"),
-        Path("C:/Windows/SysWOW64"),
+        system_root / "System32",
+        system_root / "SysWOW64",
     ]
+
     found = []
     for root in roots:
         if not root.exists():
             continue
         for pattern in patterns:
             found.extend(root.glob(pattern))
+
+    # de-dup while preserving order
     unique = []
     seen = set()
     for p in found:
@@ -33,8 +64,8 @@ def _find_vc_runtime():
             continue
         seen.add(key)
         unique.append(p)
-    return unique
 
+    return unique
 datas = []
 vc_runtime_bins = [(str(p), ".") for p in _find_vc_runtime()]
 if vc_runtime_bins:
