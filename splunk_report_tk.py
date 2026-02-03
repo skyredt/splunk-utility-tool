@@ -493,6 +493,7 @@ class ReportsApp(ttk.Frame):
 
 def main() -> None:
     root = tk.Tk()
+    root.iconbitmap("assets/app.ico")
     root.withdraw()  # hide until config is loaded
 
     try:
