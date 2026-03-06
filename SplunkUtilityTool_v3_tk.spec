@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec for Splunk Utility Tool v3 (Tkinter version).
+PyInstaller spec for Splunk Utility Tool v4 (Tkinter version).
 
 Recommended for hardened production environments:
 - Tk-only (no PySide6/Qt)
@@ -33,6 +33,9 @@ datas = []
 tcl_root = os.path.join(sys.base_prefix, "tcl")
 if os.path.isdir(tcl_root):
     datas.append((tcl_root, "tcl"))
+app_icon = os.path.join(PROJECT_ROOT, "assets", "app.ico")
+if os.path.isfile(app_icon):
+    datas.append((app_icon, "assets"))
 
 a = Analysis(
     ['main.py'],
@@ -56,7 +59,7 @@ exe = EXE(
     pyz,
     a.scripts,
     [],
-    name='SplunkUtilityTool_v3',
+    name='SplunkUtilityTool_v4',
     exclude_binaries=True,
     debug=False,
     bootloader_ignore_signals=False,
@@ -64,11 +67,12 @@ exe = EXE(
     upx=False,
     upx_exclude=[],
     console=False,
-    disable_windowed_traceback=False,
+    disable_windowed_traceback=True,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=app_icon if os.path.isfile(app_icon) else None,
 )
 coll = COLLECT(
     exe,
@@ -78,5 +82,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='SplunkUtilityTool_v3',
+    name='SplunkUtilityTool_v4',
 )

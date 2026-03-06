@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import os
 import queue
+import socket
 import sys
-import threading
 from datetime import datetime, date
+from typing import Callable, Optional
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk
 
 try:
     # Optional calendar widget for nicer date selection
@@ -16,42 +18,154 @@ except ImportError:  # fall back to simple Entry if tkcalendar is not installed
     HAS_TKCALENDAR = False
 
 from splunk_engine import (
-    SplunkClient,
+    TOOL_DISPLAY_NAME,
     SplunkConfig,
-    load_config,
+    build_slices,
+    get_effective_username,
     run_dispatch_multi,
+    set_security_audit_logger,
+    set_security_policy,
 )
+from Internal.baseline_guard import build_security_fingerprint, enforce_security_baseline
+from Internal.logging_broker import (
+    BrokerAuditLogger,
+    PERSISTENT_AUDIT_UNAVAILABLE_WARNING,
+    start_local_logging_broker,
+)
+from Internal.splunk_broker import (
+    LocalSplunkBrokerHandle,
+    SPLUNK_BROKER_UNAVAILABLE_WARNING,
+    SplunkBrokerProxyClient,
+    start_local_splunk_broker,
+)
+from Internal.security_policy import PolicyViolation, load_security_policy, redact_text
+from mergereport_monitor import MergeReportMonitor
+from postdispatch_monitor import PostDispatchStatusMonitor
+from progress_dialog import run_with_progress
+from ui_prompt import show_modal_prompt
+
+
+TOOL_VERSION = "v4"
+
+
+def _resolve_app_icon_path() -> str | None:
+    """Resolve app icon path for source and bundled executions."""
+    candidates: list[str] = []
+
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(sys.executable)
+        candidates.append(os.path.join(exe_dir, "assets", "app.ico"))
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            candidates.append(os.path.join(meipass, "assets", "app.ico"))
+
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(module_dir, "assets", "app.ico"))
+
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def _resolve_runtime_exe_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _build_cfg_from_runtime_payload(payload: dict[str, object], exe_dir: str) -> SplunkConfig:
+    config_path = os.path.join(exe_dir, "config.ini")
+    if isinstance(payload.get("config_path"), str) and str(payload.get("config_path")).strip():
+        config_path = str(payload.get("config_path")).strip()
+    return SplunkConfig(
+        servers=[str(x) for x in (payload.get("servers") or [])] if isinstance(payload.get("servers"), list) else [],
+        username=str(payload.get("username") or ""),
+        password="",
+        secret_file="secret.dpapi",
+        dpapi_scope="machine",
+        auth_mode="password",
+        verify_ssl=bool(payload.get("verify_ssl", True)),
+        config_path=config_path,
+        logging_level=str(payload.get("logging_level") or "INFO"),
+        logging_verbose=bool(payload.get("logging_verbose", False)),
+        logging_max_bytes=int(payload.get("logging_max_bytes") or 10_485_760),
+        logging_backup_count=int(payload.get("logging_backup_count") or 10),
+        legacy_password_present=bool(payload.get("legacy_password_present", False)),
+        merge_report_enabled=bool(payload.get("merge_report_enabled", False)),
+        merge_report_log_path=str(payload.get("merge_report_log_path") or ""),
+        merge_report_timeout_seconds=int(payload.get("merge_report_timeout_seconds") or 90),
+        ack_enabled=bool(payload.get("ack_enabled", True)),
+        ack_recipients=[str(x) for x in (payload.get("ack_recipients") or [])] if isinstance(payload.get("ack_recipients"), list) else [],
+        ack_use_savedsearch_recipients=bool(payload.get("ack_use_savedsearch_recipients", False)),
+        ack_attach_manifest=bool(payload.get("ack_attach_manifest", False)),
+        smtp_host=str(payload.get("smtp_host") or "127.0.0.1"),
+        smtp_port=int(payload.get("smtp_port") or 25),
+        smtp_user=str(payload.get("smtp_user") or ""),
+        smtp_pass=str(payload.get("smtp_pass") or ""),
+        smtp_use_tls=bool(payload.get("smtp_use_tls", False)),
+        smtp_from=str(payload.get("smtp_from") or "Splunk Notification <splunk-donotreply@localhost>"),
+        postdispatch_config=dict(payload.get("postdispatch_config")) if isinstance(payload.get("postdispatch_config"), dict) else None,
+    )
 
 
 class ReportsApp(ttk.Frame):
     DISPATCH_STATUS_WAIT_SECONDS = 60
     DISPATCH_STATUS_POLL_SECONDS = 2
 
-    def __init__(self, master: tk.Tk, cfg: SplunkConfig):
+    def __init__(
+        self,
+        master: tk.Tk,
+        cfg: SplunkConfig,
+        *,
+        audit_logger: Optional[BrokerAuditLogger] = None,
+        splunk_broker_handle: Optional[LocalSplunkBrokerHandle] = None,
+        startup_warning: str = "",
+        exe_dir: Optional[str] = None,
+    ):
         super().__init__(master)
         self.master = master
         self.cfg = cfg
+        self.audit_logger = audit_logger
+        self.splunk_broker_handle = splunk_broker_handle
+        self.splunk_broker_client = splunk_broker_handle.client if splunk_broker_handle else None
+        self.exe_dir = exe_dir or _resolve_runtime_exe_dir()
 
-        self.client: SplunkClient | None = None
+        self.client: SplunkBrokerProxyClient | None = None
         self.report_ids: list[str] = []
         self.report_names: list[str] = []
         self.report_email_flags: list[bool] = []
         self.filtered_indices: list[int] = []
         self._dispatch_in_progress = False
         self._dispatch_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
-        self._dispatch_thread: threading.Thread | None = None
+        self._merge_report_monitor: MergeReportMonitor | None = None
+        self._postdispatch_monitor: PostDispatchStatusMonitor | None = None
 
         self._build_ui()
         self._set_connected_state(False)
+        audit_warning = ""
+        if self.audit_logger is not None and hasattr(self.audit_logger, "unavailable_warning"):
+            audit_warning = str(self.audit_logger.unavailable_warning() or "").strip()
+        if audit_warning:
+            self._append_log(audit_warning)
+        elif self.audit_logger:
+            self._append_log("[Audit] Security audit logger initialized.")
+        else:
+            self._append_log(PERSISTENT_AUDIT_UNAVAILABLE_WARNING)
+        if self.splunk_broker_handle and (not self.splunk_broker_handle.is_available):
+            self._append_log(SPLUNK_BROKER_UNAVAILABLE_WARNING)
+        if startup_warning.strip():
+            self._append_log(startup_warning.strip())
 
         # Load servers from config
         self._load_servers()
+        self.after(100, self._startup_connectivity_check)
 
     # --------------- UI construction ---------------
 
     def _build_ui(self) -> None:
         self.pack(fill="both", expand=True)
-        self.master.title("Splunk Utility Tool v3.0 (Tk)")
+        self.master.title(TOOL_DISPLAY_NAME)
         self.master.minsize(900, 600)
 
         # Top row: server/app + controls
@@ -151,6 +265,14 @@ class ReportsApp(ttk.Frame):
         self.send_button = ttk.Button(right, text="Send reports", command=self.on_send_clicked, state="disabled")
         self.send_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(16, 0))
 
+        # User info display (audit info)
+        username = get_effective_username()
+        hostname = socket.gethostname()
+        tool_name = TOOL_DISPLAY_NAME
+        user_info_text = f"Hi {username}.\nYou are using {tool_name} on {hostname}."
+        self.user_info_label = ttk.Label(right, text=user_info_text, foreground="gray", font=("TkDefaultFont", 9), justify="left")
+        self.user_info_label.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
         for i in range(2):
             right.grid_columnconfigure(i, weight=1)
 
@@ -220,10 +342,25 @@ class ReportsApp(ttk.Frame):
             self.search_var.set("")
 
     def _append_log(self, text: str) -> None:
+        safe_text = redact_text(text)
         self.log_text.configure(state="normal")
-        self.log_text.insert("end", text + "\n")
+        self.log_text.insert("end", safe_text + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    def _show_prompt(self, title: str, message: str, prompt_type: str = "info"):
+        return show_modal_prompt(self.master, title, message, prompt_type)
+
+    def _audit_event(self, event: str, level: str = "INFO", **fields) -> None:
+        if self.audit_logger is None:
+            return
+        self.audit_logger.log_event(event, level=level, **fields)
+
+    def _require_broker_client(self) -> SplunkBrokerProxyClient:
+        client = self.splunk_broker_client
+        if client is None:
+            raise RuntimeError(SPLUNK_BROKER_UNAVAILABLE_WARNING)
+        return client
 
     def _selected_server(self) -> str | None:
         value = self.server_var.get().strip()
@@ -257,16 +394,27 @@ class ReportsApp(ttk.Frame):
                 self.reports_list.insert("end", name)
                 self.filtered_indices.append(idx)
 
+    def _startup_connectivity_check(self) -> None:
+        return
+
     # --------------- Event handlers ---------------
 
     def on_server_selection_changed(self, event=None) -> None:
         if self.client is not None:
             self._append_log("Server changed; disconnecting current session.")
+            try:
+                self.client.disconnect()
+            except Exception:
+                pass
             self._set_connected_state(False)
 
     def on_connect_clicked(self) -> None:
         if self.client is not None:
             self._append_log("Disconnected from server.")
+            try:
+                self.client.disconnect()
+            except Exception:
+                pass
             self._set_connected_state(False)
             return
         self._connect_current_server()
@@ -274,41 +422,66 @@ class ReportsApp(ttk.Frame):
     def _connect_current_server(self) -> None:
         server_url = self._selected_server()
         if not server_url:
-            messagebox.showwarning("No server", "Please select a server first.")
+            self._show_prompt("No server", "Please select a server first.", "warning")
             return
 
         self._append_log(f"Connecting to {server_url} ...")
-        try:
-            client = SplunkClient(
-                base_url=server_url,
-                username=self.cfg.username,
-                password=self.cfg.password,
-            )
-            apps = client.list_apps()
-        except Exception as e:
-            self._append_log(f"ERROR connecting to {server_url}: {e}")
-            messagebox.showerror(
-                "Connection error",
-                f"Failed to connect to {server_url}:\n{e}",
-            )
+
+        def _task(set_status: Callable[[str], None]):
+            set_status("Connecting to Splunk...")
+            broker_client = self._require_broker_client()
+            connect_result = broker_client.connect(server_url)
+            credential_persisted = True
+            if isinstance(connect_result, dict):
+                credential_persisted = bool(connect_result.get("credential_persisted", True))
+            set_status("Loading applications...")
+            apps = broker_client.list_apps() or []
+            return broker_client, apps, credential_persisted
+
+        def _on_success(payload: object) -> None:
+            client, apps, credential_persisted = payload  # type: ignore[misc]
+            self.client = client
+            self.app_combo.configure(state="readonly")
+            self.app_combo["values"] = apps
+            if apps:
+                self.app_combo.current(0)
+            self._set_connected_state(True)
+            if apps:
+                self.on_app_changed()
+            self._append_log(f"Connected. {len(apps)} app(s) loaded.")
+            if not bool(credential_persisted):
+                self._append_log(
+                    "Credential was not persisted due local ACL policy; "
+                    "you will be prompted again on next launch."
+                )
+
+        def _on_error(exc: Exception) -> None:
+            safe_error = redact_text(str(exc))
+            self._append_log(f"ERROR connecting to {server_url}: {safe_error}")
+            try:
+                broker_client = self._require_broker_client()
+                broker_client.disconnect()
+            except Exception:
+                pass
             self._set_connected_state(False)
-            return
+            self._show_prompt(
+                "Connection error",
+                f"Failed to connect to {server_url}.",
+                "error",
+            )
 
-        self.client = client
-        self.app_combo.configure(state="readonly")
-        self.app_combo["values"] = apps
-        if apps:
-            self.app_combo.current(0)
-        self._set_connected_state(True)
-
-        if apps:
-            self.on_app_changed()  # load reports for first app
-
-        self._append_log(f"Connected. {len(apps)} app(s) loaded.")
+        run_with_progress(
+            self.master,
+            "Connecting to Splunk",
+            "Connecting...",
+            _task,
+            on_success=_on_success,
+            on_error=_on_error,
+        )
 
     def on_reload_clicked(self) -> None:
         if self.client is None:
-            messagebox.showwarning("Not connected", "Please connect to a server first.")
+            self._show_prompt("Not connected", "Please connect to a server first.", "warning")
             return
         self.on_app_changed()
 
@@ -320,25 +493,39 @@ class ReportsApp(ttk.Frame):
             return
 
         self._append_log(f"Loading reports from app '{app}' ...")
-        try:
-            ids, names, email_flags = self.client.list_saved_searches(app)
+        def _task(set_status: Callable[[str], None]):
+            set_status(f"Loading reports from '{app}'...")
+            return self.client.list_saved_searches(app)
+
+        def _on_success(payload: object) -> None:
+            ids, names, email_flags = payload  # type: ignore[misc]
             self.report_ids = ids
             self.report_names = names
             self.report_email_flags = email_flags
             self._apply_search_filter()
-
             self._append_log(f"Loaded {len(names)} report(s).")
-        except Exception as e:
-            self._append_log(f"ERROR loading reports for app '{app}': {e}")
-            messagebox.showerror(
+
+        def _on_error(exc: Exception) -> None:
+            self._append_log(f"ERROR loading reports for app '{app}': {redact_text(str(exc))}")
+            self._show_prompt(
                 "Error",
-                f"Failed to load saved searches for app '{app}':\n{e}",
+                f"Failed to load saved searches for app '{app}'.",
+                "error",
             )
             self.report_ids = []
             self.report_names = []
             self.report_email_flags = []
             self.reports_list.delete(0, "end")
             self.filtered_indices = []
+
+        run_with_progress(
+            self.master,
+            "Loading Reports",
+            f"Loading reports from '{app}'...",
+            _task,
+            on_success=_on_success,
+            on_error=_on_error,
+        )
 
     def on_search_changed(self, *args) -> None:
         if self.report_names:
@@ -350,12 +537,26 @@ class ReportsApp(ttk.Frame):
     def on_clear_search(self) -> None:
         self.search_var.set("")
 
-    def _dispatch_worker(self, params: dict) -> None:
+    def _dispatch_worker(
+        self,
+        params: dict,
+        status_callback: Optional[Callable[[str], None]] = None,
+    ) -> None:
         def log_callback(line: str) -> None:
             self._dispatch_queue.put(("log", line))
+            if status_callback and line.strip():
+                status_callback(line.strip()[:120])
+
+        def sid_callback(sid: str, search_name: str) -> None:
+            # Register SID with MergeReport monitor if enabled
+            if self._merge_report_monitor is not None:
+                self._merge_report_monitor.register_sid(sid, search_name)
+            # Register SID with post-dispatch monitor if enabled
+            if self._postdispatch_monitor is not None:
+                self._postdispatch_monitor.register_sid(sid, search_name)
 
         try:
-            run_dispatch_multi(log_callback=log_callback, **params)
+            run_dispatch_multi(log_callback=log_callback, sid_callback=sid_callback, config=self.cfg, **params)
             self._dispatch_queue.put(("done", None))
         except Exception as e:
             self._dispatch_queue.put(("err", e))
@@ -370,11 +571,24 @@ class ReportsApp(ttk.Frame):
 
             if status == "log":
                 self._append_log(str(payload))
+            elif status == "mergereport":
+                # MergeReport event from the monitor
+                self._append_log(str(payload))
+            elif status == "mergereport_error":
+                # Internal MergeReport error (won't crash the dispatch)
+                self._append_log(f"[MergeReport Monitor Error] {payload}")
+            elif status == "postdispatch":
+                # Post-dispatch verification event from the monitor
+                self._append_log(str(payload))
+            elif status == "postdispatch_error":
+                # Internal post-dispatch error (won't crash the dispatch)
+                self._append_log(f"[PostDispatch Monitor Error] {payload}")
             elif status == "err":
-                self._append_log(f"ERROR during dispatch: {payload}")
-                messagebox.showerror(
+                self._append_log(f"ERROR during dispatch: {redact_text(str(payload))}")
+                self._show_prompt(
                     "Dispatch error",
-                    f"Error while dispatching reports:\n{payload}",
+                    "Error while dispatching reports. Review security audit logs for details.",
+                    "error",
                 )
                 done = True
             elif status == "done":
@@ -382,6 +596,14 @@ class ReportsApp(ttk.Frame):
 
         if done:
             self._set_dispatch_state(False)
+            # Stop MergeReport monitor if it was running
+            if self._merge_report_monitor is not None:
+                self._merge_report_monitor.stop()
+                self._merge_report_monitor = None
+            # Post-dispatch monitor disabled (not needed for simple summary)
+            if self._postdispatch_monitor is not None:
+                self._postdispatch_monitor.stop()
+                self._postdispatch_monitor = None
         elif self._dispatch_in_progress:
             self.after(150, self._poll_dispatch_queue)
 
@@ -400,18 +622,39 @@ class ReportsApp(ttk.Frame):
             self.start_date_widget.configure(state=state)
             self.end_date_widget.configure(state=state)
 
+    def _manual_regen_prompt_text(
+        self,
+        selected_report_names: list[str],
+        range_text: str,
+        mode_text: str,
+    ) -> str:
+        if len(selected_report_names) <= 5:
+            report_label = ", ".join(selected_report_names)
+        else:
+            shown = ", ".join(selected_report_names[:5])
+            report_label = f"{shown} (+{len(selected_report_names) - 5} more)"
+
+        return (
+            "This will produce a manually regenerated report run "
+            "(different from scheduled automation).\n"
+            "A summary acknowledgement email will be sent after this run.\n\n"
+            f"Report(s): {report_label}\n"
+            f"Date range: {range_text}\n"
+            f"Slice mode: {mode_text}\n"
+        )
+
     def on_send_clicked(self) -> None:
         if self.client is None:
-            messagebox.showwarning("Not connected", "Please connect to a server first.")
+            self._show_prompt("Not connected", "Please connect to a server first.", "warning")
             return
         if self._dispatch_in_progress:
-            messagebox.showinfo("Dispatch running", "A dispatch is already in progress.")
+            self._show_prompt("Dispatch running", "A dispatch is already in progress.", "info")
             return
 
         # Selected reports
         selected_display_indices = list(self.reports_list.curselection())
         if not selected_display_indices:
-            messagebox.showinfo("No reports selected", "Please select at least one report.")
+            self._show_prompt("No reports selected", "Please select at least one report.", "info")
             return
         selected_indices = [
             self.filtered_indices[i]
@@ -419,31 +662,71 @@ class ReportsApp(ttk.Frame):
             if i < len(self.filtered_indices)
         ]
 
+        selected_report_names = [self.report_names[i] for i in selected_indices]
+        frequency = self.frequency_var.get()
+        no_change = self.no_change_var.get()
+
         # Dates
-        if not self.no_change_var.get():
+        if not no_change:
             start_d = self._get_date_from_widget(self.start_date_widget)
             end_d = self._get_date_from_widget(self.end_date_widget)
             if start_d is None or end_d is None:
-                messagebox.showwarning(
+                self._show_prompt(
                     "Invalid dates",
                     "Please enter valid Start and End dates (YYYY-MM-DD).",
+                    "warning",
                 )
                 return
 
             start = datetime(start_d.year, start_d.month, start_d.day)
             end = datetime(end_d.year, end_d.month, end_d.day)
             if end <= start:
-                messagebox.showwarning("Invalid date range", "End date must be after start date.")
+                self._show_prompt("Invalid date range", "End date must be after start date.", "warning")
                 return
+            starts, _ = build_slices(start, end, frequency)
+            if len(starts) == 0:
+                self._show_prompt("Invalid range", "Selected date range generates 0 slices.", "warning")
+                return
+            if len(starts) > 12:
+                self._show_prompt(
+                    "Invalid range",
+                    "Selected date range generates more than 12 slices.",
+                    "warning",
+                )
+                return
+            range_text = f"{start_d.isoformat()} to {end_d.isoformat()}"
+            total_runs = len(starts) * len(selected_indices)
+            mode_text = (
+                f"{frequency.lower()} slices: {len(starts)} per report "
+                f"({total_runs} total)"
+            )
         else:
-            # When using saved search time range, we still need a range for logging;
-            # use today's date as a placeholder window.
-            today = date.today()
-            start = datetime(today.year, today.month, today.day)
-            end = start
+            start_d = self._get_date_from_widget(self.start_date_widget)
+            end_d = self._get_date_from_widget(self.end_date_widget)
+            if start_d is not None and end_d is not None:
+                start = datetime(start_d.year, start_d.month, start_d.day)
+                end = datetime(end_d.year, end_d.month, end_d.day)
+                range_text = f"{start_d.isoformat()} to {end_d.isoformat()} (saved search time range in effect)"
+            else:
+                today = date.today()
+                start = datetime(today.year, today.month, today.day)
+                end = start
+                range_text = "saved search time range (no override)"
+            mode_text = f"single run per report ({len(selected_indices)} total)"
 
-        frequency = self.frequency_var.get()
-        no_change = self.no_change_var.get()
+        prompt_text = self._manual_regen_prompt_text(
+            selected_report_names=selected_report_names,
+            range_text=range_text,
+            mode_text=mode_text,
+        )
+        proceed = self._show_prompt(
+            "Confirm Manual Regeneration",
+            prompt_text,
+            "confirm",
+        )
+        if not proceed:
+            self._append_log("Manual regeneration cancelled by user.")
+            return
 
         # Warn for saved searches without email action enabled
         missing_email = [
@@ -464,6 +747,40 @@ class ReportsApp(ttk.Frame):
             f"range={start} -> {end}, no_change={no_change}"
         )
 
+        # Initialize MergeReport monitor if enabled
+        if self.cfg.merge_report_enabled and self.cfg.merge_report_log_path:
+            try:
+                self._merge_report_monitor = MergeReportMonitor(
+                    log_path=self.cfg.merge_report_log_path,
+                    ui_queue=self._dispatch_queue,
+                    timeout_seconds=self.cfg.merge_report_timeout_seconds,
+                )
+                self._merge_report_monitor.start()
+                self._append_log("[MergeReport] Monitor started.")
+            except Exception as e:
+                self._append_log(f"[MergeReport] WARNING: Could not start monitor: {redact_text(str(e))}")
+                self._merge_report_monitor = None
+        else:
+            if self.cfg.merge_report_enabled and not self.cfg.merge_report_log_path:
+                self._append_log(
+                    "[MergeReport] WARNING: enabled but log_path not configured; skipping"
+                )
+            self._merge_report_monitor = None
+
+        # Initialize post-dispatch status monitor if enabled (Phase 2)
+        # DISABLED: Not needed for simple dispatch summary
+        # if self.cfg.postdispatch_config:
+        #     try:
+        #         self._postdispatch_monitor = PostDispatchStatusMonitor(
+        #             client=self.client,
+        #             ui_queue=self._dispatch_queue,
+        #             config=self.cfg.postdispatch_config,
+        #         )
+        #         self._postdispatch_monitor.start()
+        #     except Exception as e:
+        #         pass
+        self._postdispatch_monitor = None
+
         params = {
             "client": self.client,
             "report_ids": self.report_ids,
@@ -475,6 +792,7 @@ class ReportsApp(ttk.Frame):
             "no_change": no_change,
             "wait_seconds": self.DISPATCH_STATUS_WAIT_SECONDS,
             "poll_interval": self.DISPATCH_STATUS_POLL_SECONDS,
+            "app": self.app_var.get().strip(),
         }
         while True:
             try:
@@ -482,33 +800,192 @@ class ReportsApp(ttk.Frame):
             except queue.Empty:
                 break
         self._set_dispatch_state(True)
-        self._dispatch_thread = threading.Thread(
-            target=self._dispatch_worker,
-            args=(params,),
-            daemon=True,
-        )
-        self._dispatch_thread.start()
         self.after(150, self._poll_dispatch_queue)
+
+        def _task(set_status: Callable[[str], None]) -> None:
+            self._dispatch_worker(params, status_callback=set_status)
+
+        def _on_error(exc: Exception) -> None:
+            self._dispatch_queue.put(("err", exc))
+
+        run_with_progress(
+            self.master,
+            "Dispatching Reports",
+            "Starting dispatch...",
+            _task,
+            on_error=_on_error,
+        )
 
 
 def main() -> None:
     root = tk.Tk()
-    root.iconbitmap("assets/app.ico")
+    exe_dir = _resolve_runtime_exe_dir()
+
+    policy = None
+    policy_load_error: Optional[Exception] = None
+    try:
+        policy = load_security_policy(exe_dir=exe_dir)
+    except Exception as exc:
+        policy_load_error = exc
+
+    broker_handle = start_local_logging_broker(
+        exe_dir=exe_dir,
+        tool_version=TOOL_VERSION,
+        allow_local_appdata=bool(policy and (not policy.is_production) and policy.insecure_overrides_active),
+    )
+    audit_logger = broker_handle.audit_logger
+    set_security_audit_logger(audit_logger)
+    set_security_policy(policy)
+    audit_logger.log_event("TOOL_START", level="INFO")
+    if audit_logger.log_path:
+        audit_logger.log_event("LOG_PATH_SELECTED", level="INFO", log_path=audit_logger.log_path)
+
+    if policy_load_error is not None:
+        if isinstance(policy_load_error, PolicyViolation):
+            audit_logger.log_event(
+                "POLICY_VIOLATION_BLOCKED",
+                level="ERROR",
+                control=policy_load_error.control,
+                reason=policy_load_error.detail,
+            )
+        else:
+            audit_logger.log_event("CONFIG_LOAD_FAILED", level="ERROR", reason=redact_text(str(policy_load_error)))
+        audit_logger.log_event("TOOL_EXIT", level="INFO")
+        show_modal_prompt(
+            root,
+            "Security policy blocked startup",
+            "Startup was blocked by security policy. Check audit.jsonl for details.",
+            "error",
+        )
+        broker_handle.shutdown()
+        root.destroy()
+        return
+
+    if policy and policy.break_glass_used:
+        audit_logger.log_event(
+            "POLICY_BREAK_GLASS_USED",
+            level="WARN",
+            break_glass_token_sha256=policy.break_glass_token_sha256,
+        )
+
+    icon_path = _resolve_app_icon_path()
+    if icon_path:
+        try:
+            root.iconbitmap(icon_path)
+        except tk.TclError:
+            # Continue even if Tk cannot load the icon in this environment.
+            pass
     root.withdraw()  # hide until config is loaded
 
-    try:
-        cfg = load_config()
-    except Exception as e:
-        messagebox.showerror(
-            "Configuration error",
-            f"Failed to load config.ini:\n{e}",
+    log_broker_url, log_broker_token = broker_handle.child_auth_config()
+    splunk_broker_handle = start_local_splunk_broker(
+        exe_dir=exe_dir,
+        logging_broker_url=log_broker_url,
+        logging_broker_token=log_broker_token,
+    )
+    runtime_warning = ""
+    runtime_payload: dict[str, object] = {}
+    runtime_loaded = False
+    if splunk_broker_handle.is_available and splunk_broker_handle.client is not None:
+        try:
+            runtime_payload = splunk_broker_handle.client.get_runtime_config()
+            runtime_loaded = True
+        except Exception as exc:
+            runtime_warning = (
+                f"{SPLUNK_BROKER_UNAVAILABLE_WARNING} "
+                f"({redact_text(str(exc))})"
+            )
+    else:
+        runtime_warning = splunk_broker_handle.startup_error or SPLUNK_BROKER_UNAVAILABLE_WARNING
+
+    if not runtime_loaded:
+        audit_logger.log_event("CONFIG_LOAD_FAILED", level="ERROR", reason=runtime_warning or SPLUNK_BROKER_UNAVAILABLE_WARNING)
+        audit_logger.log_event("TOOL_EXIT", level="INFO")
+        show_modal_prompt(
+            root,
+            "Local Splunk broker unavailable",
+            SPLUNK_BROKER_UNAVAILABLE_WARNING,
+            "error",
         )
+        splunk_broker_handle.shutdown()
+        broker_handle.shutdown()
+        root.destroy()
+        return
+
+    cfg = _build_cfg_from_runtime_payload(runtime_payload, exe_dir=exe_dir)
+
+    audit_logger.configure(
+        level=cfg.logging_level,
+        verbose=cfg.logging_verbose,
+        max_bytes=cfg.logging_max_bytes,
+        backup_count=cfg.logging_backup_count,
+    )
+    config_hash = audit_logger.record_config_loaded(cfg.config_path)
+    audit_logger.verify_log_set()
+    if cfg.legacy_password_present:
+        audit_logger.log_event("CONFIG_LEGACY_PASSWORD_IGNORED", level="WARN")
+    if not cfg.verify_ssl:
+        audit_logger.log_event(
+            "TLS_VERIFY_DISABLED",
+            level="WARN",
+            reason="config_verify_ssl_false",
+        )
+
+    fingerprint = build_security_fingerprint(
+        tool_version=TOOL_VERSION,
+        policy=policy,
+        logging_level=cfg.logging_level,
+        logging_max_bytes=cfg.logging_max_bytes,
+        logging_backup_count=cfg.logging_backup_count,
+    )
+    baseline_ok, baseline_reason = enforce_security_baseline(
+        exe_dir=exe_dir,
+        policy=policy,
+        fingerprint=fingerprint,
+        config_hash=config_hash,
+        confirm_update_fn=lambda msg: bool(show_modal_prompt(root, "Break-glass confirmation", msg, "confirm")),
+        audit_event_fn=audit_logger.log_event,
+    )
+    if not baseline_ok:
+        audit_logger.log_event(
+            "HARDENING_REVERSAL_BLOCKED",
+            level="ERROR",
+            reason=baseline_reason,
+        )
+        audit_logger.log_event("TOOL_EXIT", level="INFO")
+        show_modal_prompt(
+            root,
+            "Security configuration blocked",
+            "Security configuration downgrade detected. Tool run blocked. Contact Splunk team.",
+            "error",
+        )
+        splunk_broker_handle.shutdown()
+        broker_handle.shutdown()
         root.destroy()
         return
 
     root.deiconify()
-    app = ReportsApp(root, cfg)
-    root.mainloop()
+    app = ReportsApp(
+        root,
+        cfg,
+        audit_logger=audit_logger,
+        splunk_broker_handle=splunk_broker_handle,
+        startup_warning=runtime_warning,
+        exe_dir=exe_dir,
+    )
+
+    def _on_close() -> None:
+        audit_logger.log_event("TOOL_EXIT", level="INFO")
+        splunk_broker_handle.shutdown()
+        broker_handle.shutdown()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", _on_close)
+    try:
+        root.mainloop()
+    finally:
+        splunk_broker_handle.shutdown()
+        broker_handle.shutdown()
 
 
 if __name__ == "__main__":

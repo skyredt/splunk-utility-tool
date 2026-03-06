@@ -1,23 +1,34 @@
-Splunk Utility Tool v3.0 (Skeleton)
+CIO Splunk Utility Tool 4.0
 
 Files:
-- main.py           : PySide6 GUI entrypoint (Reports tab only)
-- splunk_engine.py  : Core engine (REST, dispatch logic, multi-report support)
-- config.ini        : Basic Splunk connection settings
+- main.py           : launcher + token setup CLI helper
+- splunk_engine.py  : core engine (REST, auth, dispatch logic)
+- splunk_report_tk.py : Tk desktop UI
+- config.ini        : Splunk connection and app settings
 
-Quick start:
-1. Create a virtual env (optional but recommended):
-   python -m venv .venv
-   .venv\Scripts\activate  (Windows)
-   source .venv/bin/activate (Linux/macOS)
+Authentication Modes
+- `auth_mode=token` (recommended): uses `Authorization: Bearer <token>`.
+- `auth_mode=password` (rollback): uses username/password login at `/services/auth/login`, then `Authorization: Splunk <sessionKey>`.
+- `pass4SymmKey` is not used by this tool. It is for Splunk internal component trust (for example SHC/deployer), not client app authentication.
 
-2. Install dependencies:
-   pip install PySide6 requests
+Token Storage
+- Recommended: `token_storage=splunk_secret`
+  - Store a Splunk-encrypted token (`$7$...`) in `token_encrypted`.
+  - Runtime decryption uses local Splunk UF CLI and local `splunk.secret`.
+- Development fallback: `token_storage=plain`
+  - Reads clear token from `[splunk].token`.
 
-3. Edit config.ini with your Splunk servers and credentials.
+How To Configure Encrypted Token
+1. Configure:
+   - `auth_mode = token`
+   - `token_storage = splunk_secret`
+2. Generate encrypted value:
+   - `splunk.exe show-encrypted --value "<token>"`
+3. Put output into `[splunk].token_encrypted`.
+4. Validate:
+   - `python tool.py --test-auth`
 
-4. Run:
-   python main.py
-
-This is a minimal working base for Splunk Utility Tool v3.0.
-You can extend the UI (tabs, feedback, status) without touching splunk_engine.py.
+Self-Test Snippet (no secrets printed)
+```
+python tool.py --test-auth
+```

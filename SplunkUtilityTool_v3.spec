@@ -1,4 +1,4 @@
-﻿# -*- mode: python ; coding: utf-8 -*-
+# -*- mode: python ; coding: utf-8 -*-
 # Qt/PySide6 build for lab use; not recommended for hardened servers.
 import os
 import sys
@@ -112,13 +112,13 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="SplunkUtilityTool_v3",
+    name="SplunkUtilityTool_v4",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     console=False,
-    disable_windowed_traceback=False,
+    disable_windowed_traceback=True,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
@@ -133,5 +133,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name="SplunkUtilityTool_v3",
+    name="SplunkUtilityTool_v4",
 )
