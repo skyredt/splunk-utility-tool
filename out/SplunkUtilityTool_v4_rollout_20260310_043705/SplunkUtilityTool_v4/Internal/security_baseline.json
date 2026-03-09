@@ -1,0 +1,56 @@
+{
+  "baseline_fingerprint": {
+    "allow_insecure_overrides": false,
+    "allowed_artifact_roots": [
+      "c:\\splunktool3.0\\splunkutilitytool_v3.0_base\\out\\splunkutilitytool_v4_rollout_20260310_043705\\splunkutilitytool_v4\\internal",
+      "c:\\programdata\\splunkutilitytool"
+    ],
+    "allowed_auth_modes": [
+      "password"
+    ],
+    "audit_always_events": [
+      "CONFIG_CHANGE_DETECTED",
+      "CONFIG_LEGACY_PASSWORD_IGNORED",
+      "CONFIG_LOADED",
+      "CONFIG_LOAD_FAILED",
+      "CRED_DECRYPT_FAILED",
+      "CRED_ENROLL_CREATE",
+      "CRED_REENROLL_OVERWRITE",
+      "HARDENING_BASELINE_UPDATED",
+      "HARDENING_REVERSAL_BLOCKED",
+      "LEGACY_FEATURE_BLOCKED",
+      "LOG_CHAIN_START",
+      "LOG_MISSING_DETECTED",
+      "LOG_ROTATED",
+      "LOG_TAMPER_SUSPECTED",
+      "POLICY_BREAK_GLASS_USED",
+      "POLICY_VIOLATION_BLOCKED",
+      "SECRET_FILENAME_REJECTED",
+      "SECRET_FILE_MISSING",
+      "SECRET_FILE_WEAK_ACL_BLOCKED",
+      "SECRET_FILE_WRITE_FAILED",
+      "SECURITY_ARTIFACT_PATH_UNAVAILABLE",
+      "SPLUNK_AUTH_FAILED_USING_STORED_SECRET",
+      "TLS_VERIFY_DISABLED",
+      "TOOL_EXIT",
+      "TOOL_START"
+    ],
+    "audit_backup_count": 10,
+    "audit_level": "INFO",
+    "audit_max_bytes": 10485760,
+    "audit_min_retention_ok": true,
+    "build_mode": "production",
+    "env_overrides_allowed": false,
+    "https_only_enforced": true,
+    "legacy_features_enabled": false,
+    "policy_mode": "enforced",
+    "tls_verify_enforced": false,
+    "tool_version": "v4",
+    "ui_log_redaction_enabled": false
+  },
+  "baseline_hash": "b4f72c6c219b34d818c8f13881676b3eb6d0d03f5ed0a31836df4978e6ae79f2",
+  "config_hash": "3bb4c14bf81aeb78946806cc8e9b921d2a57a513936ab78781ddebd488c35bd5",
+  "created_at": "2026-03-09T20:44:39.054950+00:00",
+  "last_seen_at": "2026-03-09T20:44:39.054950+00:00",
+  "last_seen_hash": "b4f72c6c219b34d818c8f13881676b3eb6d0d03f5ed0a31836df4978e6ae79f2"
+}

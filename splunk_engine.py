@@ -5,10 +5,11 @@ import importlib
 import json
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 
 import getpass
@@ -45,6 +46,18 @@ from Internal.security_policy import PolicyViolation, SecurityPolicy, load_secur
 
 VALID_AUTH_MODES = ("password",)
 TOOL_DISPLAY_NAME = "Splunk Utility Tool v4"
+DEFAULT_DISPATCH_PER_SLICE_WAIT_SECONDS = 30
+DEFAULT_DISPATCH_CONTINUE_ON_TIMEOUT = True
+DEFAULT_DISPATCH_TIMEOUT_RESULT = "pending"
+DEFAULT_MERGEREPORT_TIMEOUT_SECONDS = 300
+DEFAULT_POSTDISPATCH_TIMEOUT_SECONDS = 300
+DEFAULT_POSTDISPATCH_POLL_SECONDS = 5
+DEFAULT_POSTDISPATCH_LOOKBACK_SECONDS = 900
+DEFAULT_STATUS_CHECK_TIMEOUT_SECONDS = DEFAULT_DISPATCH_PER_SLICE_WAIT_SECONDS
+DEFAULT_BROKER_REQUEST_TIMEOUT_SECONDS = 300
+DEFAULT_RECONCILE_PENDING_ENABLED = True
+DEFAULT_RECONCILE_WAIT_SECONDS = 60
+FAILED_DISPATCH_STATES = {"FAILED", "ERROR", "CANCELED", "CANCELLED"}
 
 
 _SECURITY_AUDIT_LOGGER = None
@@ -110,9 +123,12 @@ class SplunkConfig:
     legacy_password_present: bool = False
     merge_report_enabled: bool = False
     merge_report_log_path: str = ""
-    merge_report_timeout_seconds: int = 90
+    merge_report_timeout_seconds: int = DEFAULT_MERGEREPORT_TIMEOUT_SECONDS
+    dispatch_config: Optional[dict] = None
     # Manual regeneration acknowledgement settings
-    ack_enabled: bool = True
+    ack_enabled: bool = False
+    ack_on_pending: bool = False
+    ack_on_unknown: bool = False
     ack_recipients: List[str] = field(default_factory=list)
     ack_use_savedsearch_recipients: bool = False
     ack_attach_manifest: bool = False
@@ -179,6 +195,10 @@ def _parse_int(value: object, default: int) -> int:
         return default
 
 
+def _parse_min_int(value: object, default: int, minimum: int) -> int:
+    return max(minimum, _parse_int(value, default))
+
+
 def _parse_recipients(raw: str) -> List[str]:
     if not raw:
         return []
@@ -193,6 +213,24 @@ def _dedupe_keep_order(values: List[str]) -> List[str]:
             seen.add(value)
             output.append(value)
     return output
+
+
+def _normalize_timeout_result(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    if raw == "unknown":
+        return "UNKNOWN"
+    return "PENDING"
+
+
+def _is_pending_status(value: object) -> bool:
+    return str(value or "").strip().upper() in ("PENDING", "UNKNOWN")
+
+
+def _display_slice_status(value: object) -> str:
+    status = str(value or "").strip().upper()
+    if status == "UNKNOWN":
+        return "PENDING"
+    return status or "UNKNOWN"
 
 
 def get_effective_username() -> str:
@@ -224,7 +262,8 @@ class RegenSliceRecord:
     earliest: str = ""
     latest: str = ""
     sid: str = ""
-    status: str = "UNKNOWN"  # OK, FAILED, UNKNOWN
+    status: str = "UNKNOWN"  # OK, FAILED, PENDING/UNKNOWN
+    outcome_code: str = "DISPATCHED_PENDING"
     error: str = ""
 
 
@@ -263,6 +302,7 @@ class RegenContext:
         latest: str = "",
         sid: str = "",
         status: str = "UNKNOWN",
+        outcome_code: str = "DISPATCHED_PENDING",
         error: str = "",
     ) -> None:
         self.slices.append(
@@ -272,7 +312,8 @@ class RegenContext:
                 earliest=earliest,
                 latest=latest,
                 sid=sid,
-                status=status,
+                status=(str(status or "").strip().upper() or "UNKNOWN"),
+                outcome_code=outcome_code,
                 error=error,
             )
         )
@@ -280,8 +321,21 @@ class RegenContext:
     def summary_counts(self) -> Tuple[int, int, int]:
         ok_count = sum(1 for s in self.slices if s.status == "OK")
         fail_count = sum(1 for s in self.slices if s.status == "FAILED")
-        unknown_count = sum(1 for s in self.slices if s.status == "UNKNOWN")
-        return ok_count, fail_count, unknown_count
+        pending_count = sum(1 for s in self.slices if _is_pending_status(s.status))
+        return ok_count, fail_count, pending_count
+
+    def overall_status(self) -> str:
+        ok_count, fail_count, pending_count = self.summary_counts()
+        total = len(self.slices)
+        if pending_count > 0:
+            if ok_count > 0 or fail_count > 0:
+                return "PARTIAL / PENDING VERIFICATION"
+            return "PENDING VERIFICATION"
+        if fail_count > 0:
+            return "FAILED"
+        if total == 0:
+            return "UNKNOWN"
+        return "OK"
 
 
 def load_config(
@@ -396,18 +450,20 @@ def load_config(
     # MergeReport config (optional section)
     merge_report_enabled = False
     merge_report_log_path = ""
-    merge_report_timeout_seconds = 90
+    merge_report_timeout_seconds = DEFAULT_MERGEREPORT_TIMEOUT_SECONDS
 
     if "mergereport" in cfg:
         enabled_str = cfg["mergereport"].get("enabled", "false").lower()
         merge_report_enabled = enabled_str in ("true", "1", "yes")
         merge_report_log_path = cfg["mergereport"].get("log_path", "").strip()
-        try:
-            merge_report_timeout_seconds = int(
-                cfg["mergereport"].get("timeout_seconds", "90")
-            )
-        except ValueError:
-            merge_report_timeout_seconds = 90
+        merge_report_timeout_seconds = _parse_min_int(
+            cfg["mergereport"].get(
+                "timeout_seconds",
+                str(DEFAULT_MERGEREPORT_TIMEOUT_SECONDS),
+            ),
+            DEFAULT_MERGEREPORT_TIMEOUT_SECONDS,
+            1,
+        )
 
     # Validate MergeReport config if enabled
     merge_report_log_path_validated = ""
@@ -423,8 +479,34 @@ def load_config(
         else:
             merge_report_log_path_validated = merge_report_log_path
 
+    dispatch_config = {}
+    if "dispatch" in cfg:
+        section = cfg["dispatch"]
+        dispatch_config = {
+            "per_slice_wait_seconds": _parse_min_int(
+                section.get(
+                    "per_slice_wait_seconds",
+                    str(DEFAULT_DISPATCH_PER_SLICE_WAIT_SECONDS),
+                ),
+                DEFAULT_DISPATCH_PER_SLICE_WAIT_SECONDS,
+                1,
+            ),
+            "continue_on_timeout": _parse_bool(
+                section.get(
+                    "continue_on_timeout",
+                    str(int(DEFAULT_DISPATCH_CONTINUE_ON_TIMEOUT)),
+                ),
+                DEFAULT_DISPATCH_CONTINUE_ON_TIMEOUT,
+            ),
+            "timeout_result": _normalize_timeout_result(
+                section.get("timeout_result", DEFAULT_DISPATCH_TIMEOUT_RESULT)
+            ).lower(),
+        }
+
     # Manual ACK + SMTP defaults
-    ack_enabled = True
+    ack_enabled = False
+    ack_on_pending = False
+    ack_on_unknown = False
     ack_recipients: List[str] = []
     ack_use_savedsearch_recipients = False
     ack_attach_manifest = False
@@ -438,7 +520,10 @@ def load_config(
     # Legacy [smtp] section compatibility
     if "smtp" in cfg:
         section = cfg["smtp"]
-        ack_enabled = _parse_bool(section.get("enabled", "true"), True)
+        ack_enabled = _parse_bool(
+            section.get("enabled", str(int(ack_enabled))),
+            ack_enabled,
+        )
         smtp_host = section.get("host", "127.0.0.1").strip() or smtp_host
         smtp_port = _parse_int(section.get("port", "25"), 25)
         smtp_user = section.get("username", "").strip()
@@ -453,6 +538,11 @@ def load_config(
     if "email" in cfg:
         section = cfg["email"]
         ack_enabled = _parse_bool(section.get("ack_enabled", str(int(ack_enabled))), ack_enabled)
+        ack_on_pending = _parse_bool(
+            section.get("ack_on_pending", section.get("ack_on_unknown", "0")),
+            False,
+        )
+        ack_on_unknown = ack_on_pending
         ack_recipients = _parse_recipients(section.get("ack_recipients", ""))
         ack_use_savedsearch_recipients = _parse_bool(
             section.get("ack_use_savedsearch_recipients", "0"), False
@@ -480,15 +570,68 @@ def load_config(
             "merge_report_index": section.get("merge_report_index", "_internal"),
             "merge_report_source_contains": section.get("merge_report_source_contains", "mergeReport_alert.log"),
             "merge_report_sourcetype": section.get("merge_report_sourcetype", "").strip(),
-            "merge_report_timeout_seconds": int(section.get("merge_report_timeout_seconds", "120")) if section.get("merge_report_timeout_seconds") else 120,
+            "merge_report_timeout_seconds": _parse_min_int(
+                section.get(
+                    "merge_report_timeout_seconds",
+                    str(DEFAULT_POSTDISPATCH_TIMEOUT_SECONDS),
+                ),
+                DEFAULT_POSTDISPATCH_TIMEOUT_SECONDS,
+                1,
+            ),
             "native_email_enabled": section.get("native_email_enabled", "true").lower() in ("true", "1", "yes"),
             "native_email_index": section.get("native_email_index", "_internal"),
             "native_email_source_contains": section.get("native_email_source_contains", "python.log"),
             "native_email_sourcetype": section.get("native_email_sourcetype", "").strip(),
-            "native_email_timeout_seconds": int(section.get("native_email_timeout_seconds", "120")) if section.get("native_email_timeout_seconds") else 120,
+            "native_email_timeout_seconds": _parse_min_int(
+                section.get(
+                    "native_email_timeout_seconds",
+                    str(DEFAULT_POSTDISPATCH_TIMEOUT_SECONDS),
+                ),
+                DEFAULT_POSTDISPATCH_TIMEOUT_SECONDS,
+                1,
+            ),
             "native_email_strict_success": section.get("native_email_strict_success", "false").lower() in ("true", "1", "yes"),
-            "poll_seconds": int(section.get("poll_seconds", "3")) if section.get("poll_seconds") else 3,
-            "lookback_seconds": int(section.get("lookback_seconds", "300")) if section.get("lookback_seconds") else 300,
+            "poll_seconds": _parse_min_int(
+                section.get("poll_seconds", str(DEFAULT_POSTDISPATCH_POLL_SECONDS)),
+                DEFAULT_POSTDISPATCH_POLL_SECONDS,
+                1,
+            ),
+            "reconcile_pending": _parse_bool(
+                section.get(
+                    "reconcile_pending",
+                    str(int(DEFAULT_RECONCILE_PENDING_ENABLED)),
+                ),
+                DEFAULT_RECONCILE_PENDING_ENABLED,
+            ),
+            "reconcile_wait_seconds": _parse_min_int(
+                section.get(
+                    "reconcile_wait_seconds",
+                    str(DEFAULT_RECONCILE_WAIT_SECONDS),
+                ),
+                DEFAULT_RECONCILE_WAIT_SECONDS,
+                1,
+            ),
+            "lookback_seconds": _parse_min_int(
+                section.get("lookback_seconds", str(DEFAULT_POSTDISPATCH_LOOKBACK_SECONDS)),
+                DEFAULT_POSTDISPATCH_LOOKBACK_SECONDS,
+                1,
+            ),
+            "broker_request_timeout_seconds": _parse_min_int(
+                section.get(
+                    "broker_request_timeout_seconds",
+                    str(DEFAULT_BROKER_REQUEST_TIMEOUT_SECONDS),
+                ),
+                DEFAULT_BROKER_REQUEST_TIMEOUT_SECONDS,
+                1,
+            ),
+            "status_check_timeout_seconds": _parse_min_int(
+                section.get(
+                    "status_check_timeout_seconds",
+                    str(DEFAULT_STATUS_CHECK_TIMEOUT_SECONDS),
+                ),
+                DEFAULT_STATUS_CHECK_TIMEOUT_SECONDS,
+                1,
+            ),
         }
 
     return SplunkConfig(
@@ -508,7 +651,10 @@ def load_config(
         merge_report_enabled=merge_report_enabled,
         merge_report_log_path=merge_report_log_path_validated,
         merge_report_timeout_seconds=merge_report_timeout_seconds,
+        dispatch_config=dispatch_config if dispatch_config else None,
         ack_enabled=ack_enabled,
+        ack_on_pending=ack_on_pending,
+        ack_on_unknown=ack_on_unknown,
         ack_recipients=ack_recipients,
         ack_use_savedsearch_recipients=ack_use_savedsearch_recipients,
         ack_attach_manifest=ack_attach_manifest,
@@ -803,6 +949,33 @@ class SplunkClient(QObject):
 
         return True, sid, ""
 
+    def get_job_status_snapshot(
+        self,
+        sid: str,
+        request_timeout_seconds: float = 10.0,
+    ) -> Tuple[str, dict]:
+        resp = self._request(
+            "GET",
+            f"/services/search/jobs/{sid}",
+            params={"output_mode": "json", "count": 0},
+            timeout=max(1.0, float(request_timeout_seconds)),
+        )
+        data = resp.json()
+        entry = data.get("entry", [{}])[0]
+        content = entry.get("content", {})
+        if not isinstance(content, dict):
+            content = {}
+
+        dispatch_state = str(content.get("dispatchState", "") or "").strip().upper()
+        is_done = _parse_bool(content.get("isDone"), False)
+        is_failed = _parse_bool(content.get("isFailed"), False)
+
+        if dispatch_state in FAILED_DISPATCH_STATES or is_failed:
+            return "FAILED", content
+        if is_done:
+            return "SUCCESS", content
+        return "RUNNING", content
+
     def check_job_status(
         self, sid: str, wait_seconds: int = 10, poll_interval: int = 2
     ) -> Tuple[str, dict]:
@@ -811,27 +984,26 @@ class SplunkClient(QObject):
 
         Returns (state, content) where state is 'SUCCESS', 'FAILED', or 'TIMEOUT'.
         """
-        import time
-
         last_content: dict = {}
-        deadline = time.time() + wait_seconds
+        deadline = time.monotonic() + max(1, int(wait_seconds))
+        poll_seconds = max(1.0, float(poll_interval))
 
-        while time.time() < deadline:
-            data = self._get(f"/services/search/jobs/{sid}")
-            entry = data.get("entry", [{}])[0]
-            content = entry.get("content", {})
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            request_timeout = min(max(1.0, poll_seconds), max(1.0, remaining))
+            state, content = self.get_job_status_snapshot(
+                sid,
+                request_timeout_seconds=request_timeout,
+            )
             last_content = content
-
-            is_done = content.get("isDone")
-            dispatch_state = content.get("dispatchState")
-
-            if is_done:
-                if dispatch_state in ("DONE", "SUCCESS", None):
-                    return "SUCCESS", content
-                else:
-                    return "FAILED", content
-
-            time.sleep(poll_interval)
+            if state in ("SUCCESS", "FAILED"):
+                return state, content
+            sleep_seconds = min(poll_seconds, max(0.0, deadline - time.monotonic()))
+            if sleep_seconds <= 0:
+                break
+            time.sleep(sleep_seconds)
 
         return "TIMEOUT", last_content
 
@@ -930,6 +1102,213 @@ def _append_log(
         log_callback(line)
 
 
+def _dispatch_slice_and_wait(
+    logs: List[str],
+    *,
+    client: SplunkClient,
+    report_id_url: str,
+    report_name: str,
+    slice_label: str,
+    earliest_display: str,
+    latest_display: str,
+    dispatch_earliest: Optional[str],
+    dispatch_latest: Optional[str],
+    wait_seconds: int,
+    poll_interval: int,
+    timeout_status: str,
+    log_prefix: str,
+    log_callback: Optional[Callable[[str], None]],
+    sid_callback: Optional[Callable[[str, str], None]],
+    record_slice: Callable[..., None],
+    audit_slice_event: Callable[..., None],
+) -> Tuple[str, str]:
+    ok, sid, err = client.dispatch_saved_search(
+        report_id_url,
+        earliest=dispatch_earliest,
+        latest=dispatch_latest,
+    )
+    if not ok:
+        _append_log(logs, f"  {log_prefix}FAILED: {err}", log_callback)
+        audit_slice_event(
+            "REPORT_SLICE_FAILED",
+            level="WARN",
+            slice_label=slice_label,
+            reason=_short_error(err),
+        )
+        record_slice(
+            slice_label=slice_label,
+            status="FAILED",
+            earliest=earliest_display,
+            latest=latest_display,
+            outcome_code="DISPATCH_FAILED",
+            error=err,
+        )
+        return "FAILED", ""
+    if sid is None:
+        _append_log(logs, f"  {log_prefix}FAILED: No sid returned", log_callback)
+        audit_slice_event(
+            "REPORT_SLICE_FAILED",
+            level="WARN",
+            slice_label=slice_label,
+            reason="No SID returned",
+        )
+        record_slice(
+            slice_label=slice_label,
+            status="FAILED",
+            earliest=earliest_display,
+            latest=latest_display,
+            outcome_code="DISPATCH_FAILED",
+            error="No SID returned",
+        )
+        return "FAILED", ""
+
+    _append_log(
+        logs,
+        (
+            f"  {log_prefix}DISPATCHED (sid={sid}) - "
+            f"awaiting status verification for up to {wait_seconds}s..."
+        ),
+        log_callback,
+    )
+    audit_slice_event(
+        "REPORT_SLICE_SID_RECEIVED",
+        slice_label=slice_label,
+        sid=sid,
+    )
+    audit_slice_event(
+        "REPORT_SLICE_DISPATCHED",
+        slice_label=slice_label,
+        sid=sid,
+    )
+    if sid_callback:
+        sid_callback(sid, report_name)
+
+    try:
+        state, info = client.check_job_status(
+            sid,
+            wait_seconds=wait_seconds,
+            poll_interval=poll_interval,
+        )
+    except Exception as exc:
+        raw_error = str(exc) or repr(exc)
+        err_msg = _build_pending_status_message(raw_error, wait_seconds=wait_seconds)
+        _append_log(
+            logs,
+            f"  {log_prefix}{_display_slice_status(timeout_status)} (sid={sid}) - {err_msg}",
+            log_callback,
+        )
+        if _error_looks_like_timeout(raw_error):
+            audit_slice_event(
+                "REPORT_SLICE_ACTIVE_WAIT_EXPIRED",
+                level="WARN",
+                slice_label=slice_label,
+                sid=sid,
+                reason=_short_error(raw_error),
+            )
+        else:
+            audit_slice_event(
+                "REPORT_SLICE_STATUS_CHECK_ERROR",
+                level="WARN",
+                slice_label=slice_label,
+                sid=sid,
+                reason=_short_error(raw_error),
+            )
+        audit_slice_event(
+            "REPORT_SLICE_MARKED_PENDING",
+            level="WARN",
+            slice_label=slice_label,
+            sid=sid,
+            reason=_short_error(err_msg),
+        )
+        record_slice(
+            slice_label=slice_label,
+            status=timeout_status,
+            earliest=earliest_display,
+            latest=latest_display,
+            sid=sid,
+            outcome_code="DISPATCHED_PENDING",
+            error=err_msg,
+        )
+        return timeout_status, sid
+
+    if state == "SUCCESS":
+        _append_log(logs, f"  {log_prefix}OK (sid={sid})", log_callback)
+        audit_slice_event(
+            "REPORT_SLICE_OK",
+            slice_label=slice_label,
+            sid=sid,
+        )
+        record_slice(
+            slice_label=slice_label,
+            status="OK",
+            earliest=earliest_display,
+            latest=latest_display,
+            sid=sid,
+            outcome_code="SUCCESS",
+        )
+        return "OK", sid
+
+    if state == "FAILED":
+        dispatch_state = str(info.get("dispatchState", "Unknown error") or "Unknown error")
+        _append_log(
+            logs,
+            f"  {log_prefix}FAILED (sid={sid}, state={dispatch_state})",
+            log_callback,
+        )
+        audit_slice_event(
+            "REPORT_SLICE_FAILED",
+            level="WARN",
+            slice_label=slice_label,
+            sid=sid,
+            reason=_short_error(dispatch_state),
+        )
+        record_slice(
+            slice_label=slice_label,
+            status="FAILED",
+            earliest=earliest_display,
+            latest=latest_display,
+            sid=sid,
+            outcome_code="VERIFIED_FAILED",
+            error=dispatch_state,
+        )
+        return "FAILED", sid
+
+    last_dispatch_state = str(info.get("dispatchState", "")).strip()
+    timeout_detail = f"Status not confirmed within {wait_seconds} seconds."
+    if last_dispatch_state:
+        timeout_detail += f" Last dispatchState={last_dispatch_state}."
+    err_msg = _build_pending_status_message(timeout_detail, wait_seconds=wait_seconds)
+    _append_log(
+        logs,
+        f"  {log_prefix}{_display_slice_status(timeout_status)} (sid={sid}) - {err_msg}",
+        log_callback,
+    )
+    audit_slice_event(
+        "REPORT_SLICE_ACTIVE_WAIT_EXPIRED",
+        level="WARN",
+        slice_label=slice_label,
+        sid=sid,
+        reason=_short_error(timeout_detail),
+    )
+    audit_slice_event(
+        "REPORT_SLICE_MARKED_PENDING",
+        level="WARN",
+        slice_label=slice_label,
+        sid=sid,
+        reason=_short_error(err_msg),
+    )
+    record_slice(
+        slice_label=slice_label,
+        status=timeout_status,
+        earliest=earliest_display,
+        latest=latest_display,
+        sid=sid,
+        outcome_code="DISPATCHED_PENDING",
+        error=err_msg,
+    )
+    return timeout_status, sid
+
+
 def run_dispatch_single(
     client: SplunkClient,
     report_id_url: str,
@@ -943,14 +1322,18 @@ def run_dispatch_single(
     log_callback: Optional[Callable[[str], None]] = None,
     sid_callback: Optional[Callable[[str, str], None]] = None,
     regen_context: Optional[RegenContext] = None,
+    continue_on_timeout: bool = DEFAULT_DISPATCH_CONTINUE_ON_TIMEOUT,
+    timeout_status: str = "PENDING",
 ) -> List[str]:
     logs: List[str] = []
+
     def _record_slice(
         slice_label: str,
         status: str,
         earliest: str = "",
         latest: str = "",
         sid: str = "",
+        outcome_code: str = "DISPATCHED_PENDING",
         error: str = "",
     ) -> None:
         if regen_context is None:
@@ -962,92 +1345,49 @@ def run_dispatch_single(
             latest=latest,
             sid=sid,
             status=status,
+            outcome_code=outcome_code,
             error=error,
         )
+
+    def _audit_slice_event(event: str, *, level: str = "INFO", **fields) -> None:
+        if regen_context is None:
+            return
+        _audit_event(
+            event,
+            level=level,
+            run_id=regen_context.run_id,
+            report_name=report_name,
+            **fields,
+        )
+
     if no_change:
+        slice_label = "single run"
         _append_log(
             logs,
             f"Dispatching '{report_name}' with saved search time range...",
             log_callback,
         )
-        ok, sid, err = client.dispatch_saved_search(report_id_url)
-        if not ok:
-            _append_log(logs, f"  FAILED: {err}", log_callback)
-            _record_slice(
-                slice_label="single run",
-                status="FAILED",
-                earliest=str(start),
-                latest=str(end),
-                error=err,
-            )
-            return logs
-        if sid is None:
-            _append_log(logs, "  FAILED: No sid returned", log_callback)
-            _record_slice(
-                slice_label="single run",
-                status="FAILED",
-                earliest=str(start),
-                latest=str(end),
-                error="No SID returned",
-            )
-            return logs
-        if sid_callback:
-            sid_callback(sid, report_name)
-        try:
-            state, info = client.check_job_status(
-                sid, wait_seconds=wait_seconds, poll_interval=poll_interval
-            )
-        except Exception as exc:
-            err_msg = f"Status check error: {exc!r}"
-            _append_log(logs, f"  FAILED (sid={sid}, error={err_msg})", log_callback)
-            _record_slice(
-                slice_label="single run",
-                status="FAILED",
-                earliest=str(start),
-                latest=str(end),
-                sid=sid,
-                error=err_msg,
-            )
-            return logs
-        if state == "SUCCESS":
-            _append_log(logs, f"  OK (sid={sid})", log_callback)
-            _record_slice(
-                slice_label="single run",
-                status="OK",
-                earliest=str(start),
-                latest=str(end),
-                sid=sid,
-            )
-        elif state == "FAILED":
-            dispatch_state = str(info.get("dispatchState", "Unknown error"))
-            _append_log(
-                logs,
-                f"  FAILED (sid={sid}, state={dispatch_state})",
-                log_callback,
-            )
-            _record_slice(
-                slice_label="single run",
-                status="FAILED",
-                earliest=str(start),
-                latest=str(end),
-                sid=sid,
-                error=dispatch_state,
-            )
-        else:
-            _append_log(
-                logs,
-                f"  UNKNOWN (sid={sid}) - job still running / timeout while checking",
-                log_callback,
-            )
-            _record_slice(
-                slice_label="single run",
-                status="UNKNOWN",
-                earliest=str(start),
-                latest=str(end),
-                sid=sid,
-                error="Job still running / timeout",
-            )
+        _dispatch_slice_and_wait(
+            logs,
+            client=client,
+            report_id_url=report_id_url,
+            report_name=report_name,
+            slice_label=slice_label,
+            earliest_display=str(start),
+            latest_display=str(end),
+            dispatch_earliest=None,
+            dispatch_latest=None,
+            wait_seconds=wait_seconds,
+            poll_interval=poll_interval,
+            timeout_status=timeout_status,
+            log_prefix="",
+            log_callback=log_callback,
+            sid_callback=sid_callback,
+            record_slice=_record_slice,
+            audit_slice_event=_audit_slice_event,
+        )
         return logs
+
     starts, ends = build_slices(start, end, frequency)
     if len(starts) == 0:
         raise ValueError("Selected date range generates 0 slices/emails.")
@@ -1059,6 +1399,7 @@ def run_dispatch_single(
         log_callback,
     )
     for i, (s, e) in enumerate(zip(starts, ends), start=1):
+        slice_label = f"[{i}/{len(starts)}]"
         earliest = to_epoch(s)
         latest = to_epoch(e)
         _append_log(
@@ -1066,91 +1407,56 @@ def run_dispatch_single(
             f"  [{i}/{len(starts)}] Earliest: {s}, Latest: {e} - sending...",
             log_callback,
         )
-        ok, sid, err = client.dispatch_saved_search(
-            report_id_url, earliest=earliest, latest=latest
+        status, sid = _dispatch_slice_and_wait(
+            logs,
+            client=client,
+            report_id_url=report_id_url,
+            report_name=report_name,
+            slice_label=slice_label,
+            earliest_display=str(s),
+            latest_display=str(e),
+            dispatch_earliest=earliest,
+            dispatch_latest=latest,
+            wait_seconds=wait_seconds,
+            poll_interval=poll_interval,
+            timeout_status=timeout_status,
+            log_prefix=f"[{i}/{len(starts)}] ",
+            log_callback=log_callback,
+            sid_callback=sid_callback,
+            record_slice=_record_slice,
+            audit_slice_event=_audit_slice_event,
         )
-        if not ok:
-            _append_log(logs, f"  [{i}/{len(starts)}] FAILED: {err}", log_callback)
-            _record_slice(
-                slice_label=f"[{i}/{len(starts)}]",
-                status="FAILED",
-                earliest=str(s),
-                latest=str(e),
-                error=err,
-            )
-            continue
-        if sid is None:
-            _append_log(
-                logs, f"  [{i}/{len(starts)}] FAILED: No sid returned", log_callback
-            )
-            _record_slice(
-                slice_label=f"[{i}/{len(starts)}]",
-                status="FAILED",
-                earliest=str(s),
-                latest=str(e),
-                error="No SID returned",
-            )
-            continue
-        if sid_callback:
-            sid_callback(sid, report_name)
-        try:
-            state, info = client.check_job_status(
-                sid, wait_seconds=wait_seconds, poll_interval=poll_interval
-            )
-        except Exception as exc:
-            err_msg = f"Status check error: {exc!r}"
+        if _is_pending_status(status) and i < len(starts):
+            if continue_on_timeout:
+                _append_log(
+                    logs,
+                    (
+                        f"  [{i}/{len(starts)}] Status not confirmed within {wait_seconds} seconds. "
+                        "Continuing to next slice."
+                    ),
+                    log_callback,
+                )
+                _audit_slice_event(
+                    "REPORT_BATCH_CONTINUE_AFTER_PENDING",
+                    level="INFO",
+                    slice_label=slice_label,
+                    sid=sid,
+                    remaining_slices=len(starts) - i,
+                )
+                continue
             _append_log(
                 logs,
-                f"  [{i}/{len(starts)}] FAILED (sid={sid}, error={err_msg})",
+                f"  [{i}/{len(starts)}] Halting remaining slices because continue_on_timeout=false.",
                 log_callback,
             )
-            _record_slice(
-                slice_label=f"[{i}/{len(starts)}]",
-                status="FAILED",
-                earliest=str(s),
-                latest=str(e),
+            _audit_slice_event(
+                "REPORT_BATCH_STOPPED_AFTER_PENDING",
+                level="WARN",
+                slice_label=slice_label,
                 sid=sid,
-                error=err_msg,
+                remaining_slices=len(starts) - i,
             )
-            continue
-        if state == "SUCCESS":
-            _append_log(logs, f"  [{i}/{len(starts)}] OK (sid={sid})", log_callback)
-            _record_slice(
-                slice_label=f"[{i}/{len(starts)}]",
-                status="OK",
-                earliest=str(s),
-                latest=str(e),
-                sid=sid,
-            )
-        elif state == "FAILED":
-            dispatch_state = str(info.get("dispatchState", "Unknown error"))
-            _append_log(
-                logs,
-                f"  [{i}/{len(starts)}] FAILED (sid={sid}, state={dispatch_state})",
-                log_callback,
-            )
-            _record_slice(
-                slice_label=f"[{i}/{len(starts)}]",
-                status="FAILED",
-                earliest=str(s),
-                latest=str(e),
-                sid=sid,
-                error=dispatch_state,
-            )
-        else:
-            _append_log(
-                logs,
-                f"  [{i}/{len(starts)}] UNKNOWN (sid={sid}) - job still running / timeout while checking",
-                log_callback,
-            )
-            _record_slice(
-                slice_label=f"[{i}/{len(starts)}]",
-                status="UNKNOWN",
-                earliest=str(s),
-                latest=str(e),
-                sid=sid,
-                error="Job still running / timeout",
-            )
+            break
     return logs
 
 @dataclass
@@ -1160,11 +1466,305 @@ class AckEmailResult:
     recipients: List[str] = field(default_factory=list)
     reason: str = ""
     error: str = ""
+
+
 def _short_error(text: str, limit: int = 180) -> str:
     clean = (text or "").replace("\n", " ").replace("\r", " ").strip()
     if len(clean) <= limit:
         return clean
     return clean[: limit - 3] + "..."
+
+
+def _error_looks_like_timeout(text: str) -> bool:
+    lower = (text or "").lower()
+    return "timed out" in lower or "timeout" in lower
+
+
+def _build_pending_status_message(detail: str = "", *, wait_seconds: Optional[int] = None) -> str:
+    active_wait = max(1, int(wait_seconds or DEFAULT_DISPATCH_PER_SLICE_WAIT_SECONDS))
+    if _error_looks_like_timeout(detail):
+        base = (
+            f"Status not confirmed within {active_wait} seconds. "
+            "Splunk may still complete pending jobs asynchronously."
+        )
+    else:
+        base = (
+            "Slice dispatched successfully and remains pending verification. "
+            "Splunk may still complete pending jobs asynchronously."
+        )
+    clean_detail = (detail or "").strip()
+    if clean_detail:
+        return f"{base} Detail: {clean_detail}"
+    return base
+
+
+def resolve_status_check_timeout_seconds(config: Optional[SplunkConfig]) -> int:
+    if (
+        config is not None
+        and isinstance(config.dispatch_config, dict)
+        and "per_slice_wait_seconds" in config.dispatch_config
+    ):
+        return _parse_min_int(
+            config.dispatch_config.get("per_slice_wait_seconds"),
+            DEFAULT_DISPATCH_PER_SLICE_WAIT_SECONDS,
+            1,
+        )
+    if config is None or not isinstance(config.postdispatch_config, dict):
+        return DEFAULT_DISPATCH_PER_SLICE_WAIT_SECONDS
+    return _parse_min_int(
+        config.postdispatch_config.get("status_check_timeout_seconds"),
+        DEFAULT_STATUS_CHECK_TIMEOUT_SECONDS,
+        1,
+    )
+
+
+def resolve_status_check_poll_seconds(config: Optional[SplunkConfig]) -> int:
+    if config is None or not isinstance(config.postdispatch_config, dict):
+        return DEFAULT_POSTDISPATCH_POLL_SECONDS
+    return _parse_min_int(
+        config.postdispatch_config.get("poll_seconds"),
+        DEFAULT_POSTDISPATCH_POLL_SECONDS,
+        1,
+    )
+
+
+def resolve_broker_request_timeout_seconds(config: Optional[SplunkConfig]) -> int:
+    if config is None or not isinstance(config.postdispatch_config, dict):
+        return DEFAULT_BROKER_REQUEST_TIMEOUT_SECONDS
+    return _parse_min_int(
+        config.postdispatch_config.get("broker_request_timeout_seconds"),
+        DEFAULT_BROKER_REQUEST_TIMEOUT_SECONDS,
+        1,
+    )
+
+
+def resolve_continue_on_timeout(config: Optional[SplunkConfig]) -> bool:
+    if (
+        config is None
+        or not isinstance(config.dispatch_config, dict)
+        or "continue_on_timeout" not in config.dispatch_config
+    ):
+        return DEFAULT_DISPATCH_CONTINUE_ON_TIMEOUT
+    return _parse_bool(
+        config.dispatch_config.get("continue_on_timeout"),
+        DEFAULT_DISPATCH_CONTINUE_ON_TIMEOUT,
+    )
+
+
+def resolve_timeout_result(config: Optional[SplunkConfig]) -> str:
+    if (
+        config is None
+        or not isinstance(config.dispatch_config, dict)
+        or "timeout_result" not in config.dispatch_config
+    ):
+        return _normalize_timeout_result(DEFAULT_DISPATCH_TIMEOUT_RESULT)
+    return _normalize_timeout_result(
+        config.dispatch_config.get("timeout_result", DEFAULT_DISPATCH_TIMEOUT_RESULT)
+    )
+
+
+def resolve_reconcile_pending(config: Optional[SplunkConfig]) -> bool:
+    if config is None or not isinstance(config.postdispatch_config, dict):
+        return DEFAULT_RECONCILE_PENDING_ENABLED
+    return _parse_bool(
+        config.postdispatch_config.get("reconcile_pending"),
+        DEFAULT_RECONCILE_PENDING_ENABLED,
+    )
+
+
+def resolve_reconcile_wait_seconds(config: Optional[SplunkConfig]) -> int:
+    if config is None or not isinstance(config.postdispatch_config, dict):
+        return DEFAULT_RECONCILE_WAIT_SECONDS
+    return _parse_min_int(
+        config.postdispatch_config.get("reconcile_wait_seconds"),
+        DEFAULT_RECONCILE_WAIT_SECONDS,
+        1,
+    )
+
+
+def _pending_slice_records(context: RegenContext) -> List[RegenSliceRecord]:
+    return [item for item in context.slices if _is_pending_status(item.status)]
+
+
+def _fetch_job_status_snapshot(
+    client: SplunkClient,
+    sid: str,
+    *,
+    request_timeout_seconds: int,
+    poll_interval: int,
+) -> Tuple[str, dict]:
+    if hasattr(client, "get_job_status_snapshot"):
+        return client.get_job_status_snapshot(
+            sid,
+            request_timeout_seconds=max(1, int(request_timeout_seconds)),
+        )
+    return client.check_job_status(
+        sid,
+        wait_seconds=max(1, int(request_timeout_seconds)),
+        poll_interval=max(1, int(poll_interval)),
+    )
+
+
+def _reconcile_pending_slices(
+    client: SplunkClient,
+    context: RegenContext,
+    *,
+    wait_seconds: int,
+    poll_interval: int,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> List[str]:
+    logs: List[str] = []
+    pending = [item for item in _pending_slice_records(context) if item.sid]
+    if not pending:
+        return logs
+
+    _append_log(
+        logs,
+        (
+            f"Starting pending reconciliation for {len(pending)} slice(s). "
+            f"Budget={max(1, int(wait_seconds))} seconds."
+        ),
+        log_callback,
+    )
+    _audit_event(
+        "REPORT_PENDING_RECONCILIATION_STARTED",
+        level="INFO",
+        run_id=context.run_id,
+        pending_slices=len(pending),
+        wait_seconds=max(1, int(wait_seconds)),
+    )
+
+    unresolved = list(pending)
+    deadline = time.monotonic() + max(1, int(wait_seconds))
+    poll_seconds = max(1, int(poll_interval))
+
+    while unresolved and time.monotonic() < deadline:
+        next_unresolved: List[RegenSliceRecord] = []
+        for item in unresolved:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                next_unresolved.append(item)
+                continue
+            request_timeout = min(max(1, poll_seconds), max(1, int(remaining)))
+            try:
+                state, info = _fetch_job_status_snapshot(
+                    client,
+                    item.sid,
+                    request_timeout_seconds=request_timeout,
+                    poll_interval=poll_seconds,
+                )
+            except Exception as exc:
+                safe_msg = _short_error(redact_text(str(exc)))
+                _audit_event(
+                    "REPORT_PENDING_RECONCILIATION_CHECK_FAILED",
+                    level="WARN",
+                    run_id=context.run_id,
+                    sid=item.sid,
+                    report_name=item.report_name,
+                    slice_label=item.slice_label,
+                    reason=safe_msg,
+                )
+                next_unresolved.append(item)
+                continue
+
+            if state == "SUCCESS":
+                item.status = "OK"
+                item.outcome_code = "RECONCILED_OK"
+                item.error = ""
+                _append_log(
+                    logs,
+                    f"  Pending slice resolved to OK (sid={item.sid}).",
+                    log_callback,
+                )
+                _audit_event(
+                    "REPORT_PENDING_RESOLVED_OK",
+                    level="INFO",
+                    run_id=context.run_id,
+                    sid=item.sid,
+                    report_name=item.report_name,
+                    slice_label=item.slice_label,
+                )
+                continue
+
+            if state == "FAILED":
+                dispatch_state = str(info.get("dispatchState", "Unknown error") or "Unknown error")
+                item.status = "FAILED"
+                item.outcome_code = "RECONCILED_FAILED"
+                item.error = dispatch_state
+                _append_log(
+                    logs,
+                    f"  Pending slice resolved to FAILED (sid={item.sid}, state={dispatch_state}).",
+                    log_callback,
+                )
+                _audit_event(
+                    "REPORT_PENDING_RESOLVED_FAILED",
+                    level="WARN",
+                    run_id=context.run_id,
+                    sid=item.sid,
+                    report_name=item.report_name,
+                    slice_label=item.slice_label,
+                    reason=_short_error(dispatch_state),
+                )
+                continue
+
+            next_unresolved.append(item)
+
+        unresolved = next_unresolved
+        if unresolved:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(float(poll_seconds), max(0.0, remaining)))
+
+    for item in unresolved:
+        _append_log(
+            logs,
+            (
+                f"  Pending slice remains unresolved (sid={item.sid}). "
+                "Splunk may still complete pending jobs asynchronously."
+            ),
+            log_callback,
+        )
+        _audit_event(
+            "REPORT_PENDING_REMAINED_UNRESOLVED",
+            level="WARN",
+            run_id=context.run_id,
+            sid=item.sid,
+            report_name=item.report_name,
+            slice_label=item.slice_label,
+        )
+
+    return logs
+
+
+def _format_slice_summary_line(item: RegenSliceRecord) -> str:
+    range_parts = [part for part in (item.earliest, item.latest) if part]
+    range_text = " to ".join(range_parts) if len(range_parts) == 2 else (range_parts[0] if range_parts else "saved search range")
+    sid_text = f" (sid={item.sid})" if item.sid else ""
+    status_label = _display_slice_status(item.status)
+    line = f"  [{status_label}] {item.report_name} {item.slice_label}: {range_text}{sid_text}"
+    if status_label != "OK" and item.error:
+        line += f" - {_short_error(item.error)}"
+    return line
+
+
+def _build_run_summary_lines(context: RegenContext) -> List[str]:
+    ok_count, fail_count, pending_count = context.summary_counts()
+    lines = [
+        "Summary:",
+        f"  Total slices: {len(context.slices)}",
+        f"  Succeeded: {ok_count}",
+        f"  Failed: {fail_count}",
+        f"  Pending: {pending_count}",
+    ]
+    for item in context.slices:
+        lines.append(_format_slice_summary_line(item))
+    if pending_count:
+        lines.append(
+            "  One or more slices remain PENDING because active status verification did not complete."
+        )
+        lines.append("  Splunk may still complete pending jobs asynchronously.")
+    return lines
 
 
 def _extract_recipients_from_content(content: dict) -> List[str]:
@@ -1265,7 +1865,7 @@ def _collect_saved_search_recipients(
 
 
 def _resolve_ack_enabled(config: Optional[SplunkConfig]) -> bool:
-    default_enabled = True if config is None else config.ack_enabled
+    default_enabled = False if config is None else config.ack_enabled
     if not _env_override_allowed():
         _audit_blocked_env_override("SPLUNK_TOOL_ACK_ENABLED", "SPLUNK_TOOL_ACK_ENABLE")
         return default_enabled
@@ -1275,6 +1875,14 @@ def _resolve_ack_enabled(config: Optional[SplunkConfig]) -> bool:
     if not env_value:
         return default_enabled
     return _parse_bool(env_value, default_enabled)
+
+
+def _resolve_ack_on_pending(config: Optional[SplunkConfig]) -> bool:
+    if config is None:
+        return False
+    return bool(getattr(config, "ack_on_pending", False) or getattr(config, "ack_on_unknown", False))
+
+
 def _resolve_ack_recipients(
     context: RegenContext,
     config: Optional[SplunkConfig],
@@ -1358,17 +1966,20 @@ def _build_ack_subject(context: RegenContext) -> str:
         report_label = context.report_names[0]
     else:
         report_label = f"{context.report_names[0]} (+{len(context.report_names) - 1} more)"
+    overall_status = context.overall_status()
+    status_prefix = f"{overall_status} | " if overall_status != "OK" else ""
     return (
-        f"*** MANUALLY REGENERATED *** {report_label} | "
+        f"*** MANUALLY REGENERATED *** {status_prefix}{report_label} | "
         f"{context.earliest_configured} to {context.latest_configured} | "
         f"{format_sgt(run_time)}"
     )
 def _build_ack_body(context: RegenContext) -> str:
     generated_at = context.end_time_sgt or context.start_time_sgt or get_sgt_now()
-    ok_count, fail_count, unknown_count = context.summary_counts()
+    ok_count, fail_count, pending_count = context.summary_counts()
     total = len(context.slices)
-    successful_slices = [item for item in context.slices if item.status == "OK" and item.sid]
+    slices_with_sid = [item for item in context.slices if item.sid]
     failed_slices = [item for item in context.slices if item.status == "FAILED"]
+    pending_slices = [item for item in context.slices if _is_pending_status(item.status)]
     body_lines = [
         "*** MANUALLY REGENERATED ***",
         f"User: {context.operator}",
@@ -1380,28 +1991,33 @@ def _build_ack_body(context: RegenContext) -> str:
         f"Range: {context.earliest_configured} to {context.latest_configured}",
         "",
         "Result summary:",
+        f"  - Overall status: {context.overall_status()}",
         f"  - Total slices: {total}",
         f"  - Succeeded: {ok_count}",
         f"  - Failed: {fail_count}",
+        f"  - Pending: {pending_count}",
     ]
-    if unknown_count:
-        body_lines.append(f"  - Unknown: {unknown_count}")
     if context.slicing_enabled and context.slices:
         body_lines.append("  - Per-slice ranges:")
         for item in context.slices:
-            body_lines.append(
-                f"    * {item.report_name} {item.slice_label}: {item.earliest} to {item.latest} [{item.status}]"
-            )
+            body_lines.append(f"    * {_format_slice_summary_line(item).strip()}")
     if failed_slices:
-        body_lines.append("  - Failures:")
+        body_lines.append("  - Failed slices:")
         for item in failed_slices:
             body_lines.append(
                 f"    * {item.report_name} {item.slice_label}: {_short_error(item.error or 'Unknown error')}"
             )
+    if pending_slices:
+        body_lines.append("  - Pending / awaiting verification:")
+        for item in pending_slices:
+            body_lines.append(
+                f"    * {item.report_name} {item.slice_label}: {_short_error(item.error or 'Final status not yet known')}"
+            )
+        body_lines.append("  - Splunk may still complete pending jobs asynchronously.")
     body_lines.append("")
-    body_lines.append("SIDs:")
-    if successful_slices:
-        for item in successful_slices:
+    body_lines.append("SIDs issued by dispatch:")
+    if slices_with_sid:
+        for item in slices_with_sid:
             body_lines.append(f"  - {item.report_name} {item.slice_label}: {item.sid}")
     else:
         body_lines.append("  - None")
@@ -1433,7 +2049,9 @@ def _build_manifest_attachment(context: RegenContext) -> Optional[tuple]:
     return (filename, payload, "text", "csv")
 def send_ack_summary_email(context: RegenContext, config: Optional[SplunkConfig] = None) -> AckEmailResult:
     ack_enabled = _resolve_ack_enabled(config)
+    ack_on_pending = _resolve_ack_on_pending(config)
     recipients = _resolve_ack_recipients(context, config) if ack_enabled else []
+    _, fail_count, pending_count = context.summary_counts()
     _audit_event(
         "EMAIL_SEND_REQUESTED",
         level="INFO",
@@ -1444,7 +2062,7 @@ def send_ack_summary_email(context: RegenContext, config: Optional[SplunkConfig]
     )
     if not ack_enabled:
         _audit_event(
-            "EMAIL_SEND_FAILED",
+            "ACK_EMAIL_SKIPPED_DISABLED",
             level="WARN",
             run_id=context.run_id,
             recipient_count=0,
@@ -1454,6 +2072,20 @@ def send_ack_summary_email(context: RegenContext, config: Optional[SplunkConfig]
             attempted=False,
             success=False,
             reason="ack_disabled",
+        )
+    if pending_count > 0 and not ack_on_pending:
+        _audit_event(
+            "ACK_EMAIL_SKIPPED_PENDING",
+            level="WARN",
+            run_id=context.run_id,
+            recipient_count=len(recipients),
+            pending_slices=pending_count,
+        )
+        return AckEmailResult(
+            attempted=False,
+            success=False,
+            recipients=recipients,
+            reason="pending_slices_present",
         )
     if not recipients:
         _audit_event(
@@ -1471,6 +2103,15 @@ def send_ack_summary_email(context: RegenContext, config: Optional[SplunkConfig]
     smtp_settings = _resolve_smtp_settings(config)
     subject = _build_ack_subject(context)
     body = _build_ack_body(context)
+    if pending_count > 0:
+        _audit_event(
+            "ACK_EMAIL_SENT_PENDING",
+            level="INFO",
+            run_id=context.run_id,
+            recipient_count=len(recipients),
+            pending_slices=pending_count,
+            failed_slices=fail_count,
+        )
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = smtp_settings["from_addr"]
@@ -1501,6 +2142,7 @@ def send_ack_summary_email(context: RegenContext, config: Optional[SplunkConfig]
             attempted=True,
             success=True,
             recipients=recipients,
+            reason="pending_verification" if pending_count > 0 else "",
         )
     except Exception as exc:
         _audit_event(
@@ -1634,22 +2276,33 @@ def run_dispatch_multi(
                 log_callback=log_callback,
                 sid_callback=sid_callback,
                 regen_context=regen_context,
+                continue_on_timeout=resolve_continue_on_timeout(config),
+                timeout_status=resolve_timeout_result(config),
             )
             logs.extend(report_logs)
+        if _pending_slice_records(regen_context) and resolve_reconcile_pending(config):
+            reconcile_logs = _reconcile_pending_slices(
+                client,
+                regen_context,
+                wait_seconds=resolve_reconcile_wait_seconds(config),
+                poll_interval=resolve_status_check_poll_seconds(config),
+                log_callback=log_callback,
+            )
+            logs.extend(reconcile_logs)
         regen_context.end_time_sgt = get_sgt_now()
         regen_context.slice_count = len(regen_context.slices)
-        ok_count, fail_count, unknown_count = regen_context.summary_counts()
-        total_count = ok_count + fail_count + unknown_count
+        ok_count, fail_count, pending_count = regen_context.summary_counts()
+        total_count = len(regen_context.slices)
         _append_log(logs, "", log_callback)
-        _append_log(
-            logs,
-            (
-                f"Summary: {ok_count} OK, {fail_count} failed, {unknown_count} unknown "
-                f"out of {total_count} slice run(s)."
-            ),
-            log_callback,
-        )
-        if fail_count == 0 and unknown_count == 0:
+        for line in _build_run_summary_lines(regen_context):
+            _append_log(logs, line, log_callback)
+        if pending_count > 0:
+            _append_log(
+                logs,
+                "Splunk may still complete pending jobs asynchronously.",
+                log_callback,
+            )
+        if fail_count == 0 and pending_count == 0:
             _audit_event(
                 "REPORT_DISPATCH_SUCCESS",
                 level="INFO",
@@ -1657,6 +2310,16 @@ def run_dispatch_multi(
                 app=app,
                 report_count=len(selected_indices),
                 total_slices=total_count,
+            )
+        elif fail_count == 0:
+            _audit_event(
+                "REPORT_DISPATCH_PENDING",
+                level="WARN",
+                run_id=regen_context.run_id,
+                app=app,
+                report_count=len(selected_indices),
+                total_slices=total_count,
+                pending_slices=pending_count,
             )
         else:
             _audit_event(
@@ -1667,12 +2330,17 @@ def run_dispatch_multi(
                 report_count=len(selected_indices),
                 total_slices=total_count,
                 failed_slices=fail_count,
-                unknown_slices=unknown_count,
+                pending_slices=pending_count,
             )
         ack_result = send_ack_summary_email(regen_context, config=config)
         report_audit = ",".join(selected_report_names)
         recipient_count = len(ack_result.recipients)
-        status = "success" if ack_result.success else "failure"
+        if ack_result.success:
+            status = "sent"
+        elif ack_result.attempted:
+            status = "failed"
+        else:
+            status = "skipped"
         reason = ack_result.reason or "-"
         _append_log(
             logs,
@@ -1682,6 +2350,24 @@ def run_dispatch_multi(
             ),
             log_callback,
         )
+        if ack_result.reason == "pending_slices_present":
+            _append_log(
+                logs,
+                "Acknowledgement email skipped because one or more slices are still pending.",
+                log_callback,
+            )
+        elif ack_result.reason == "pending_verification":
+            _append_log(
+                logs,
+                "Acknowledgement email sent with PARTIAL / PENDING VERIFICATION status because pending slices remain.",
+                log_callback,
+            )
+        elif ack_result.reason == "ack_disabled":
+            _append_log(
+                logs,
+                "Acknowledgement email skipped because ack_enabled=false.",
+                log_callback,
+            )
         if ack_result.error:
             _append_log(
                 logs,

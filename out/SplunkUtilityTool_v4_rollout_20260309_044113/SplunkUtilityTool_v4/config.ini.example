@@ -1,0 +1,75 @@
+[splunk]
+# Primary endpoint (Splunk management port)
+host = https://splunk-sh-vip:8089
+
+# Backward-compatible list form (first entry is used for startup checks/connect)
+servers = https://splunk-sh-vip:8089
+
+# v4 is password-only (DPAPI secret file). Token/CLI auth is not supported.
+auth_mode = password
+# TLS certificate verification can be disabled for internal/self-signed cert deployments.
+# HTTPS is still mandatory; http:// endpoints are rejected.
+verify_ssl = false
+
+# Legacy token settings are unsupported in v4:
+# token_storage, token, token_ini, token_encrypted, splunk_cli_path
+
+# Legacy plaintext password entry is ignored by v4 (do not use)
+# password =
+
+[Credentials]
+username = splunk_service
+secret_file = secret.dpapi
+dpapi_scope = machine
+
+[Security]
+build_mode = production
+policy_mode = enforced
+allow_insecure_overrides = false
+
+[Logging]
+level = INFO
+verbose = false
+max_bytes = 10485760
+backup_count = 10
+
+[email]
+# Manual regeneration acknowledgement email settings
+ack_enabled = 1
+ack_recipients =
+ack_use_savedsearch_recipients = 0
+ack_attach_manifest = 0
+
+# SMTP settings for ACK summary email
+smtp_host = 127.0.0.1
+smtp_port = 25
+smtp_tls = 0
+smtp_user =
+smtp_pass =
+from_addr = Splunk Notification <splunk-donotreply@dsta.gov.sg>
+
+[postdispatch]
+# Post-dispatch status verification via Splunk REST searches (primary method)
+# Verifies actual email/alert action completion by querying _internal logs
+
+# MergeReport verification settings
+merge_report_enabled = true
+merge_report_index = _internal
+merge_report_source_contains = mergeReport_alert.log
+merge_report_sourcetype =
+merge_report_timeout_seconds = 120
+
+# Native Splunk email action verification settings
+native_email_enabled = true
+native_email_index = _internal
+native_email_source_contains = python.log
+native_email_sourcetype =
+native_email_timeout_seconds = 120
+
+# Native email strictness: if false (default), success = invoked + no error
+# if true, requires explicit success marker in logs (else marks UNKNOWN)
+native_email_strict_success = false
+
+# Polling parameters
+poll_seconds = 3
+lookback_seconds = 300

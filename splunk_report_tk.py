@@ -22,6 +22,9 @@ from splunk_engine import (
     SplunkConfig,
     build_slices,
     get_effective_username,
+    resolve_broker_request_timeout_seconds,
+    resolve_status_check_poll_seconds,
+    resolve_status_check_timeout_seconds,
     run_dispatch_multi,
     set_security_audit_logger,
     set_security_policy,
@@ -94,8 +97,11 @@ def _build_cfg_from_runtime_payload(payload: dict[str, object], exe_dir: str) ->
         legacy_password_present=bool(payload.get("legacy_password_present", False)),
         merge_report_enabled=bool(payload.get("merge_report_enabled", False)),
         merge_report_log_path=str(payload.get("merge_report_log_path") or ""),
-        merge_report_timeout_seconds=int(payload.get("merge_report_timeout_seconds") or 90),
-        ack_enabled=bool(payload.get("ack_enabled", True)),
+        merge_report_timeout_seconds=int(payload.get("merge_report_timeout_seconds") or 300),
+        dispatch_config=dict(payload.get("dispatch_config")) if isinstance(payload.get("dispatch_config"), dict) else None,
+        ack_enabled=bool(payload.get("ack_enabled", False)),
+        ack_on_pending=bool(payload.get("ack_on_pending", payload.get("ack_on_unknown", False))),
+        ack_on_unknown=bool(payload.get("ack_on_unknown", False)),
         ack_recipients=[str(x) for x in (payload.get("ack_recipients") or [])] if isinstance(payload.get("ack_recipients"), list) else [],
         ack_use_savedsearch_recipients=bool(payload.get("ack_use_savedsearch_recipients", False)),
         ack_attach_manifest=bool(payload.get("ack_attach_manifest", False)),
@@ -110,8 +116,8 @@ def _build_cfg_from_runtime_payload(payload: dict[str, object], exe_dir: str) ->
 
 
 class ReportsApp(ttk.Frame):
-    DISPATCH_STATUS_WAIT_SECONDS = 60
-    DISPATCH_STATUS_POLL_SECONDS = 2
+    DISPATCH_STATUS_WAIT_SECONDS = 300
+    DISPATCH_STATUS_POLL_SECONDS = 5
 
     def __init__(
         self,
@@ -129,6 +135,10 @@ class ReportsApp(ttk.Frame):
         self.audit_logger = audit_logger
         self.splunk_broker_handle = splunk_broker_handle
         self.splunk_broker_client = splunk_broker_handle.client if splunk_broker_handle else None
+        if self.splunk_broker_client is not None and hasattr(self.splunk_broker_client, "configure_request_timeout"):
+            self.splunk_broker_client.configure_request_timeout(
+                resolve_broker_request_timeout_seconds(cfg)
+            )
         self.exe_dir = exe_dir or _resolve_runtime_exe_dir()
 
         self.client: SplunkBrokerProxyClient | None = None
@@ -637,7 +647,7 @@ class ReportsApp(ttk.Frame):
         return (
             "This will produce a manually regenerated report run "
             "(different from scheduled automation).\n"
-            "A summary acknowledgement email will be sent after this run.\n\n"
+            "An acknowledgement email will be sent only when final status is known, or when pending verification emails are explicitly enabled.\n\n"
             f"Report(s): {report_label}\n"
             f"Date range: {range_text}\n"
             f"Slice mode: {mode_text}\n"
@@ -790,8 +800,8 @@ class ReportsApp(ttk.Frame):
             "start": start,
             "end": end,
             "no_change": no_change,
-            "wait_seconds": self.DISPATCH_STATUS_WAIT_SECONDS,
-            "poll_interval": self.DISPATCH_STATUS_POLL_SECONDS,
+            "wait_seconds": resolve_status_check_timeout_seconds(self.cfg),
+            "poll_interval": resolve_status_check_poll_seconds(self.cfg),
             "app": self.app_var.get().strip(),
         }
         while True:

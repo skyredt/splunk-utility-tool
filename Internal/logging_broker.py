@@ -143,6 +143,16 @@ _EVENT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "required": ("run_id", "app", "report_count", "total_slices"),
     },
+    "REPORT_DISPATCH_PENDING": {
+        "fields": {
+            "run_id": _TYPE_STR,
+            "app": _TYPE_STR,
+            "report_count": _TYPE_INT,
+            "total_slices": _TYPE_INT,
+            "unknown_slices": _TYPE_INT,
+        },
+        "required": ("run_id", "app", "report_count", "total_slices", "unknown_slices"),
+    },
     "REPORT_DISPATCH_FAILED": {
         "fields": {
             "run_id": _TYPE_STR,
@@ -154,6 +164,35 @@ _EVENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "reason": _TYPE_STR,
         },
         "required": ("app", "report_count"),
+    },
+    "REPORT_SLICE_DISPATCHED": {
+        "fields": {
+            "run_id": _TYPE_STR,
+            "report_name": _TYPE_STR,
+            "slice_label": _TYPE_STR,
+            "sid": _TYPE_STR,
+        },
+        "required": ("run_id", "report_name", "slice_label", "sid"),
+    },
+    "REPORT_SLICE_STATUS_TIMEOUT": {
+        "fields": {
+            "run_id": _TYPE_STR,
+            "report_name": _TYPE_STR,
+            "slice_label": _TYPE_STR,
+            "sid": _TYPE_STR,
+            "reason": _TYPE_STR,
+        },
+        "required": ("run_id", "report_name", "slice_label", "sid"),
+    },
+    "REPORT_SLICE_UNKNOWN": {
+        "fields": {
+            "run_id": _TYPE_STR,
+            "report_name": _TYPE_STR,
+            "slice_label": _TYPE_STR,
+            "sid": _TYPE_STR,
+            "reason": _TYPE_STR,
+        },
+        "required": ("run_id", "report_name", "slice_label", "sid"),
     },
     "EMAIL_SEND_REQUESTED": {
         "fields": {
@@ -178,6 +217,23 @@ _EVENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "reason": _TYPE_STR,
         },
         "required": ("run_id", "recipient_count"),
+    },
+    "ACK_EMAIL_SKIPPED_UNKNOWN": {
+        "fields": {
+            "run_id": _TYPE_STR,
+            "recipient_count": _TYPE_INT,
+            "unknown_slices": _TYPE_INT,
+        },
+        "required": ("run_id", "recipient_count", "unknown_slices"),
+    },
+    "ACK_EMAIL_SENT_PENDING": {
+        "fields": {
+            "run_id": _TYPE_STR,
+            "recipient_count": _TYPE_INT,
+            "unknown_slices": _TYPE_INT,
+            "failed_slices": _TYPE_INT,
+        },
+        "required": ("run_id", "recipient_count", "unknown_slices", "failed_slices"),
     },
     "TLS_VERIFY_DISABLED": {"fields": {"reason": _TYPE_STR}, "required": ()},
     "POLICY_VIOLATION_BLOCKED": {

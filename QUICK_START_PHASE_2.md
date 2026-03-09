@@ -9,15 +9,32 @@ The Splunk Utility Tool now verifies that reports were **actually delivered**, n
 
 ## Configuration
 
-### 1. Enable in config.ini
+### 1. Use the pilot config in config.ini
 
 ```ini
+[dispatch]
+per_slice_wait_seconds = 30
+continue_on_timeout = true
+timeout_result = pending
+
+[email]
+ack_enabled = 0
+ack_on_pending = 0
+
 [postdispatch]
 merge_report_enabled = true
 native_email_enabled = true
-poll_seconds = 3
-lookback_seconds = 300
+reconcile_pending = true
+reconcile_wait_seconds = 60
+poll_seconds = 5
+lookback_seconds = 900
 ```
+
+Pilot intent:
+- wait up to 30 seconds per slice for active confirmation
+- continue to the next slice if a SID is still unresolved
+- run one bounded reconciliation pass after submission
+- keep ACK email disabled by default during pilot
 
 ### 2. Verify Splunk Logs Exist
 
@@ -48,7 +65,7 @@ index=_internal source=python.log sendemail
 Dispatch OK: 10
 Verified Sent: 8
 Failed: 1
-Unknown: 1
+Pending: 1
 ```
 
 ## Success Rules
@@ -56,12 +73,12 @@ Unknown: 1
 ### MergeReport (Strict)
 ✅ **SUCCESS**: Log contains `Action=Email sent` with valid SMTP server  
 ❌ **FAILED**: `SmtpServer=""` or ERROR/Traceback in logs  
-⏳ **TIMEOUT**: No activity for 120 seconds
+⏳ **PENDING**: No activity yet confirmed within the active wait window
 
 ### Native Email (Best-Effort)
 ✅ **SUCCESS**: `Sending email.` found in python.log + no errors  
 ❌ **FAILED**: SMTPException, connection error, authentication failed  
-⏳ **TIMEOUT**: No invocation for 120 seconds
+⏳ **PENDING**: No invocation yet confirmed within the active wait window
 
 ## Troubleshooting
 
@@ -72,7 +89,7 @@ Unknown: 1
    - Native: `index=_internal source=python.log sendemail`
 3. Check Splunk connectivity (connection test should work)
 
-### All reports show "Unknown"
+### All reports show "Pending"
 1. Increase `lookback_seconds` in config (logs may be delayed)
 2. Verify reports actually used MergeReport or sendemail action
 3. Check Splunk log format matches expected patterns
@@ -88,11 +105,14 @@ Unknown: 1
 |---------|---------|--------------|
 | `merge_report_enabled` | true | Monitor MergeReport log |
 | `native_email_enabled` | true | Monitor sendemail action |
-| `poll_seconds` | 3 | Check logs every N seconds |
-| `lookback_seconds` | 300 | Search last N seconds of logs |
+| `poll_seconds` | 5 | Check logs every N seconds |
+| `lookback_seconds` | 900 | Search last N seconds of logs |
 | `merge_report_timeout_seconds` | 120 | Give up after N seconds |
 | `native_email_timeout_seconds` | 120 | Give up after N seconds |
 | `native_email_strict_success` | false | Require explicit success marker (rare) |
+| `per_slice_wait_seconds` | 30 | Active wait budget before moving to next slice |
+| `reconcile_wait_seconds` | 60 | Bounded pending reconciliation window after submission |
+| `ack_enabled` | 0 | Pilot default: do not send ACK email |
 
 ## Examples
 
@@ -112,12 +132,23 @@ native_email_enabled = true
 
 ### Both (Recommended)
 ```ini
+[dispatch]
+per_slice_wait_seconds = 30
+continue_on_timeout = true
+timeout_result = pending
+
+[email]
+ack_enabled = 0
+ack_on_pending = 0
+
 [postdispatch]
 merge_report_enabled = true
 native_email_enabled = true
 native_email_strict_success = false
-poll_seconds = 3
-lookback_seconds = 300
+reconcile_pending = true
+reconcile_wait_seconds = 60
+poll_seconds = 5
+lookback_seconds = 900
 ```
 
 ### Fast Polling (More Load)
@@ -175,11 +206,12 @@ SmtpPort=""
 
 ## FAQ
 
-**Q: Why does my report show "Unknown" status?**  
-A: No matching log entry found. Check:
+**Q: Why does my report show "Pending" status?**  
+A: The tool received a SID but did not get active confirmation within 30 seconds. Check:
 1. Report actually used MergeReport or native email
 2. Splunk logs haven't been purged
 3. Increase lookback_seconds if logs are delayed
+4. Remember the batch continues and Splunk may still complete the job asynchronously
 
 **Q: Does this verify email was actually read?**  
 A: No, only that the send action was invoked. Delivery confirmation depends on your mail server.
@@ -190,8 +222,8 @@ A: No, this feature requires Splunk _internal logs with MergeReport or sendemail
 **Q: Is this required?**  
 A: No, it's optional. Tool works without [postdispatch] section (reverts to Phase 1 behavior).
 
-**Q: Does it slow down the tool?**  
-A: No, verification runs in background thread after dispatch completes.
+**Q: Does it block later slices?**  
+A: No. After the 30-second active wait budget expires, the tool continues to the next slice and reconciles pending ones once more afterward.
 
 **Q: Can I customize the search?**  
 A: Currently searches are fixed. Future versions may support custom search queries.

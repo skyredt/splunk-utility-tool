@@ -270,6 +270,13 @@ class SplunkBrokerProxyClient:
         self._port = int(port)
         self._auth_token = auth_token
         self.username = username
+        self._request_timeout_seconds = 300.0
+
+    def configure_request_timeout(self, timeout_seconds: float) -> None:
+        try:
+            self._request_timeout_seconds = max(1.0, float(timeout_seconds))
+        except Exception:
+            self._request_timeout_seconds = 300.0
 
     def _op(self, op: str, args: Optional[dict[str, Any]] = None, *, timeout: float = 30.0) -> dict[str, Any]:
         payload = {"op": op, "args": args or {}}
@@ -391,7 +398,11 @@ class SplunkBrokerProxyClient:
             "trigger_actions": bool(trigger_actions),
         }
         try:
-            result = self._op("dispatch_saved_search", payload, timeout=70.0)
+            result = self._op(
+                "dispatch_saved_search",
+                payload,
+                timeout=max(70.0, self._request_timeout_seconds),
+            )
             return bool(result.get("ok")), str(result.get("sid", "") or "") or None, str(result.get("error", "") or "")
         except Exception as exc:
             return False, None, _safe_error_text(exc)
@@ -402,7 +413,27 @@ class SplunkBrokerProxyClient:
             "wait_seconds": int(wait_seconds),
             "poll_interval": int(poll_interval),
         }
-        result = self._op("check_job_status", payload, timeout=max(float(wait_seconds) + 20.0, 30.0))
+        result = self._op(
+            "check_job_status",
+            payload,
+            timeout=max(float(wait_seconds) + 10.0, 20.0),
+        )
+        state = str(result.get("state", "UNKNOWN"))
+        content = result.get("content", {})
+        if not isinstance(content, dict):
+            content = {}
+        return state, content
+
+    def get_job_status_snapshot(self, sid: str, request_timeout_seconds: int = 5):
+        payload = {
+            "sid": str(sid or ""),
+            "request_timeout_seconds": int(request_timeout_seconds),
+        }
+        result = self._op(
+            "get_job_status_snapshot",
+            payload,
+            timeout=max(float(request_timeout_seconds) + 5.0, 10.0),
+        )
         state = str(result.get("state", "UNKNOWN"))
         content = result.get("content", {})
         if not isinstance(content, dict):
@@ -664,7 +695,10 @@ class _SplunkBrokerState:
             "merge_report_enabled": bool(cfg.merge_report_enabled),
             "merge_report_log_path": str(cfg.merge_report_log_path or ""),
             "merge_report_timeout_seconds": int(cfg.merge_report_timeout_seconds),
+            "dispatch_config": dict(cfg.dispatch_config) if isinstance(cfg.dispatch_config, dict) else None,
             "ack_enabled": bool(cfg.ack_enabled),
+            "ack_on_pending": bool(getattr(cfg, "ack_on_pending", False)),
+            "ack_on_unknown": bool(cfg.ack_on_unknown),
             "ack_recipients": list(cfg.ack_recipients),
             "ack_use_savedsearch_recipients": bool(cfg.ack_use_savedsearch_recipients),
             "ack_attach_manifest": bool(cfg.ack_attach_manifest),
@@ -784,9 +818,30 @@ class _SplunkBrokerState:
         sid = _validate_string_field(args, "sid", required=True, max_len=200)
         if not _SID_RE.match(sid):
             raise _BrokerError(400, "invalid_sid", "Invalid SID format.")
-        wait_seconds = _validate_int_field(args, "wait_seconds", default=10, min_value=1, max_value=300)
-        poll_interval = _validate_int_field(args, "poll_interval", default=2, min_value=1, max_value=10)
+        wait_seconds = _validate_int_field(args, "wait_seconds", default=10, min_value=1, max_value=3600)
+        poll_interval = _validate_int_field(args, "poll_interval", default=2, min_value=1, max_value=60)
         state, content = client.check_job_status(sid=sid, wait_seconds=wait_seconds, poll_interval=poll_interval)
+        safe_content = _redact_sensitive(content, key_hint="content")
+        if not isinstance(safe_content, dict):
+            safe_content = {}
+        return {"state": _sanitize_text(str(state or "UNKNOWN")), "content": safe_content}
+
+    def op_get_job_status_snapshot(self, args: dict[str, Any]) -> dict[str, Any]:
+        client = self._require_client()
+        sid = _validate_string_field(args, "sid", required=True, max_len=200)
+        if not _SID_RE.match(sid):
+            raise _BrokerError(400, "invalid_sid", "Invalid SID format.")
+        request_timeout_seconds = _validate_int_field(
+            args,
+            "request_timeout_seconds",
+            default=5,
+            min_value=1,
+            max_value=60,
+        )
+        state, content = client.get_job_status_snapshot(
+            sid=sid,
+            request_timeout_seconds=request_timeout_seconds,
+        )
         safe_content = _redact_sensitive(content, key_hint="content")
         if not isinstance(safe_content, dict):
             safe_content = {}
@@ -907,6 +962,8 @@ class _SplunkBrokerRequestHandler(http.server.BaseHTTPRequestHandler):
             return state.op_dispatch_saved_search(args)
         if op == "check_job_status":
             return state.op_check_job_status(args)
+        if op == "get_job_status_snapshot":
+            return state.op_get_job_status_snapshot(args)
         if op == "get_saved_search_metadata":
             return state.op_get_saved_search_metadata(args)
         if op == "shutdown":

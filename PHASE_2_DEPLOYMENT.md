@@ -42,9 +42,18 @@ Phase 2 implements **REST API-based post-dispatch verification** via Splunk log 
 - One MergeReport search + one native email search = 2 searches every 3 seconds
 - Fixed 300-second lookback window (configurable)
 
-### Configuration: `config.ini` [postdispatch] section
+### Configuration: pilot stanzas in `config.ini`
 
 ```ini
+[dispatch]
+per_slice_wait_seconds = 30
+continue_on_timeout = true
+timeout_result = pending
+
+[email]
+ack_enabled = 0
+ack_on_pending = 0
+
 [postdispatch]
 # MergeReport verification settings
 merge_report_enabled = true
@@ -63,9 +72,11 @@ native_email_timeout_seconds = 120
 # Strictness: false = invoked + no error = success; true = requires explicit success marker
 native_email_strict_success = false
 
-# Polling parameters
-poll_seconds = 3                                   # Check logs every 3 seconds
-lookback_seconds = 300                             # Search last 5 minutes of logs
+# Polling and bounded reconciliation
+reconcile_pending = true
+reconcile_wait_seconds = 60
+poll_seconds = 5                                   # Check logs every 5 seconds
+lookback_seconds = 900                             # Search last 15 minutes of logs
 ```
 
 ## Integration Points
@@ -116,7 +127,7 @@ User clicks "Send reports"
 | Log contains `Action=Email sent` + SmtpServer != "" | **SUCCESS** | "Action=Email sent" in mergeReport_alert.log |
 | Log contains `Action=Sending email` + SmtpServer == "" | **FAILED** | "Action=Sending email" + SmtpServer empty |
 | Log contains ERROR, Traceback, Exception | **FAILED** | Error keywords in mergeReport_alert.log |
-| No log found after 120s | **TIMEOUT** | No activity within merge_report_timeout_seconds |
+| No log found during active wait / reconciliation window | **PENDING** | No activity yet confirmed within bounded verification |
 | Action=Sending email (progress only) | **SENDING** | In-progress, not final state |
 
 ### Native Email Channel
@@ -125,8 +136,8 @@ User clicks "Send reports"
 |-----------|--------|----------|
 | `Sending email.` in python.log + no errors | **SUCCESS** | "Sending email." + clean logs |
 | `Sending email.` found + SMTPException, connection error, etc. | **FAILED** | Error keywords + sendemail context |
-| No invocation found + timeout | **TIMEOUT** | No "Sending email." within native_email_timeout_seconds |
-| strict_success=true + no explicit marker | **UNKNOWN** | Invoked but no final marker (rare) |
+| No invocation found during active wait / reconciliation window | **PENDING** | No "Sending email." confirmed yet |
+| strict_success=true + no explicit marker | **PENDING** | Invoked but no final marker (rare) |
 
 ## UI Output Examples
 
@@ -146,7 +157,7 @@ User clicks "Send reports"
 Dispatch OK: 3
 Verified Sent: 2
 Failed: 1
-Unknown: 0
+Pending: 0
 ```
 
 ## Search Queries Generated
@@ -244,7 +255,7 @@ print(f'Postdispatch config: {cfg.postdispatch_config}')
 - Verify SIDs are being registered (check queue in UI)
 - Increase lookback_seconds if logs are delayed
 
-### "Unknown" status for all SIDs
+### "Pending" status for all SIDs
 - Logs may not contain expected keywords
 - Verify exact log format matches search patterns
 - Check if sendemail action actually triggered
@@ -274,12 +285,23 @@ native_email_strict_success = false
 
 ### Example 3: Both channels (recommended)
 ```ini
+[dispatch]
+per_slice_wait_seconds = 30
+continue_on_timeout = true
+timeout_result = pending
+
+[email]
+ack_enabled = 0
+ack_on_pending = 0
+
 [postdispatch]
 merge_report_enabled = true
 native_email_enabled = true
 native_email_strict_success = false
-poll_seconds = 3
-lookback_seconds = 300
+reconcile_pending = true
+reconcile_wait_seconds = 60
+poll_seconds = 5
+lookback_seconds = 900
 ```
 
 ## Future Enhancements

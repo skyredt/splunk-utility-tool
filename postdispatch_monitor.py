@@ -69,11 +69,19 @@ class PostDispatchStatusMonitor:
         self.config = config
 
         self.tracked_sids: Dict[str, SIDState] = {}
+        self.completed_states: Dict[str, str] = {}
         self.stop_event = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._last_search_time: float = 0.0
         self._event_dedup_cache: Dict[str, float] = {}  # (time, raw) -> timestamp
+
+    def _finalize_sid(self, sid: str, final_state: str) -> None:
+        """Move a SID from active tracking to a final status bucket."""
+        with self._lock:
+            if sid in self.tracked_sids:
+                del self.tracked_sids[sid]
+            self.completed_states[sid] = final_state
 
     def register_sid(
         self,
@@ -113,7 +121,7 @@ class PostDispatchStatusMonitor:
             except Exception as e:
                 self.ui_queue.put(("postdispatch_error", str(e)))
 
-            time.sleep(self.config.get("poll_seconds", 3))
+            time.sleep(self.config.get("poll_seconds", 5))
 
     def _poll_searches(self) -> None:
         """Poll Splunk logs for verification evidence."""
@@ -223,7 +231,7 @@ class PostDispatchStatusMonitor:
 
     def _get_earliest(self, channel: str) -> str:
         """Get earliest time for search (incremental)."""
-        lookback = self.config.get("lookback_seconds", 300)
+        lookback = self.config.get("lookback_seconds", 900)
         # For simplicity, always use fixed lookback; could be incremental with state
         return f"-{lookback}s"
 
@@ -259,6 +267,7 @@ class PostDispatchStatusMonitor:
             self._emit_ui_line(
                 f"[PostDispatch] [MergeReport] (sid={sid}) Email sent"
             )
+            self._finalize_sid(sid, "verified_sent")
             return
 
         # Check for "Sending email" (progress only)
@@ -276,6 +285,7 @@ class PostDispatchStatusMonitor:
                     f"[PostDispatch] [MergeReport] (sid={sid}) FAILED: SMTP server not configured (SmtpServer empty)"
                 )
                 state.merge_report_state["failed"] = True
+                self._finalize_sid(sid, "failed")
             else:
                 self._emit_ui_line(
                     f"[PostDispatch] [MergeReport] (sid={sid}) Sending email (smtp={smtp}:{port})"
@@ -289,6 +299,7 @@ class PostDispatchStatusMonitor:
             self._emit_ui_line(
                 f"[PostDispatch] [MergeReport] (sid={sid}) FAILED: {error_msg}"
             )
+            self._finalize_sid(sid, "failed")
             return
 
         # Progress lines (zip/xlsx)
@@ -347,6 +358,7 @@ class PostDispatchStatusMonitor:
             self._emit_ui_line(
                 f"[PostDispatch] [NativeEmail] (sid={sid}) FAILED: {error_msg or 'See logs'}"
             )
+            self._finalize_sid(sid, "failed")
             return
 
         # Check for "Sending email." (invoked)
@@ -370,23 +382,22 @@ class PostDispatchStatusMonitor:
             elapsed = current_time - state.registered_time
 
             # MergeReport timeout
-            mr_timeout = self.config.get("merge_report_timeout_seconds", 120)
+            mr_timeout = self.config.get("merge_report_timeout_seconds", 300)
             if (
                 self.config.get("merge_report_enabled", True)
                 and not state.merge_report_state["success"]
                 and not state.merge_report_state["failed"]
                 and elapsed > mr_timeout
             ):
-                state.merge_report_state["failed"] = True
+                state.merge_report_state["error_msg"] = "Timeout waiting for MergeReport success marker"
                 self._emit_ui_line(
-                    f"[PostDispatch] [MergeReport] (sid={sid}) FAILED: Timeout (no success marker after {mr_timeout}s)"
+                    f"[PostDispatch] [MergeReport] (sid={sid}) PENDING: Timeout (no success marker after {mr_timeout}s). Final delivery status not yet known."
                 )
-                with self._lock:
-                    if sid in self.tracked_sids:
-                        del self.tracked_sids[sid]
+                self._finalize_sid(sid, "pending")
+                continue
 
             # Native email timeout
-            ne_timeout = self.config.get("native_email_timeout_seconds", 120)
+            ne_timeout = self.config.get("native_email_timeout_seconds", 300)
             if (
                 self.config.get("native_email_enabled", True)
                 and state.native_email_state["invoked"]
@@ -400,13 +411,12 @@ class PostDispatchStatusMonitor:
                     self._emit_ui_line(
                         f"[PostDispatch] [NativeEmail] (sid={sid}) Sent (best-effort: invoked + no errors)"
                     )
+                    self._finalize_sid(sid, "verified_sent")
                 else:
                     self._emit_ui_line(
-                        f"[PostDispatch] [NativeEmail] (sid={sid}) UNKNOWN: Invoked but no success marker (strict mode)"
+                        f"[PostDispatch] [NativeEmail] (sid={sid}) PENDING: Invoked but no success marker (strict mode). Final delivery status not yet known."
                     )
-                with self._lock:
-                    if sid in self.tracked_sids:
-                        del self.tracked_sids[sid]
+                    self._finalize_sid(sid, "pending")
 
     def _emit_ui_line(self, line: str) -> None:
         """Emit a formatted line to the UI queue."""
@@ -416,21 +426,29 @@ class PostDispatchStatusMonitor:
         """Get final status counts for summary."""
         with self._lock:
             states = list(self.tracked_sids.values())
+            completed_states = list(self.completed_states.values())
 
-        dispatch_ok = len(states)
+        dispatch_ok = len(states) + len(completed_states)
         verified_sent = sum(
             1 for s in states
             if (s.merge_report_state["success"] or s.native_email_state["success"])
         )
+        verified_sent += sum(1 for state in completed_states if state == "verified_sent")
         failed = sum(
             1 for s in states
             if (s.merge_report_state["failed"] or s.native_email_state["failed"])
         )
-        unknown = dispatch_ok - verified_sent - failed
+        failed += sum(1 for state in completed_states if state == "failed")
+        pending = sum(1 for state in completed_states if state in ("unknown", "pending"))
+        pending += dispatch_ok - len(completed_states) - (
+            sum(1 for s in states if (s.merge_report_state["success"] or s.native_email_state["success"]))
+            + sum(1 for s in states if (s.merge_report_state["failed"] or s.native_email_state["failed"]))
+        )
 
         return {
             "dispatch_ok": dispatch_ok,
             "verified_sent": verified_sent,
             "failed": failed,
-            "unknown": unknown,
+            "pending": pending,
+            "unknown": pending,
         }
