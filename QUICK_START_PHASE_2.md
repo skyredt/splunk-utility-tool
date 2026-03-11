@@ -15,6 +15,16 @@
 - If formatting is valid but inconsistent, the tool rewrites it into canonical INI layout and keeps `config.ini.bak`.
 - If formatting is malformed, startup stops with a line-aware configuration error.
 
+## Production Values You Must Set Manually
+
+- `config.ini` is environment-specific and must not be committed to source control.
+- REQUIRED: `[splunk] host` and `[splunk] servers` (HTTPS management endpoint allowlist).
+- REQUIRED: `[Credentials] username`, `secret_file`, and `dpapi_scope`.
+- REQUIRED: `[splunk] verify_ssl` decision (keep `true` unless you must trust self-signed certs).
+- REQUIRED: `[email] smtp_host` and `from_addr` (plus `smtp_user`/`smtp_pass` if relay requires auth).
+- REQUIRED: `[email] ack_recipients` if `ack_use_savedsearch_recipients = 0`.
+- OPTIONAL: `[postdispatch] merge_report_log_path` if enabling file-based MergeReport monitoring; must be the full log file path, not just the directory.
+
 ## Pilot Config
 
 ```ini
