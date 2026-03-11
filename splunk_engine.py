@@ -1207,6 +1207,7 @@ def _dispatch_slice_and_wait(
                 sid=sid,
                 reason=_short_error(safe_error),
                 error_type=error_type,
+                error_phase="status_check",
             )
         else:
             audit_slice_event(
@@ -1216,6 +1217,7 @@ def _dispatch_slice_and_wait(
                 sid=sid,
                 reason=_short_error(safe_error),
                 error_type=error_type,
+                error_phase="status_check",
             )
         audit_slice_event(
             "REPORT_SLICE_MARKED_PENDING",
