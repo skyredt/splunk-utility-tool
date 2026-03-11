@@ -333,8 +333,10 @@ def load_or_enroll_password(
             reason=str(exc),
         )
         raise PermissionError("Invalid secret filename.") from exc
+    had_existing_secret = False
     existing_paths = [p for p in resolve_secret_candidates(exe_dir, secret_file=secret_file) if os.path.isfile(p)]
     if existing_paths:
+        had_existing_secret = True
         for existing_path in existing_paths:
             if _path_acl_is_weak(existing_path):
                 _audit_event(
@@ -426,7 +428,7 @@ def load_or_enroll_password(
             return password, ""
         raise
 
-    if existing_path:
+    if had_existing_secret:
         _audit_event(logger, "CRED_REENROLL_OVERWRITE", level="INFO", secret_path_used=target_path)
     else:
         _audit_event(logger, "CRED_ENROLL_CREATE", level="INFO", secret_path_used=target_path)

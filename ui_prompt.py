@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from overlay import create_overlay, remove_overlay
+from ui_theme import SURFACE_BG, style_window
 
 
 def _center_dialog(parent: tk.Misc, dialog: tk.Toplevel) -> None:
@@ -36,18 +37,19 @@ def show_modal_prompt(
     dialog.title(title)
     dialog.transient(parent)
     dialog.resizable(False, False)
+    style_window(dialog, surface=SURFACE_BG)
     try:
         dialog.attributes("-topmost", True)
     except tk.TclError:
         pass
 
-    frame = ttk.Frame(dialog, padding=14)
+    frame = ttk.Frame(dialog, padding=14, style="Dialog.TFrame")
     frame.pack(fill="both", expand=True)
 
-    label = ttk.Label(frame, text=message, justify="left", wraplength=460)
+    label = ttk.Label(frame, text=message, justify="left", wraplength=460, style="Dialog.TLabel")
     label.pack(fill="both", expand=True)
 
-    button_row = ttk.Frame(frame)
+    button_row = ttk.Frame(frame, style="Dialog.TFrame")
     button_row.pack(fill="x", pady=(12, 0))
 
     def _close(value):

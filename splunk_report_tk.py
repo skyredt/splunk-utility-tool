@@ -22,11 +22,15 @@ from splunk_engine import (
     SplunkConfig,
     build_slices,
     get_effective_username,
+    resolve_broker_request_timeout_seconds,
+    resolve_status_check_poll_seconds,
+    resolve_status_check_timeout_seconds,
     run_dispatch_multi,
     set_security_audit_logger,
     set_security_policy,
 )
 from Internal.baseline_guard import build_security_fingerprint, enforce_security_baseline
+from Internal.config_manager import ConfigError
 from Internal.logging_broker import (
     BrokerAuditLogger,
     PERSISTENT_AUDIT_UNAVAILABLE_WARNING,
@@ -42,6 +46,14 @@ from Internal.security_policy import PolicyViolation, load_security_policy, reda
 from mergereport_monitor import MergeReportMonitor
 from postdispatch_monitor import PostDispatchStatusMonitor
 from progress_dialog import run_with_progress
+from ui_theme import (
+    SURFACE_BG,
+    WINDOW_BG,
+    apply_splunk_light_theme,
+    style_listbox,
+    style_text_widget,
+    style_window,
+)
 from ui_prompt import show_modal_prompt
 
 
@@ -94,8 +106,11 @@ def _build_cfg_from_runtime_payload(payload: dict[str, object], exe_dir: str) ->
         legacy_password_present=bool(payload.get("legacy_password_present", False)),
         merge_report_enabled=bool(payload.get("merge_report_enabled", False)),
         merge_report_log_path=str(payload.get("merge_report_log_path") or ""),
-        merge_report_timeout_seconds=int(payload.get("merge_report_timeout_seconds") or 90),
-        ack_enabled=bool(payload.get("ack_enabled", True)),
+        merge_report_timeout_seconds=int(payload.get("merge_report_timeout_seconds") or 300),
+        dispatch_config=dict(payload.get("dispatch_config")) if isinstance(payload.get("dispatch_config"), dict) else None,
+        ack_enabled=bool(payload.get("ack_enabled", False)),
+        ack_on_pending=bool(payload.get("ack_on_pending", payload.get("ack_on_unknown", False))),
+        ack_on_unknown=bool(payload.get("ack_on_unknown", False)),
         ack_recipients=[str(x) for x in (payload.get("ack_recipients") or [])] if isinstance(payload.get("ack_recipients"), list) else [],
         ack_use_savedsearch_recipients=bool(payload.get("ack_use_savedsearch_recipients", False)),
         ack_attach_manifest=bool(payload.get("ack_attach_manifest", False)),
@@ -110,8 +125,8 @@ def _build_cfg_from_runtime_payload(payload: dict[str, object], exe_dir: str) ->
 
 
 class ReportsApp(ttk.Frame):
-    DISPATCH_STATUS_WAIT_SECONDS = 60
-    DISPATCH_STATUS_POLL_SECONDS = 2
+    DISPATCH_STATUS_WAIT_SECONDS = 300
+    DISPATCH_STATUS_POLL_SECONDS = 5
 
     def __init__(
         self,
@@ -129,6 +144,10 @@ class ReportsApp(ttk.Frame):
         self.audit_logger = audit_logger
         self.splunk_broker_handle = splunk_broker_handle
         self.splunk_broker_client = splunk_broker_handle.client if splunk_broker_handle else None
+        if self.splunk_broker_client is not None and hasattr(self.splunk_broker_client, "configure_request_timeout"):
+            self.splunk_broker_client.configure_request_timeout(
+                resolve_broker_request_timeout_seconds(cfg)
+            )
         self.exe_dir = exe_dir or _resolve_runtime_exe_dir()
 
         self.client: SplunkBrokerProxyClient | None = None
@@ -164,21 +183,23 @@ class ReportsApp(ttk.Frame):
     # --------------- UI construction ---------------
 
     def _build_ui(self) -> None:
-        self.pack(fill="both", expand=True)
+        self.configure(style="App.TFrame")
+        self.pack(fill="both", expand=True, padx=18, pady=18)
         self.master.title(TOOL_DISPLAY_NAME)
         self.master.minsize(900, 600)
+        style_window(self.master, surface=WINDOW_BG)
 
         # Top row: server/app + controls
-        top = ttk.Frame(self)
-        top.pack(side="top", fill="x", padx=10, pady=8)
+        top = ttk.Frame(self, padding=(16, 14), style="Card.TFrame")
+        top.pack(side="top", fill="x", pady=(0, 14))
 
-        ttk.Label(top, text="Server:").pack(side="left")
+        ttk.Label(top, text="Server:", style="Card.TLabel").pack(side="left")
         self.server_var = tk.StringVar()
         self.server_combo = ttk.Combobox(top, textvariable=self.server_var, state="readonly", width=40)
         self.server_combo.bind("<<ComboboxSelected>>", self.on_server_selection_changed)
         self.server_combo.pack(side="left", padx=(4, 12))
 
-        ttk.Label(top, text="App:").pack(side="left")
+        ttk.Label(top, text="App:", style="Card.TLabel").pack(side="left")
         self.app_var = tk.StringVar()
         self.app_combo = ttk.Combobox(top, textvariable=self.app_var, state="disabled", width=30)
         self.app_combo.bind("<<ComboboxSelected>>", self.on_app_changed)
@@ -191,22 +212,22 @@ class ReportsApp(ttk.Frame):
         self.reload_button.pack(side="left", padx=(8, 0))
 
         # Spacer
-        top_spacer = ttk.Label(top)
+        top_spacer = ttk.Label(top, style="Card.TLabel")
         top_spacer.pack(side="left", expand=True)
 
         # Middle row: reports list + options
-        middle = ttk.Frame(self)
-        middle.pack(side="top", fill="both", expand=True, padx=10, pady=8)
+        middle = ttk.Frame(self, style="App.TFrame")
+        middle.pack(side="top", fill="both", expand=True, pady=(0, 14))
 
         # Left: reports list
-        left = ttk.Frame(middle)
+        left = ttk.Frame(middle, padding=(16, 14), style="Card.TFrame")
         left.pack(side="left", fill="both", expand=True)
 
-        ttk.Label(left, text="Reports:").pack(anchor="w")
-        search_row = ttk.Frame(left)
+        ttk.Label(left, text="Reports", style="Section.TLabel").pack(anchor="w")
+        search_row = ttk.Frame(left, style="Card.TFrame")
         search_row.pack(fill="x", pady=(2, 6))
 
-        ttk.Label(search_row, text="Search:").pack(side="left")
+        ttk.Label(search_row, text="Search:", style="Card.TLabel").pack(side="left")
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self.on_search_changed)
         self.search_entry = ttk.Entry(search_row, textvariable=self.search_var)
@@ -220,17 +241,19 @@ class ReportsApp(ttk.Frame):
             exportselection=False,
         )
         self.reports_list.pack(side="left", fill="both", expand=True)
+        style_listbox(self.reports_list)
 
         reports_scroll = ttk.Scrollbar(left, orient="vertical", command=self.reports_list.yview)
         reports_scroll.pack(side="right", fill="y")
         self.reports_list.config(yscrollcommand=reports_scroll.set)
 
         # Right: options
-        right = ttk.Frame(middle)
+        right = ttk.Frame(middle, padding=(16, 14), style="Card.TFrame")
         right.pack(side="left", fill="y", padx=(12, 0))
 
         # Frequency
-        ttk.Label(right, text="Frequency:").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(right, text="Dispatch Options", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ttk.Label(right, text="Frequency:", style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=(0, 4))
         self.frequency_var = tk.StringVar(value="Daily")
         self.frequency_combo = ttk.Combobox(
             right,
@@ -239,17 +262,17 @@ class ReportsApp(ttk.Frame):
             state="readonly",
             width=15,
         )
-        self.frequency_combo.grid(row=0, column=1, sticky="w", pady=(0, 4))
+        self.frequency_combo.grid(row=1, column=1, sticky="w", pady=(0, 4))
 
         # Start date
-        ttk.Label(right, text="Start date:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Label(right, text="Start date:", style="Card.TLabel").grid(row=2, column=0, sticky="w", pady=4)
         self.start_date_widget = self._make_date_widget(right)
-        self.start_date_widget.grid(row=1, column=1, sticky="w", pady=4)
+        self.start_date_widget.grid(row=2, column=1, sticky="w", pady=4)
 
         # End date
-        ttk.Label(right, text="End date:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Label(right, text="End date:", style="Card.TLabel").grid(row=3, column=0, sticky="w", pady=4)
         self.end_date_widget = self._make_date_widget(right)
-        self.end_date_widget.grid(row=2, column=1, sticky="w", pady=4)
+        self.end_date_widget.grid(row=3, column=1, sticky="w", pady=4)
 
         # No change checkbox
         self.no_change_var = tk.BooleanVar(value=False)
@@ -258,31 +281,39 @@ class ReportsApp(ttk.Frame):
             text="Use saved search time range (no override)",
             variable=self.no_change_var,
             command=self.on_no_change_toggled,
+            style="TCheckbutton",
         )
-        self.no_change_chk.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        self.no_change_chk.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 4))
 
         # Send button
-        self.send_button = ttk.Button(right, text="Send reports", command=self.on_send_clicked, state="disabled")
-        self.send_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        self.send_button = ttk.Button(
+            right,
+            text="Send reports",
+            command=self.on_send_clicked,
+            state="disabled",
+            style="Primary.TButton",
+        )
+        self.send_button.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(16, 0))
 
         # User info display (audit info)
         username = get_effective_username()
         hostname = socket.gethostname()
         tool_name = TOOL_DISPLAY_NAME
         user_info_text = f"Hi {username}.\nYou are using {tool_name} on {hostname}."
-        self.user_info_label = ttk.Label(right, text=user_info_text, foreground="gray", font=("TkDefaultFont", 9), justify="left")
-        self.user_info_label.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.user_info_label = ttk.Label(right, text=user_info_text, style="Subtle.TLabel", justify="left")
+        self.user_info_label.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         for i in range(2):
             right.grid_columnconfigure(i, weight=1)
 
         # Bottom: log area
-        bottom = ttk.Frame(self)
-        bottom.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 10))
+        bottom = ttk.Frame(self, padding=(16, 14), style="Card.TFrame")
+        bottom.pack(side="top", fill="both", expand=True)
 
-        ttk.Label(bottom, text="Log:").pack(anchor="w")
+        ttk.Label(bottom, text="Activity Log", style="Section.TLabel").pack(anchor="w")
         self.log_text = tk.Text(bottom, height=12, wrap="word", state="disabled")
         self.log_text.pack(side="left", fill="both", expand=True)
+        style_text_widget(self.log_text)
 
         log_scroll = ttk.Scrollbar(bottom, orient="vertical", command=self.log_text.yview)
         log_scroll.pack(side="right", fill="y")
@@ -637,7 +668,7 @@ class ReportsApp(ttk.Frame):
         return (
             "This will produce a manually regenerated report run "
             "(different from scheduled automation).\n"
-            "A summary acknowledgement email will be sent after this run.\n\n"
+            "An acknowledgement email will be sent only when final status is known, or when pending verification emails are explicitly enabled.\n\n"
             f"Report(s): {report_label}\n"
             f"Date range: {range_text}\n"
             f"Slice mode: {mode_text}\n"
@@ -790,8 +821,8 @@ class ReportsApp(ttk.Frame):
             "start": start,
             "end": end,
             "no_change": no_change,
-            "wait_seconds": self.DISPATCH_STATUS_WAIT_SECONDS,
-            "poll_interval": self.DISPATCH_STATUS_POLL_SECONDS,
+            "wait_seconds": resolve_status_check_timeout_seconds(self.cfg),
+            "poll_interval": resolve_status_check_poll_seconds(self.cfg),
             "app": self.app_var.get().strip(),
         }
         while True:
@@ -819,6 +850,8 @@ class ReportsApp(ttk.Frame):
 
 def main() -> None:
     root = tk.Tk()
+    apply_splunk_light_theme(root)
+    style_window(root, surface=WINDOW_BG)
     exe_dir = _resolve_runtime_exe_dir()
 
     policy = None
@@ -841,20 +874,38 @@ def main() -> None:
         audit_logger.log_event("LOG_PATH_SELECTED", level="INFO", log_path=audit_logger.log_path)
 
     if policy_load_error is not None:
-        if isinstance(policy_load_error, PolicyViolation):
+        if isinstance(policy_load_error, ConfigError):
+            audit_logger.log_event("CONFIG_LOAD_FAILED", level="ERROR", reason=redact_text(str(policy_load_error)))
+            title = "Configuration error"
+            message = (
+                f"{policy_load_error}\n\n"
+                "Review config.ini and config.ini.example. The tool will create config.ini from the template when possible, "
+                "and will save config.ini.bak before any automatic repair."
+            )
+        elif isinstance(policy_load_error, PolicyViolation):
             audit_logger.log_event(
                 "POLICY_VIOLATION_BLOCKED",
                 level="ERROR",
                 control=policy_load_error.control,
                 reason=policy_load_error.detail,
             )
+            title = "Security policy blocked startup"
+            message = (
+                f"{policy_load_error.detail}\n\n"
+                "Review the hardening settings in config.ini and audit.jsonl for details."
+            )
         else:
             audit_logger.log_event("CONFIG_LOAD_FAILED", level="ERROR", reason=redact_text(str(policy_load_error)))
+            title = "Startup error"
+            message = (
+                f"{redact_text(str(policy_load_error))}\n\n"
+                "Startup could not continue. Review audit.jsonl for details."
+            )
         audit_logger.log_event("TOOL_EXIT", level="INFO")
         show_modal_prompt(
             root,
-            "Security policy blocked startup",
-            "Startup was blocked by security policy. Check audit.jsonl for details.",
+            title,
+            message,
             "error",
         )
         broker_handle.shutdown()
@@ -886,25 +937,45 @@ def main() -> None:
     runtime_warning = ""
     runtime_payload: dict[str, object] = {}
     runtime_loaded = False
+    config_startup_error = ""
     if splunk_broker_handle.is_available and splunk_broker_handle.client is not None:
         try:
             runtime_payload = splunk_broker_handle.client.get_runtime_config()
             runtime_loaded = True
         except Exception as exc:
-            runtime_warning = (
-                f"{SPLUNK_BROKER_UNAVAILABLE_WARNING} "
-                f"({redact_text(str(exc))})"
-            )
+            try:
+                health = splunk_broker_handle.client.health()
+                if isinstance(health, dict):
+                    config_startup_error = redact_text(str(health.get("config_error") or "")).strip()
+            except Exception:
+                config_startup_error = ""
+            if config_startup_error:
+                runtime_warning = config_startup_error
+            else:
+                runtime_warning = (
+                    f"{SPLUNK_BROKER_UNAVAILABLE_WARNING} "
+                    f"({redact_text(str(exc))})"
+                )
     else:
         runtime_warning = splunk_broker_handle.startup_error or SPLUNK_BROKER_UNAVAILABLE_WARNING
 
     if not runtime_loaded:
-        audit_logger.log_event("CONFIG_LOAD_FAILED", level="ERROR", reason=runtime_warning or SPLUNK_BROKER_UNAVAILABLE_WARNING)
+        if config_startup_error:
+            audit_logger.log_event("CONFIG_LOAD_FAILED", level="ERROR", reason=config_startup_error)
+            title = "Configuration error"
+            message = (
+                f"{config_startup_error}\n\n"
+                "Fix the configuration and retry. If a repair was applied, compare config.ini with config.ini.bak."
+            )
+        else:
+            audit_logger.log_event("CONFIG_LOAD_FAILED", level="ERROR", reason=runtime_warning or SPLUNK_BROKER_UNAVAILABLE_WARNING)
+            title = "Local Splunk broker unavailable"
+            message = SPLUNK_BROKER_UNAVAILABLE_WARNING
         audit_logger.log_event("TOOL_EXIT", level="INFO")
         show_modal_prompt(
             root,
-            "Local Splunk broker unavailable",
-            SPLUNK_BROKER_UNAVAILABLE_WARNING,
+            title,
+            message,
             "error",
         )
         splunk_broker_handle.shutdown()

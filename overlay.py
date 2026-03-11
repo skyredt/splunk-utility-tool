@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import tkinter as tk
 
+from ui_theme import OVERLAY_ALPHA, OVERLAY_BG
+
 
 _OVERLAYS: dict[int, tuple[tk.Toplevel, int]] = {}
 
@@ -27,10 +29,10 @@ def create_overlay(parent: tk.Misc) -> tk.Toplevel:
 
     overlay = tk.Toplevel(parent)
     overlay.overrideredirect(True)
-    overlay.configure(bg="black")
+    overlay.configure(bg=OVERLAY_BG)
     overlay.transient(parent)
     try:
-        overlay.attributes("-alpha", 0.32)
+        overlay.attributes("-alpha", OVERLAY_ALPHA)
     except tk.TclError:
         pass
     _sync_geometry(parent, overlay)

@@ -180,13 +180,42 @@ python -c "from splunk_engine import load_config; cfg = load_config(); print(f'p
 ```ini
 [mergereport]
 enabled = false                    # Set to true if you have log path
+timeout_seconds = 300
+
+[dispatch]
+per_slice_wait_seconds = 30
+continue_on_timeout = true
+timeout_result = pending
+
+[email]
+ack_enabled = 0
+ack_on_pending = 0                 # Default: skip ACK when slices remain PENDING
 
 [postdispatch]
 merge_report_enabled = true        # Phase 2: REST verification
 native_email_enabled = true        # Phase 2: REST verification
-poll_seconds = 3                   # Check logs every 3 seconds
-lookback_seconds = 300             # Search last 5 minutes
+merge_report_timeout_seconds = 300
+native_email_timeout_seconds = 300
+broker_request_timeout_seconds = 300
+reconcile_pending = true
+reconcile_wait_seconds = 60
+poll_seconds = 5                   # Check logs every 5 seconds
+lookback_seconds = 900             # Search last 15 minutes
 ```
+
+### March 2026 Timeout Handling Update
+- If dispatch returns a SID but the active wait budget expires first, the slice is marked `PENDING`, not `FAILED`.
+- The batch continues to the next slice after the 30-second active wait budget expires.
+- `FAILED` now means Splunk explicitly reported failure, not just that active waiting timed out.
+- `ack_on_pending = 0` skips the acknowledgement email when final delivery status is still pending.
+- `ack_on_pending = 1` sends the acknowledgement email with `PARTIAL / PENDING VERIFICATION` wording and separate Pending counts.
+- `ack_enabled = 0` is the recommended pilot default.
+
+### March 2026 Config Recovery Update
+- `config.ini` is loaded from the executable directory only.
+- If `config.ini` is missing and `config.ini.example` exists, the tool recreates `config.ini` automatically.
+- If formatting is valid but inconsistent, the tool rewrites it into canonical INI format and stores the previous copy as `config.ini.bak`.
+- If the config is malformed, startup stops with a readable line-aware configuration error instead of a generic hardening block.
 
 ### Disable Everything
 ```ini

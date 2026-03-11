@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import configparser
 import hashlib
 import json
 import os
@@ -9,6 +8,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
+
+from Internal.config_manager import LoadedConfig, load_and_validate_config
 
 
 DEFAULT_POLICY_MODE = "enforced"
@@ -281,12 +282,17 @@ def load_security_policy(
                 "CONFIG_PATH_BINDING",
                 f"config.ini must be loaded from exe_dir only: {expected_cfg}",
             )
+    loaded = load_and_validate_config(exe_dir=resolved_exe_dir)
+    return check_hardening_policy(loaded, exe_dir=resolved_exe_dir, config_path=expected_cfg)
 
-    cfg = configparser.ConfigParser()
-    read_files = cfg.read(expected_cfg)
-    if not read_files:
-        raise FileNotFoundError(f"Config file not found: {expected_cfg}")
 
+def check_hardening_policy(
+    loaded: LoadedConfig,
+    *,
+    exe_dir: str,
+    config_path: str,
+) -> SecurityPolicy:
+    cfg = loaded.parser
     section = cfg["Security"] if "Security" in cfg else cfg["security"] if "security" in cfg else None
     build_mode = DEFAULT_BUILD_MODE
     mode = DEFAULT_POLICY_MODE
@@ -300,7 +306,7 @@ def load_security_policy(
             raise PolicyViolation("POLICY_MODE_INVALID", f"Unsupported Security.policy_mode={mode!r}")
         allow_insecure = _parse_bool(section.get("allow_insecure_overrides", str(int(allow_insecure))), allow_insecure)
 
-    token = _read_break_glass_token(resolved_exe_dir)
+    token = _read_break_glass_token(exe_dir)
     if build_mode == "production" and mode == "permissive":
         if not allow_insecure:
             raise PolicyViolation(
@@ -314,8 +320,8 @@ def load_security_policy(
             )
 
     return SecurityPolicy(
-        exe_dir=resolved_exe_dir,
-        config_path=expected_cfg,
+        exe_dir=exe_dir,
+        config_path=config_path,
         build_mode=build_mode,
         policy_mode=mode,
         allow_insecure_overrides=allow_insecure,
