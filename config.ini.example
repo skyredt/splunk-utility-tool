@@ -1,3 +1,8 @@
+# Runtime configuration for Splunk Utility Tool v4.
+# Keep each section header on its own line and each setting as `key = value`.
+# If config.ini is missing, the tool recreates it from this template.
+# If formatting is repaired automatically, the previous file is saved as config.ini.bak.
+
 [splunk]
 # Primary endpoint (Splunk management port)
 host = https://splunk-sh-vip:8089

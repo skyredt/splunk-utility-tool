@@ -211,6 +211,12 @@ lookback_seconds = 900             # Search last 15 minutes
 - `ack_on_pending = 1` sends the acknowledgement email with `PARTIAL / PENDING VERIFICATION` wording and separate Pending counts.
 - `ack_enabled = 0` is the recommended pilot default.
 
+### March 2026 Config Recovery Update
+- `config.ini` is loaded from the executable directory only.
+- If `config.ini` is missing and `config.ini.example` exists, the tool recreates `config.ini` automatically.
+- If formatting is valid but inconsistent, the tool rewrites it into canonical INI format and stores the previous copy as `config.ini.bak`.
+- If the config is malformed, startup stops with a readable line-aware configuration error instead of a generic hardening block.
+
 ### Disable Everything
 ```ini
 [postdispatch]
