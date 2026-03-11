@@ -1,7 +1,12 @@
-﻿name: Build Windows EXE (PyInstaller)
+name: Build Windows EXE (PyInstaller)
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/tag/commit to build (leave blank = default branch)"
+        required: false
+        default: ""
   push:
     branches:
       - portable-env
@@ -12,7 +17,18 @@ jobs:
     runs-on: windows-2022
 
     steps:
-      - name: Checkout
+      - name: Checkout (workflow_dispatch with ref)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.ref != '' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Checkout (workflow_dispatch default)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.ref == '' }}
+        uses: actions/checkout@v4
+
+      - name: Checkout (push)
+        if: ${{ github.event_name == 'push' }}
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -49,12 +65,13 @@ jobs:
             }
           }
 
+      - name: Diagnostics
+        shell: pwsh
+        run: |
+          python -c "import sys; print('sys.executable:', sys.executable); print('sys.base_prefix:', sys.base_prefix)"
           Write-Host "vc_runtime folder contents:"
           Get-ChildItem vc_runtime -Force | Select-Object Name,Length | Format-Table -AutoSize
 
-      - name: Diagnostics (prove what Actions is building)
-        shell: pwsh
-        run: |
           Write-Host "HEAD:"; git rev-parse HEAD
           Write-Host "First 60 lines of spec:"
           Get-Content .\SplunkUtilityTool_v3.spec -TotalCount 60

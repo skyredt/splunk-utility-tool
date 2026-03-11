@@ -3,18 +3,25 @@
 import os
 import sys
 from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_all
 
 
-def _repo_root():
+def _repo_root() -> Path:
     """
-    Resolve repo root without using module file variable.
-    Prefer PyInstaller-injected `specpath` (directory containing the spec),
-    then GITHUB_WORKSPACE (Actions), else current working directory.
+    Resolve repo root without __file__ (PyInstaller spec does not guarantee __file__ exists).
+
+    Priority:
+    1) PyInstaller-injected 'specpath' (directory containing the spec)
+    2) GitHub Actions workspace
+    3) Current working directory
     """
     sp = globals().get("specpath")
     if sp:
-        return Path(sp).resolve()
+        try:
+            return Path(sp).resolve()
+        except Exception:
+            pass
 
     ws = os.environ.get("GITHUB_WORKSPACE")
     if ws:
@@ -52,11 +59,11 @@ def _find_vc_runtime_bins():
     for dll in allow:
         picked = None
         for root in roots:
-            p = root / dll
-            if p.exists():
-                picked = p
+            candidate = root / dll
+            if candidate.exists():
+                picked = candidate
                 break
-        if picked:
+        if picked is not None:
             bins.append((str(picked), "."))
 
     return bins
@@ -68,27 +75,36 @@ if app_icon.exists():
     datas.append((str(app_icon), "assets"))
 else:
     print("Warning: assets/app.ico not found; build will use default icon.")
+
 binaries = _find_vc_runtime_bins()
 if binaries:
     print("Bundling VC runtime DLLs (minimal):")
-    for p, _ in binaries:
-        print(" -", p)
+    for path, _ in binaries:
+        print(" -", path)
 else:
     print("Bundling VC runtime DLLs (minimal): none found")
 
 hiddenimports = []
 
 tmp_ret = collect_all("PySide6")
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+datas += tmp_ret[0]
+binaries += tmp_ret[1]
+hiddenimports += tmp_ret[2]
 
 tmp_ret = collect_all("PySide6_Essentials")
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+datas += tmp_ret[0]
+binaries += tmp_ret[1]
+hiddenimports += tmp_ret[2]
 
 tmp_ret = collect_all("PySide6_Addons")
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+datas += tmp_ret[0]
+binaries += tmp_ret[1]
+hiddenimports += tmp_ret[2]
 
 tmp_ret = collect_all("shiboken6")
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+datas += tmp_ret[0]
+binaries += tmp_ret[1]
+hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
