@@ -39,7 +39,8 @@ max_bytes = 10485760
 backup_count = 10
 
 [mergereport]
-# Optional file-based MergeReport monitoring
+# Legacy file-based MergeReport monitoring (use [postdispatch] instead)
+# If [postdispatch] merge_report_* keys are present, this section is ignored.
 enabled = false
 log_path =
 timeout_seconds = 300
@@ -74,6 +75,8 @@ from_addr = Splunk Notification <splunk-donotreply@dsta.gov.sg>
 
 # MergeReport verification settings
 merge_report_enabled = true
+# Optional file-based MergeReport log path (absolute). Leave blank to disable file tailing.
+merge_report_log_path =
 merge_report_index = _internal
 merge_report_source_contains = mergeReport_alert.log
 merge_report_sourcetype =

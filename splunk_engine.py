@@ -4,6 +4,7 @@ import importlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -259,6 +260,8 @@ class RegenSliceRecord:
     """Record of a single slice dispatch outcome."""
     report_name: str
     slice_label: str
+    slice_index: int = 0
+    slice_total: int = 0
     earliest: str = ""
     latest: str = ""
     sid: str = ""
@@ -298,6 +301,8 @@ class RegenContext:
         self,
         report_name: str,
         slice_label: str,
+        slice_index: int = 0,
+        slice_total: int = 0,
         earliest: str = "",
         latest: str = "",
         sid: str = "",
@@ -309,6 +314,8 @@ class RegenContext:
             RegenSliceRecord(
                 report_name=report_name,
                 slice_label=slice_label,
+                slice_index=max(0, int(slice_index or 0)),
+                slice_total=max(0, int(slice_total or 0)),
                 earliest=earliest,
                 latest=latest,
                 sid=sid,
@@ -447,22 +454,52 @@ def load_config(
         logging_backup_count,
     )
 
-    # MergeReport config (optional section)
+    # MergeReport config (canonical: [postdispatch], legacy: [mergereport])
     merge_report_enabled = False
     merge_report_log_path = ""
     merge_report_timeout_seconds = DEFAULT_MERGEREPORT_TIMEOUT_SECONDS
 
-    if "mergereport" in cfg:
-        enabled_str = cfg["mergereport"].get("enabled", "false").lower()
-        merge_report_enabled = enabled_str in ("true", "1", "yes")
-        merge_report_log_path = cfg["mergereport"].get("log_path", "").strip()
+    postdispatch_section = cfg["postdispatch"] if "postdispatch" in cfg else None
+    legacy_mergereport_section = cfg["mergereport"] if "mergereport" in cfg else None
+    postdispatch_has_merge_report = False
+    if postdispatch_section:
+        postdispatch_has_merge_report = any(
+            cfg.has_option("postdispatch", key)
+            for key in ("merge_report_enabled", "merge_report_log_path", "merge_report_timeout_seconds")
+        )
+
+    if postdispatch_section and postdispatch_has_merge_report:
+        merge_report_enabled = _parse_bool(
+            postdispatch_section.get("merge_report_enabled", "true"),
+            True,
+        )
+        merge_report_log_path = postdispatch_section.get("merge_report_log_path", "").strip()
         merge_report_timeout_seconds = _parse_min_int(
-            cfg["mergereport"].get(
+            postdispatch_section.get(
+                "merge_report_timeout_seconds",
+                str(DEFAULT_MERGEREPORT_TIMEOUT_SECONDS),
+            ),
+            DEFAULT_MERGEREPORT_TIMEOUT_SECONDS,
+            1,
+        )
+        if legacy_mergereport_section is not None:
+            logging.getLogger(__name__).warning(
+                "Config section [mergereport] is legacy and ignored; use [postdispatch] merge_report_* keys."
+            )
+    elif legacy_mergereport_section is not None:
+        enabled_str = legacy_mergereport_section.get("enabled", "false").lower()
+        merge_report_enabled = enabled_str in ("true", "1", "yes")
+        merge_report_log_path = legacy_mergereport_section.get("log_path", "").strip()
+        merge_report_timeout_seconds = _parse_min_int(
+            legacy_mergereport_section.get(
                 "timeout_seconds",
                 str(DEFAULT_MERGEREPORT_TIMEOUT_SECONDS),
             ),
             DEFAULT_MERGEREPORT_TIMEOUT_SECONDS,
             1,
+        )
+        logging.getLogger(__name__).warning(
+            "Config section [mergereport] is legacy; mapping to [postdispatch] merge_report_* settings."
         )
 
     # Validate MergeReport config if enabled
@@ -567,6 +604,7 @@ def load_config(
         section = cfg["postdispatch"]
         postdispatch_config = {
             "merge_report_enabled": section.get("merge_report_enabled", "true").lower() in ("true", "1", "yes"),
+            "merge_report_log_path": section.get("merge_report_log_path", "").strip(),
             "merge_report_index": section.get("merge_report_index", "_internal"),
             "merge_report_source_contains": section.get("merge_report_source_contains", "mergeReport_alert.log"),
             "merge_report_sourcetype": section.get("merge_report_sourcetype", "").strip(),
@@ -1109,6 +1147,8 @@ def _dispatch_slice_and_wait(
     report_id_url: str,
     report_name: str,
     slice_label: str,
+    slice_index: int = 0,
+    slice_total: int = 0,
     earliest_display: str,
     latest_display: str,
     dispatch_earliest: Optional[str],
@@ -1122,6 +1162,8 @@ def _dispatch_slice_and_wait(
     record_slice: Callable[..., None],
     audit_slice_event: Callable[..., None],
 ) -> Tuple[str, str]:
+    slice_index = max(0, int(slice_index or 0))
+    slice_total = max(0, int(slice_total or 0))
     ok, sid, err = client.dispatch_saved_search(
         report_id_url,
         earliest=dispatch_earliest,
@@ -1129,14 +1171,29 @@ def _dispatch_slice_and_wait(
     )
     if not ok:
         _append_log(logs, f"  {log_prefix}FAILED: {err}", log_callback)
+        broker_op, broker_timeout = _extract_broker_context(text=err)
+        error_type = "TimeoutError" if _error_looks_like_timeout(err) else "DispatchError"
+        audit_fields = {
+            "slice_label": slice_label,
+            "slice_index": slice_index,
+            "slice_total": slice_total,
+            "reason": _short_error(err),
+            "error_type": error_type,
+            "error_phase": "dispatch",
+        }
+        if broker_op:
+            audit_fields["broker_op"] = broker_op
+        if broker_timeout is not None:
+            audit_fields["timeout_seconds"] = broker_timeout
         audit_slice_event(
             "REPORT_SLICE_FAILED",
             level="WARN",
-            slice_label=slice_label,
-            reason=_short_error(err),
+            **audit_fields,
         )
         record_slice(
             slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
             status="FAILED",
             earliest=earliest_display,
             latest=latest_display,
@@ -1150,10 +1207,16 @@ def _dispatch_slice_and_wait(
             "REPORT_SLICE_FAILED",
             level="WARN",
             slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
             reason="No SID returned",
+            error_type="NoSID",
+            error_phase="dispatch",
         )
         record_slice(
             slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
             status="FAILED",
             earliest=earliest_display,
             latest=latest_display,
@@ -1173,11 +1236,15 @@ def _dispatch_slice_and_wait(
     audit_slice_event(
         "REPORT_SLICE_SID_RECEIVED",
         slice_label=slice_label,
+        slice_index=slice_index,
+        slice_total=slice_total,
         sid=sid,
     )
     audit_slice_event(
         "REPORT_SLICE_DISPATCHED",
         slice_label=slice_label,
+        slice_index=slice_index,
+        slice_total=slice_total,
         sid=sid,
     )
     if sid_callback:
@@ -1194,6 +1261,7 @@ def _dispatch_slice_and_wait(
         safe_error = redact_text(raw_error)
         err_msg = _build_pending_status_message(safe_error, wait_seconds=wait_seconds)
         error_type = type(exc).__name__
+        broker_op, broker_timeout = _extract_broker_context(exc=exc, text=raw_error)
         _append_log(
             logs,
             f"  {log_prefix}{_display_slice_status(timeout_status)} (sid={sid}) - {err_msg}",
@@ -1204,30 +1272,43 @@ def _dispatch_slice_and_wait(
                 "REPORT_SLICE_ACTIVE_WAIT_EXPIRED",
                 level="WARN",
                 slice_label=slice_label,
+                slice_index=slice_index,
+                slice_total=slice_total,
                 sid=sid,
                 reason=_short_error(safe_error),
                 error_type=error_type,
                 error_phase="status_check",
+                broker_op=broker_op if broker_op else None,
+                timeout_seconds=broker_timeout,
             )
         else:
             audit_slice_event(
                 "REPORT_SLICE_STATUS_CHECK_ERROR",
                 level="WARN",
                 slice_label=slice_label,
+                slice_index=slice_index,
+                slice_total=slice_total,
                 sid=sid,
                 reason=_short_error(safe_error),
                 error_type=error_type,
                 error_phase="status_check",
+                broker_op=broker_op if broker_op else None,
+                timeout_seconds=broker_timeout,
             )
         audit_slice_event(
             "REPORT_SLICE_MARKED_PENDING",
             level="WARN",
             slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
             sid=sid,
             reason=_short_error(err_msg),
+            error_phase="status_check",
         )
         record_slice(
             slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
             status=timeout_status,
             earliest=earliest_display,
             latest=latest_display,
@@ -1242,10 +1323,14 @@ def _dispatch_slice_and_wait(
         audit_slice_event(
             "REPORT_SLICE_OK",
             slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
             sid=sid,
         )
         record_slice(
             slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
             status="OK",
             earliest=earliest_display,
             latest=latest_display,
@@ -1265,11 +1350,16 @@ def _dispatch_slice_and_wait(
             "REPORT_SLICE_FAILED",
             level="WARN",
             slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
             sid=sid,
             reason=_short_error(dispatch_state),
+            error_phase="status_check",
         )
         record_slice(
             slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
             status="FAILED",
             earliest=earliest_display,
             latest=latest_display,
@@ -1293,18 +1383,26 @@ def _dispatch_slice_and_wait(
         "REPORT_SLICE_ACTIVE_WAIT_EXPIRED",
         level="WARN",
         slice_label=slice_label,
+        slice_index=slice_index,
+        slice_total=slice_total,
         sid=sid,
         reason=_short_error(timeout_detail),
+        error_phase="status_check",
     )
     audit_slice_event(
         "REPORT_SLICE_MARKED_PENDING",
         level="WARN",
         slice_label=slice_label,
+        slice_index=slice_index,
+        slice_total=slice_total,
         sid=sid,
         reason=_short_error(err_msg),
+        error_phase="status_check",
     )
     record_slice(
         slice_label=slice_label,
+        slice_index=slice_index,
+        slice_total=slice_total,
         status=timeout_status,
         earliest=earliest_display,
         latest=latest_display,
@@ -1336,6 +1434,8 @@ def run_dispatch_single(
     def _record_slice(
         slice_label: str,
         status: str,
+        slice_index: int = 0,
+        slice_total: int = 0,
         earliest: str = "",
         latest: str = "",
         sid: str = "",
@@ -1347,6 +1447,8 @@ def run_dispatch_single(
         regen_context.add_slice(
             report_name=report_name,
             slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
             earliest=earliest,
             latest=latest,
             sid=sid,
@@ -1379,6 +1481,8 @@ def run_dispatch_single(
             report_id_url=report_id_url,
             report_name=report_name,
             slice_label=slice_label,
+            slice_index=1,
+            slice_total=1,
             earliest_display=str(start),
             latest_display=str(end),
             dispatch_earliest=None,
@@ -1419,6 +1523,8 @@ def run_dispatch_single(
             report_id_url=report_id_url,
             report_name=report_name,
             slice_label=slice_label,
+            slice_index=i,
+            slice_total=len(starts),
             earliest_display=str(s),
             latest_display=str(e),
             dispatch_earliest=earliest,
@@ -1446,6 +1552,8 @@ def run_dispatch_single(
                     "REPORT_BATCH_CONTINUE_AFTER_PENDING",
                     level="INFO",
                     slice_label=slice_label,
+                    slice_index=i,
+                    slice_total=len(starts),
                     sid=sid,
                     remaining_slices=len(starts) - i,
                 )
@@ -1459,6 +1567,8 @@ def run_dispatch_single(
                 "REPORT_BATCH_STOPPED_AFTER_PENDING",
                 level="WARN",
                 slice_label=slice_label,
+                slice_index=i,
+                slice_total=len(starts),
                 sid=sid,
                 remaining_slices=len(starts) - i,
             )
@@ -1481,9 +1591,43 @@ def _short_error(text: str, limit: int = 180) -> str:
     return clean[: limit - 3] + "..."
 
 
+_BROKER_TIMEOUT_RE = re.compile(
+    r"Local Splunk broker timed out while processing the request"
+    r"(?:\s*\(op=([^,]+),\s*timeout=(\d+)s\))?",
+    re.IGNORECASE,
+)
+
+
 def _error_looks_like_timeout(text: str) -> bool:
     lower = (text or "").lower()
     return "timed out" in lower or "timeout" in lower
+
+
+def _extract_broker_context(exc: Optional[Exception] = None, text: str = "") -> Tuple[Optional[str], Optional[int]]:
+    op = getattr(exc, "broker_op", None) if exc is not None else None
+    timeout_seconds = getattr(exc, "timeout_seconds", None) if exc is not None else None
+
+    if (not op or timeout_seconds is None) and text:
+        match = _BROKER_TIMEOUT_RE.search(text)
+        if match:
+            if not op:
+                op = match.group(1) or ""
+            if timeout_seconds is None:
+                try:
+                    timeout_seconds = int(match.group(2))
+                except Exception:
+                    timeout_seconds = None
+
+    op = str(op).strip() if isinstance(op, str) else ""
+    if isinstance(timeout_seconds, (int, float)):
+        try:
+            timeout_seconds = int(timeout_seconds)
+        except Exception:
+            timeout_seconds = None
+    else:
+        timeout_seconds = None
+
+    return (op if op else None), timeout_seconds
 
 
 def _build_pending_status_message(detail: str = "", *, wait_seconds: Optional[int] = None) -> str:
@@ -1660,7 +1804,10 @@ def _reconcile_pending_slices(
                     poll_interval=poll_seconds,
                 )
             except Exception as exc:
-                safe_msg = _short_error(redact_text(str(exc)))
+                raw_error = str(exc) or repr(exc)
+                safe_msg = _short_error(redact_text(raw_error))
+                error_type = type(exc).__name__
+                broker_op, broker_timeout = _extract_broker_context(exc=exc, text=raw_error)
                 _audit_event(
                     "REPORT_PENDING_RECONCILIATION_CHECK_FAILED",
                     level="WARN",
@@ -1668,7 +1815,13 @@ def _reconcile_pending_slices(
                     sid=item.sid,
                     report_name=item.report_name,
                     slice_label=item.slice_label,
+                    slice_index=item.slice_index,
+                    slice_total=item.slice_total,
                     reason=safe_msg,
+                    error_type=error_type,
+                    error_phase="reconciliation",
+                    broker_op=broker_op if broker_op else None,
+                    timeout_seconds=broker_timeout,
                 )
                 next_unresolved.append(item)
                 continue
@@ -1689,6 +1842,8 @@ def _reconcile_pending_slices(
                     sid=item.sid,
                     report_name=item.report_name,
                     slice_label=item.slice_label,
+                    slice_index=item.slice_index,
+                    slice_total=item.slice_total,
                 )
                 continue
 
@@ -1709,7 +1864,10 @@ def _reconcile_pending_slices(
                     sid=item.sid,
                     report_name=item.report_name,
                     slice_label=item.slice_label,
+                    slice_index=item.slice_index,
+                    slice_total=item.slice_total,
                     reason=_short_error(dispatch_state),
+                    error_phase="reconciliation",
                 )
                 continue
 
@@ -1738,6 +1896,9 @@ def _reconcile_pending_slices(
             sid=item.sid,
             report_name=item.report_name,
             slice_label=item.slice_label,
+            slice_index=item.slice_index,
+            slice_total=item.slice_total,
+            error_phase="reconciliation",
         )
 
     return logs
@@ -2073,6 +2234,8 @@ def send_ack_summary_email(context: RegenContext, config: Optional[SplunkConfig]
             run_id=context.run_id,
             recipient_count=0,
             reason="ack_disabled",
+            error_type="ack_disabled",
+            error_phase="ack_decision",
         )
         return AckEmailResult(
             attempted=False,
@@ -2086,6 +2249,9 @@ def send_ack_summary_email(context: RegenContext, config: Optional[SplunkConfig]
             run_id=context.run_id,
             recipient_count=len(recipients),
             pending_slices=pending_count,
+            reason="pending_slices_present",
+            error_type="pending_slices_present",
+            error_phase="ack_decision",
         )
         return AckEmailResult(
             attempted=False,
@@ -2100,6 +2266,8 @@ def send_ack_summary_email(context: RegenContext, config: Optional[SplunkConfig]
             run_id=context.run_id,
             recipient_count=0,
             reason="no_recipients",
+            error_type="no_recipients",
+            error_phase="ack_decision",
         )
         return AckEmailResult(
             attempted=False,
@@ -2157,6 +2325,8 @@ def send_ack_summary_email(context: RegenContext, config: Optional[SplunkConfig]
             run_id=context.run_id,
             recipient_count=len(recipients),
             reason="smtp_send_failed",
+            error_type=type(exc).__name__,
+            error_phase="email_send",
         )
         return AckEmailResult(
             attempted=True,

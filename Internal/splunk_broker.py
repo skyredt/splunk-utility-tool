@@ -74,6 +74,30 @@ def _safe_error_text(exc: Exception) -> str:
     return _sanitize_text(redact_text(str(exc)))
 
 
+def _coerce_timeout_seconds(timeout_seconds: float) -> Optional[int]:
+    try:
+        value = int(round(float(timeout_seconds)))
+        return max(1, value)
+    except Exception:
+        return None
+
+
+class LocalSplunkBrokerTimeout(RuntimeError):
+    def __init__(self, op: str, timeout_seconds: float) -> None:
+        self.broker_op = str(op or "").strip()
+        self.timeout_seconds = _coerce_timeout_seconds(timeout_seconds)
+        detail_parts: list[str] = []
+        if self.broker_op:
+            detail_parts.append(f"op={self.broker_op}")
+        if self.timeout_seconds:
+            detail_parts.append(f"timeout={self.timeout_seconds}s")
+        message = "Local Splunk broker timed out while processing the request"
+        if detail_parts:
+            message += " (" + ", ".join(detail_parts) + ")"
+        message += "."
+        super().__init__(message)
+
+
 def _redact_sensitive(value: Any, key_hint: str = "") -> Any:
     key_lower = key_hint.lower()
     if any(part in key_lower for part in _SENSITIVE_KEY_PARTS):
@@ -296,7 +320,7 @@ class SplunkBrokerProxyClient:
             status = int(resp.status)
             raw = resp.read(MAX_RESPONSE_BYTES)
         except (TimeoutError, socket.timeout):
-            raise RuntimeError("Local Splunk broker timed out while processing the request.")
+            raise LocalSplunkBrokerTimeout(op, timeout)
         except (ConnectionError, OSError, http.client.HTTPException):
             raise RuntimeError("Local Splunk broker is unavailable. Please restart the tool.")
         finally:

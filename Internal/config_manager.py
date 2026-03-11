@@ -61,6 +61,7 @@ _KNOWN_KEY_ORDER = {
     ),
     "postdispatch": (
         "merge_report_enabled",
+        "merge_report_log_path",
         "merge_report_index",
         "merge_report_source_contains",
         "merge_report_sourcetype",

@@ -422,7 +422,7 @@ reconcile_wait_seconds = 66
                 policy=FakePolicy(config_path),
             )
 
-        self.assertEqual(cfg.merge_report_timeout_seconds, 333)
+        self.assertEqual(cfg.merge_report_timeout_seconds, 444)
         self.assertTrue(cfg.ack_enabled)
         self.assertTrue(cfg.ack_on_pending)
         self.assertTrue(cfg.ack_on_unknown)
