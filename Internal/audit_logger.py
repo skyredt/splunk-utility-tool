@@ -7,7 +7,7 @@ import re
 import threading
 import uuid
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import getpass
@@ -84,9 +84,30 @@ SECURITY_ALWAYS_EVENTS = {
     "HARDENING_BASELINE_UPDATED",
 }
 
+# Try to import zoneinfo for proper SGT timezone handling (Python 3.9+)
+try:
+    from zoneinfo import ZoneInfo
+    _HAS_ZONEINFO = True
+except ImportError:
+    _HAS_ZONEINFO = False
+
+
+def _sgt_now() -> datetime:
+    if _HAS_ZONEINFO:
+        try:
+            return datetime.now(ZoneInfo("Asia/Singapore"))
+        except Exception:
+            pass
+    return datetime.now(timezone(timedelta(hours=8)))
+
+
+def _sgt_now_iso() -> str:
+    return _sgt_now().isoformat()
+
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    # Legacy helper name; returns SGT timestamps (UTC+8).
+    return _sgt_now_iso()
 
 
 def _canonical_payload_bytes(payload: dict[str, Any]) -> bytes:
@@ -350,7 +371,7 @@ class SecurityAuditLogger:
     def _archive_tampered_log(self) -> None:
         if not os.path.isfile(self.log_path):
             return
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        ts = _sgt_now().strftime("%Y%m%d%H%M%S")
         tampered_path = f"{self.log_path}.tampered_{ts}"
         try:
             os.replace(self.log_path, tampered_path)

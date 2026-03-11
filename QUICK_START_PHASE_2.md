@@ -6,7 +6,7 @@
 - If a slice has a SID but is still unresolved after that budget, the tool marks it `PENDING` and continues to the next slice.
 - `FAILED` now means explicit failure, not just timeout.
 - A bounded reconciliation pass re-checks pending slices after submission.
-- Acknowledgement email stays disabled by default during pilot.
+- Acknowledgement email is enabled by default.
 
 ## Config Recovery
 
@@ -24,7 +24,7 @@ continue_on_timeout = true
 timeout_result = pending
 
 [email]
-ack_enabled = 0
+ack_enabled = 1
 ack_on_pending = 0
 
 [postdispatch]

@@ -29,7 +29,7 @@ Pilot Dispatch Defaults
 - `[dispatch]` uses a 30 second active wait budget per slice
 - Timeout after a valid SID becomes `PENDING`, not `FAILED`
 - `[postdispatch]` performs one bounded reconciliation pass after submission
-- `[email]` keeps acknowledgement email disabled by default during pilot
+- `[email]` keeps acknowledgement email enabled by default
 
 Hardening Errors
 - `Configuration error`: missing template, malformed INI, duplicate sections/keys, or unsupported formatting

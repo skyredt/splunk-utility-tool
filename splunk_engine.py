@@ -126,7 +126,7 @@ class SplunkConfig:
     merge_report_timeout_seconds: int = DEFAULT_MERGEREPORT_TIMEOUT_SECONDS
     dispatch_config: Optional[dict] = None
     # Manual regeneration acknowledgement settings
-    ack_enabled: bool = False
+    ack_enabled: bool = True
     ack_on_pending: bool = False
     ack_on_unknown: bool = False
     ack_recipients: List[str] = field(default_factory=list)
@@ -504,7 +504,7 @@ def load_config(
         }
 
     # Manual ACK + SMTP defaults
-    ack_enabled = False
+    ack_enabled = True
     ack_on_pending = False
     ack_on_unknown = False
     ack_recipients: List[str] = []
@@ -1865,7 +1865,7 @@ def _collect_saved_search_recipients(
 
 
 def _resolve_ack_enabled(config: Optional[SplunkConfig]) -> bool:
-    default_enabled = False if config is None else config.ack_enabled
+    default_enabled = True if config is None else config.ack_enabled
     if not _env_override_allowed():
         _audit_blocked_env_override("SPLUNK_TOOL_ACK_ENABLED", "SPLUNK_TOOL_ACK_ENABLE")
         return default_enabled

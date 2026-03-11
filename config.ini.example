@@ -52,9 +52,9 @@ continue_on_timeout = true
 timeout_result = pending
 
 [email]
-# Pilot default: disable acknowledgement email.
+# Acknowledgement email is enabled by default.
 # Legacy alias `ack_on_unknown` is still accepted, but `ack_on_pending` is preferred.
-ack_enabled = 0
+ack_enabled = 1
 ack_on_pending = 0
 ack_recipients =
 ack_use_savedsearch_recipients = 0

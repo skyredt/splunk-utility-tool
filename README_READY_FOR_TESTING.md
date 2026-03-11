@@ -188,7 +188,7 @@ continue_on_timeout = true
 timeout_result = pending
 
 [email]
-ack_enabled = 0
+ack_enabled = 1
 ack_on_pending = 0                 # Default: skip ACK when slices remain PENDING
 
 [postdispatch]
@@ -209,7 +209,7 @@ lookback_seconds = 900             # Search last 15 minutes
 - `FAILED` now means Splunk explicitly reported failure, not just that active waiting timed out.
 - `ack_on_pending = 0` skips the acknowledgement email when final delivery status is still pending.
 - `ack_on_pending = 1` sends the acknowledgement email with `PARTIAL / PENDING VERIFICATION` wording and separate Pending counts.
-- `ack_enabled = 0` is the recommended pilot default.
+- `ack_enabled = 1` is the default.
 
 ### March 2026 Config Recovery Update
 - `config.ini` is loaded from the executable directory only.

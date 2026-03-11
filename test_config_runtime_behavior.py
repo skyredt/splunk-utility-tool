@@ -50,7 +50,7 @@ BASE_TEMPLATE = textwrap.dedent(
     timeout_result = pending
 
     [email]
-    ack_enabled = 0
+    ack_enabled = 1
     ack_on_pending = 0
     ack_recipients =
     ack_use_savedsearch_recipients = 0

@@ -108,7 +108,7 @@ def _build_cfg_from_runtime_payload(payload: dict[str, object], exe_dir: str) ->
         merge_report_log_path=str(payload.get("merge_report_log_path") or ""),
         merge_report_timeout_seconds=int(payload.get("merge_report_timeout_seconds") or 300),
         dispatch_config=dict(payload.get("dispatch_config")) if isinstance(payload.get("dispatch_config"), dict) else None,
-        ack_enabled=bool(payload.get("ack_enabled", False)),
+        ack_enabled=bool(payload.get("ack_enabled", True)),
         ack_on_pending=bool(payload.get("ack_on_pending", payload.get("ack_on_unknown", False))),
         ack_on_unknown=bool(payload.get("ack_on_unknown", False)),
         ack_recipients=[str(x) for x in (payload.get("ack_recipients") or [])] if isinstance(payload.get("ack_recipients"), list) else [],

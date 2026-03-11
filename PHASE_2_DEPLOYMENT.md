@@ -13,7 +13,7 @@ continue_on_timeout = true
 timeout_result = pending
 
 [email]
-ack_enabled = 0
+ack_enabled = 1
 ack_on_pending = 0
 
 [postdispatch]
@@ -42,8 +42,8 @@ Pending slices do not block later slices. One bounded reconciliation pass runs a
 
 ## Acknowledgement Handling
 
-- `ack_enabled = 0` is the pilot default.
-- If ACK is enabled later, the tool still skips acknowledgement when pending slices exist unless `ack_on_pending = 1`.
+- `ack_enabled = 1` is the default.
+- The tool still skips acknowledgement when pending slices exist unless `ack_on_pending = 1`.
 - Pending slices are never counted as failures in the final summary or ACK body.
 
 ## Deployment Checks

@@ -8,8 +8,8 @@ Splunk Utility Tool v4 now uses a bounded active wait per slice.
 - `PENDING` means the dispatch was accepted and may still complete asynchronously in Splunk.
 - The batch continues to the next slice instead of stalling on one slow slice.
 - A lightweight reconciliation pass can promote `PENDING` slices to `OK` or `FAILED` after all slices are attempted.
-- Pilot default is `ack_enabled = 0`, so acknowledgement email is disabled unless operators opt in later.
-- If ACK is enabled later, it is still skipped while pending slices remain unless `ack_on_pending = 1`.
+- Default is `ack_enabled = 1`, so acknowledgement email is enabled unless operators opt out.
+- ACK is still skipped while pending slices remain unless `ack_on_pending = 1`.
 
 Operator guidance:
 
