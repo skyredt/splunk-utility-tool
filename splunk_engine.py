@@ -739,6 +739,7 @@ class SplunkClient(QObject):
             }
         )
         self._auth_header = f"Splunk {self._login_with_password(self.username, password)}"
+        self._last_snapshot_meta: dict[str, Any] = {}
 
     def _login_with_password(self, username: str, password: str) -> str:
         if not username or not password:
@@ -991,13 +992,26 @@ class SplunkClient(QObject):
         self,
         sid: str,
         request_timeout_seconds: float = 10.0,
+        max_total_timeout_seconds: Optional[float] = None,
     ) -> Tuple[str, dict]:
+        effective_timeout = max(1.0, float(request_timeout_seconds))
+        if max_total_timeout_seconds is not None:
+            try:
+                effective_timeout = min(effective_timeout, max(1.0, float(max_total_timeout_seconds)))
+            except Exception:
+                effective_timeout = max(1.0, float(request_timeout_seconds))
+        start = time.monotonic()
         resp = self._request(
             "GET",
             f"/services/search/jobs/{sid}",
             params={"output_mode": "json", "count": 0},
-            timeout=max(1.0, float(request_timeout_seconds)),
+            timeout=effective_timeout,
         )
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        self._last_snapshot_meta = {
+            "splunk_elapsed_ms": elapsed_ms,
+            "request_timeout_seconds": effective_timeout,
+        }
         data = resp.json()
         entry = data.get("entry", [{}])[0]
         content = entry.get("content", {})
@@ -1250,11 +1264,52 @@ def _dispatch_slice_and_wait(
     if sid_callback:
         sid_callback(sid, report_name)
 
+    status_check_start_utc = _utc_now_iso()
+    status_check_start = time.monotonic()
+    poll_count = 0
+
+    audit_slice_event(
+        "REPORT_SLICE_STATUS_CHECK_START",
+        level="INFO",
+        slice_label=slice_label,
+        slice_index=slice_index,
+        slice_total=slice_total,
+        sid=sid,
+        outer_wait_seconds=max(1, int(wait_seconds)),
+        poll_interval_seconds=max(1, int(poll_interval)),
+        start_utc=status_check_start_utc,
+    )
+
+    def _poll_audit(**payload: object) -> None:
+        nonlocal poll_count
+        poll_count = int(payload.get("poll_count", poll_count))
+        meta = getattr(client, "_last_snapshot_meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        audit_slice_event(
+            "REPORT_SLICE_STATUS_CHECK_POLL",
+            level="INFO",
+            slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
+            sid=sid,
+            poll_index=payload.get("poll_count"),
+            poll_elapsed_ms=payload.get("poll_elapsed_ms"),
+            request_timeout_seconds=payload.get("request_timeout_seconds"),
+            remaining_seconds=payload.get("remaining_seconds"),
+            state=payload.get("state"),
+            broker_timeout_seconds=meta.get("broker_timeout_seconds"),
+            broker_elapsed_ms=meta.get("broker_elapsed_ms"),
+            splunk_elapsed_ms=meta.get("splunk_elapsed_ms"),
+        )
+
     try:
-        state, info = client.check_job_status(
+        state, info, poll_count = _poll_job_status_with_budget(
+            client,
             sid,
             wait_seconds=wait_seconds,
             poll_interval=poll_interval,
+            poll_callback=_poll_audit,
         )
     except Exception as exc:
         raw_error = str(exc) or repr(exc)
@@ -1262,6 +1317,33 @@ def _dispatch_slice_and_wait(
         err_msg = _build_pending_status_message(safe_error, wait_seconds=wait_seconds)
         error_type = type(exc).__name__
         broker_op, broker_timeout = _extract_broker_context(exc=exc, text=raw_error)
+        status_check_end_utc = _utc_now_iso()
+        status_elapsed_ms = int((time.monotonic() - status_check_start) * 1000)
+        last_meta = getattr(client, "_last_snapshot_meta", {})
+        if not isinstance(last_meta, dict):
+            last_meta = {}
+        audit_slice_event(
+            "REPORT_SLICE_STATUS_CHECK_END",
+            level="WARN",
+            slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
+            sid=sid,
+            result_state="EXCEPTION",
+            error_type=error_type,
+            outer_wait_seconds=max(1, int(wait_seconds)),
+            poll_interval_seconds=max(1, int(poll_interval)),
+            poll_count=poll_count,
+            elapsed_ms=status_elapsed_ms,
+            start_utc=status_check_start_utc,
+            end_utc=status_check_end_utc,
+            broker_timeout_seconds=broker_timeout
+            if broker_timeout is not None
+            else last_meta.get("broker_timeout_seconds"),
+            request_timeout_seconds=last_meta.get("request_timeout_seconds"),
+            broker_elapsed_ms=last_meta.get("broker_elapsed_ms"),
+            splunk_elapsed_ms=last_meta.get("splunk_elapsed_ms"),
+        )
         _append_log(
             logs,
             f"  {log_prefix}{_display_slice_status(timeout_status)} (sid={sid}) - {err_msg}",
@@ -1317,6 +1399,31 @@ def _dispatch_slice_and_wait(
             error=err_msg,
         )
         return timeout_status, sid
+
+    status_check_end_utc = _utc_now_iso()
+    status_elapsed_ms = int((time.monotonic() - status_check_start) * 1000)
+    last_meta = getattr(client, "_last_snapshot_meta", {})
+    if not isinstance(last_meta, dict):
+        last_meta = {}
+    audit_slice_event(
+        "REPORT_SLICE_STATUS_CHECK_END",
+        level="INFO",
+        slice_label=slice_label,
+        slice_index=slice_index,
+        slice_total=slice_total,
+        sid=sid,
+        result_state=state,
+        outer_wait_seconds=max(1, int(wait_seconds)),
+        poll_interval_seconds=max(1, int(poll_interval)),
+        poll_count=poll_count,
+        elapsed_ms=status_elapsed_ms,
+        start_utc=status_check_start_utc,
+        end_utc=status_check_end_utc,
+        broker_timeout_seconds=last_meta.get("broker_timeout_seconds"),
+        request_timeout_seconds=last_meta.get("request_timeout_seconds"),
+        broker_elapsed_ms=last_meta.get("broker_elapsed_ms"),
+        splunk_elapsed_ms=last_meta.get("splunk_elapsed_ms"),
+    )
 
     if state == "SUCCESS":
         _append_log(logs, f"  {log_prefix}OK (sid={sid})", log_callback)
@@ -1591,6 +1698,10 @@ def _short_error(text: str, limit: int = 180) -> str:
     return clean[: limit - 3] + "..."
 
 
+def _utc_now_iso() -> str:
+    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 _BROKER_TIMEOUT_RE = re.compile(
     r"Local Splunk broker timed out while processing the request"
     r"(?:\s*\(op=([^,]+),\s*timeout=(\d+)s\))?",
@@ -1628,6 +1739,100 @@ def _extract_broker_context(exc: Optional[Exception] = None, text: str = "") -> 
         timeout_seconds = None
 
     return (op if op else None), timeout_seconds
+
+
+def _poll_job_status_with_budget(
+    client: SplunkClient,
+    sid: str,
+    wait_seconds: int,
+    poll_interval: int,
+    *,
+    poll_callback: Optional[Callable[..., None]] = None,
+) -> Tuple[str, dict, int]:
+    last_content: dict = {}
+    deadline = time.monotonic() + max(1, int(wait_seconds))
+    poll_seconds = max(1.0, float(poll_interval))
+    poll_count = 0
+
+    snapshot_fn = getattr(client, "get_job_status_snapshot", None)
+    can_snapshot = callable(snapshot_fn)
+
+    if not can_snapshot:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or remaining < 1.0:
+                break
+            request_timeout = min(poll_seconds, remaining)
+            poll_count += 1
+            poll_start = time.monotonic()
+            state, content = client.check_job_status(
+                sid,
+                wait_seconds=max(1, int(request_timeout)),
+                poll_interval=max(1, int(min(poll_seconds, request_timeout))),
+            )
+            poll_elapsed = time.monotonic() - poll_start
+            poll_elapsed_ms = int(poll_elapsed * 1000)
+            last_content = content
+
+            if poll_callback:
+                poll_callback(
+                    poll_count=poll_count,
+                    state=state,
+                    content=content,
+                    poll_elapsed_ms=poll_elapsed_ms,
+                    request_timeout_seconds=request_timeout,
+                    remaining_seconds=max(0.0, remaining),
+                )
+
+            if state in ("SUCCESS", "FAILED"):
+                return state, content, poll_count
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sleep_seconds = max(0.0, poll_seconds - poll_elapsed)
+            sleep_seconds = min(sleep_seconds, max(0.0, remaining))
+            if sleep_seconds <= 0:
+                continue
+            time.sleep(sleep_seconds)
+
+        return "TIMEOUT", last_content, poll_count
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or remaining < 1.0:
+            break
+
+        request_timeout = min(poll_seconds, remaining)
+        poll_count += 1
+        poll_start = time.monotonic()
+        state, content = snapshot_fn(
+            sid,
+            request_timeout_seconds=request_timeout,
+            max_total_timeout_seconds=remaining,
+        )
+        poll_elapsed_ms = int((time.monotonic() - poll_start) * 1000)
+        last_content = content
+
+        if poll_callback:
+            poll_callback(
+                poll_count=poll_count,
+                state=state,
+                content=content,
+                poll_elapsed_ms=poll_elapsed_ms,
+                request_timeout_seconds=request_timeout,
+                remaining_seconds=max(0.0, remaining),
+            )
+
+        if state in ("SUCCESS", "FAILED"):
+            return state, content, poll_count
+
+        sleep_seconds = min(poll_seconds, max(0.0, deadline - time.monotonic()))
+        if sleep_seconds <= 0:
+            break
+        time.sleep(sleep_seconds)
+
+    return "TIMEOUT", last_content, poll_count
 
 
 def _build_pending_status_message(detail: str = "", *, wait_seconds: Optional[int] = None) -> str:
@@ -1747,6 +1952,7 @@ def _fetch_job_status_snapshot(
         return client.get_job_status_snapshot(
             sid,
             request_timeout_seconds=max(1, int(request_timeout_seconds)),
+            max_total_timeout_seconds=max(1, int(request_timeout_seconds)),
         )
     return client.check_job_status(
         sid,

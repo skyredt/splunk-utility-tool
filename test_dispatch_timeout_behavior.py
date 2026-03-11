@@ -153,7 +153,11 @@ class DispatchTimeoutBehaviorTests(unittest.TestCase):
         context = self._make_context()
         client = FakeClient(
             dispatch_results=[(True, "1700000_ABC123", "")],
-            status_results=[RuntimeError("Local Splunk broker timed out while processing the request.")],
+            snapshot_results=[
+                RuntimeError(
+                    "Local Splunk broker timed out while processing the request (op=get_job_status_snapshot, timeout=10s)."
+                )
+            ],
         )
 
         logs = run_dispatch_single(
@@ -174,6 +178,7 @@ class DispatchTimeoutBehaviorTests(unittest.TestCase):
         self.assertEqual(record.outcome_code, "DISPATCHED_PENDING")
         self.assertEqual(record.sid, "1700000_ABC123")
         self.assertIn("30 seconds", record.error)
+        self.assertIn("timeout=10s", record.error)
         self.assertIn("PENDING (sid=1700000_ABC123)", "\n".join(logs))
 
     def test_dispatch_without_sid_is_failed(self) -> None:
@@ -200,7 +205,7 @@ class DispatchTimeoutBehaviorTests(unittest.TestCase):
         context = self._make_context()
         client = FakeClient(
             dispatch_results=[(True, "1700000_DEF456", "")],
-            status_results=[("FAILED", {"dispatchState": "FAILED"})],
+            snapshot_results=[("FAILED", {"dispatchState": "FAILED"})],
         )
 
         run_dispatch_single(
@@ -225,29 +230,133 @@ class DispatchTimeoutBehaviorTests(unittest.TestCase):
                 (True, "1700000_PEND01", ""),
                 (True, "1700000_OK002", ""),
             ],
-            status_results=[
-                ("TIMEOUT", {"dispatchState": "RUNNING"}),
+            snapshot_results=[
+                ("RUNNING", {"dispatchState": "RUNNING"}),
                 ("SUCCESS", {"dispatchState": "DONE", "isDone": True}),
             ],
         )
 
-        logs = run_dispatch_single(
-            client=client,
-            report_id_url="/servicesNS/nobody/search/saved/searches/Daily%20KPI",
-            report_name="Daily KPI",
-            frequency="Daily",
-            start=datetime(2026, 3, 1, 0, 0, 0),
-            end=datetime(2026, 3, 3, 0, 0, 0),
-            no_change=False,
-            wait_seconds=30,
-            regen_context=context,
-        )
+        monotonic_tick = {"t": 0.0}
+
+        def _fast_monotonic() -> float:
+            monotonic_tick["t"] += 6.0
+            return monotonic_tick["t"]
+
+        with patch.object(splunk_engine.time, "monotonic", _fast_monotonic):
+            with patch.object(splunk_engine.time, "sleep", lambda _seconds: None):
+                logs = run_dispatch_single(
+                    client=client,
+                    report_id_url="/servicesNS/nobody/search/saved/searches/Daily%20KPI",
+                    report_name="Daily KPI",
+                    frequency="Daily",
+                    start=datetime(2026, 3, 1, 0, 0, 0),
+                    end=datetime(2026, 3, 3, 0, 0, 0),
+                    no_change=False,
+                    wait_seconds=5,
+                    regen_context=context,
+                )
 
         self.assertEqual(len(context.slices), 2)
         self.assertEqual(context.slices[0].status, "PENDING")
         self.assertEqual(context.slices[1].status, "OK")
         self.assertEqual(context.slices[1].sid, "1700000_OK002")
         self.assertIn("Continuing to next slice.", "\n".join(logs))
+
+    def test_status_check_uses_bounded_snapshot_polls(self) -> None:
+        context = self._make_context()
+
+        class RecordingClient(FakeClient):
+            def __init__(self):
+                super().__init__(dispatch_results=[(True, "1700000_RUN01", "")])
+                self.snapshot_calls = []
+
+            def get_job_status_snapshot(self, *args, **kwargs):
+                self.snapshot_calls.append(
+                    (
+                        kwargs.get("request_timeout_seconds"),
+                        kwargs.get("max_total_timeout_seconds"),
+                    )
+                )
+                return ("RUNNING", {"dispatchState": "RUNNING"})
+
+        client = RecordingClient()
+        monotonic_tick = {"t": 0.0}
+
+        def _slow_monotonic() -> float:
+            monotonic_tick["t"] += 0.2
+            return monotonic_tick["t"]
+
+        with patch.object(splunk_engine.time, "monotonic", _slow_monotonic):
+            with patch.object(splunk_engine.time, "sleep", lambda _seconds: None):
+                run_dispatch_single(
+                    client=client,
+                    report_id_url="/servicesNS/nobody/search/saved/searches/Daily%20KPI",
+                    report_name="Daily KPI",
+                    frequency="Daily",
+                    start=datetime(2026, 3, 1, 0, 0, 0),
+                    end=datetime(2026, 3, 2, 0, 0, 0),
+                    no_change=True,
+                    wait_seconds=5,
+                    poll_interval=2,
+                    regen_context=context,
+                )
+
+        self.assertGreaterEqual(len(client.snapshot_calls), 2)
+        for request_timeout, max_total_timeout in client.snapshot_calls:
+            self.assertLessEqual(float(request_timeout), 2.0)
+            self.assertLessEqual(float(max_total_timeout), 5.0)
+
+    def test_status_check_fallback_uses_short_check_job_status_calls(self) -> None:
+        context = self._make_context()
+
+        class FallbackClient:
+            def __init__(self):
+                self.dispatch_results = [(True, "1700000_RUN01", "")]
+                self.check_calls = []
+                self.dispatch_log = _NullSignal()
+                self.error = _NullSignal()
+                self.finished = _NullSignal()
+                self.username = "splunk_service"
+
+            def dispatch_saved_search(self, *args, **kwargs):
+                return self.dispatch_results.pop(0)
+
+            def check_job_status(self, *args, **kwargs):
+                self.check_calls.append(
+                    (kwargs.get("wait_seconds"), kwargs.get("poll_interval"))
+                )
+                return ("TIMEOUT", {"dispatchState": "RUNNING"})
+
+            def _get(self, path: str):
+                del path
+                return {}
+
+        client = FallbackClient()
+        monotonic_tick = {"t": 0.0}
+
+        def _slow_monotonic() -> float:
+            monotonic_tick["t"] += 0.2
+            return monotonic_tick["t"]
+
+        with patch.object(splunk_engine.time, "monotonic", _slow_monotonic):
+            with patch.object(splunk_engine.time, "sleep", lambda _seconds: None):
+                run_dispatch_single(
+                    client=client,
+                    report_id_url="/servicesNS/nobody/search/saved/searches/Daily%20KPI",
+                    report_name="Daily KPI",
+                    frequency="Daily",
+                    start=datetime(2026, 3, 1, 0, 0, 0),
+                    end=datetime(2026, 3, 2, 0, 0, 0),
+                    no_change=True,
+                    wait_seconds=5,
+                    poll_interval=2,
+                    regen_context=context,
+                )
+
+        self.assertGreaterEqual(len(client.check_calls), 2)
+        for wait_seconds, poll_interval in client.check_calls:
+            self.assertLessEqual(int(wait_seconds or 0), 2)
+            self.assertLessEqual(int(poll_interval or 0), 2)
 
     def test_reconciliation_converts_pending_to_ok_when_later_completed(self) -> None:
         context = self._make_context()
@@ -281,6 +390,54 @@ class DispatchTimeoutBehaviorTests(unittest.TestCase):
         self.assertEqual(context.slices[0].outcome_code, "RECONCILED_OK")
         self.assertEqual(context.slices[0].error, "")
         self.assertIn("Pending slice resolved to OK", "\n".join(logs))
+
+    def test_reconciliation_uses_bounded_snapshot_polls(self) -> None:
+        context = self._make_context()
+        context.add_slice(
+            report_name="Daily KPI",
+            slice_label="[1/1]",
+            earliest="2026-03-01 00:00:00",
+            latest="2026-03-02 00:00:00",
+            sid="1700000_WAIT01",
+            status="PENDING",
+            outcome_code="DISPATCHED_PENDING",
+            error="Status not confirmed within 30 seconds.",
+        )
+
+        class RecordingClient(FakeClient):
+            def __init__(self):
+                super().__init__(dispatch_results=[])
+                self.snapshot_calls = []
+
+            def get_job_status_snapshot(self, *args, **kwargs):
+                self.snapshot_calls.append(
+                    (
+                        kwargs.get("request_timeout_seconds"),
+                        kwargs.get("max_total_timeout_seconds"),
+                    )
+                )
+                return ("RUNNING", {"dispatchState": "RUNNING"})
+
+        client = RecordingClient()
+        monotonic_tick = {"t": 0.0}
+
+        def _slow_monotonic() -> float:
+            monotonic_tick["t"] += 0.3
+            return monotonic_tick["t"]
+
+        with patch.object(splunk_engine.time, "monotonic", _slow_monotonic):
+            with patch.object(splunk_engine.time, "sleep", lambda _seconds: None):
+                _reconcile_pending_slices(
+                    client,
+                    context,
+                    wait_seconds=3,
+                    poll_interval=2,
+                )
+
+        self.assertGreaterEqual(len(client.snapshot_calls), 1)
+        for request_timeout, max_total_timeout in client.snapshot_calls:
+            self.assertLessEqual(float(request_timeout), 2.0)
+            self.assertLessEqual(float(max_total_timeout), 3.0)
 
     def test_summary_counts_and_per_slice_lines_include_pending(self) -> None:
         context = self._make_context()

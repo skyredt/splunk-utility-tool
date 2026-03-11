@@ -295,6 +295,7 @@ class SplunkBrokerProxyClient:
         self._auth_token = auth_token
         self.username = username
         self._request_timeout_seconds = 300.0
+        self._last_snapshot_meta: dict[str, Any] = {}
 
     def configure_request_timeout(self, timeout_seconds: float) -> None:
         try:
@@ -432,34 +433,60 @@ class SplunkBrokerProxyClient:
             return False, None, _safe_error_text(exc)
 
     def check_job_status(self, sid: str, wait_seconds: int = 10, poll_interval: int = 2):
-        payload = {
-            "sid": str(sid or ""),
-            "wait_seconds": int(wait_seconds),
-            "poll_interval": int(poll_interval),
-        }
-        result = self._op(
-            "check_job_status",
-            payload,
-            timeout=max(float(wait_seconds) + 10.0, 20.0),
-        )
-        state = str(result.get("state", "UNKNOWN"))
-        content = result.get("content", {})
-        if not isinstance(content, dict):
-            content = {}
-        return state, content
+        last_content: dict = {}
+        deadline = time.monotonic() + max(1, int(wait_seconds))
+        poll_seconds = max(1.0, float(poll_interval))
 
-    def get_job_status_snapshot(self, sid: str, request_timeout_seconds: int = 5):
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            request_timeout = min(poll_seconds, max(1.0, remaining))
+            state, content = self.get_job_status_snapshot(
+                sid,
+                request_timeout_seconds=request_timeout,
+                max_total_timeout_seconds=remaining,
+            )
+            last_content = content
+            if state in ("SUCCESS", "FAILED"):
+                return state, content
+            sleep_seconds = min(poll_seconds, max(0.0, deadline - time.monotonic()))
+            if sleep_seconds <= 0:
+                break
+            time.sleep(sleep_seconds)
+
+        return "TIMEOUT", last_content
+
+    def get_job_status_snapshot(
+        self,
+        sid: str,
+        request_timeout_seconds: int = 5,
+        max_total_timeout_seconds: Optional[float] = None,
+    ):
         payload = {
             "sid": str(sid or ""),
             "request_timeout_seconds": int(request_timeout_seconds),
         }
-        result = self._op(
-            "get_job_status_snapshot",
-            payload,
-            timeout=max(float(request_timeout_seconds) + 5.0, 10.0),
-        )
+        op_timeout = max(1.0, float(request_timeout_seconds) + 2.0)
+        if max_total_timeout_seconds is not None:
+            try:
+                op_timeout = min(op_timeout, max(1.0, float(max_total_timeout_seconds)))
+            except Exception:
+                op_timeout = max(1.0, float(request_timeout_seconds) + 2.0)
+        op_start = time.monotonic()
+        result = self._op("get_job_status_snapshot", payload, timeout=op_timeout)
+        broker_elapsed_ms = int((time.monotonic() - op_start) * 1000)
         state = str(result.get("state", "UNKNOWN"))
         content = result.get("content", {})
+        meta = result.get("meta", {})
+        if isinstance(meta, dict):
+            meta = dict(meta)
+        else:
+            meta = {}
+        meta["broker_timeout_seconds"] = op_timeout
+        meta["request_timeout_seconds"] = max(1.0, float(request_timeout_seconds))
+        meta["broker_elapsed_ms"] = broker_elapsed_ms
+        self._last_snapshot_meta = meta
         if not isinstance(content, dict):
             content = {}
         return state, content
@@ -862,14 +889,23 @@ class _SplunkBrokerState:
             min_value=1,
             max_value=60,
         )
+        start = time.monotonic()
         state, content = client.get_job_status_snapshot(
             sid=sid,
             request_timeout_seconds=request_timeout_seconds,
         )
+        splunk_elapsed_ms = int((time.monotonic() - start) * 1000)
         safe_content = _redact_sensitive(content, key_hint="content")
         if not isinstance(safe_content, dict):
             safe_content = {}
-        return {"state": _sanitize_text(str(state or "UNKNOWN")), "content": safe_content}
+        return {
+            "state": _sanitize_text(str(state or "UNKNOWN")),
+            "content": safe_content,
+            "meta": {
+                "splunk_elapsed_ms": splunk_elapsed_ms,
+                "request_timeout_seconds": int(request_timeout_seconds),
+            },
+        }
 
     def op_get_saved_search_metadata(self, args: dict[str, Any]) -> dict[str, Any]:
         client = self._require_client()
