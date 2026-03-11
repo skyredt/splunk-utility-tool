@@ -27,6 +27,10 @@ OVERLAY_BG = "#243127"
 OVERLAY_ALPHA = 0.16
 
 
+def _font_spec(family: str, size: int, *options: str) -> tuple:
+    return (family, int(size), *tuple(str(x) for x in options))
+
+
 def apply_splunk_light_theme(root: tk.Misc) -> ttk.Style:
     style = ttk.Style(root)
     try:
@@ -35,25 +39,25 @@ def apply_splunk_light_theme(root: tk.Misc) -> ttk.Style:
         pass
 
     root.configure(bg=WINDOW_BG)
-    root.option_add("*Font", f"{FONT_FAMILY} 10")
-    root.option_add("*TCombobox*Listbox.font", f"{FONT_FAMILY} 10")
+    root.option_add("*Font", _font_spec(FONT_FAMILY, 10))
+    root.option_add("*TCombobox*Listbox.font", _font_spec(FONT_FAMILY, 10))
     root.option_add("*TCombobox*Listbox.background", SURFACE_BG)
     root.option_add("*TCombobox*Listbox.foreground", TEXT)
     root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
     root.option_add("*TCombobox*Listbox.selectForeground", "#FFFFFF")
 
-    style.configure(".", background=WINDOW_BG, foreground=TEXT, font=(FONT_FAMILY, 10))
+    style.configure(".", background=WINDOW_BG, foreground=TEXT, font=_font_spec(FONT_FAMILY, 10))
     style.configure("App.TFrame", background=WINDOW_BG)
     style.configure("TFrame", background=WINDOW_BG)
     style.configure("Card.TFrame", background=SURFACE_BG, borderwidth=1, relief="solid")
     style.configure("Dialog.TFrame", background=SURFACE_BG)
     style.configure("CardInset.TFrame", background=SURFACE_ALT_BG)
 
-    style.configure("TLabel", background=WINDOW_BG, foreground=TEXT, font=(FONT_FAMILY, 10))
-    style.configure("Card.TLabel", background=SURFACE_BG, foreground=TEXT, font=(FONT_FAMILY, 10))
-    style.configure("Dialog.TLabel", background=SURFACE_BG, foreground=TEXT, font=(FONT_FAMILY, 10))
-    style.configure("Section.TLabel", background=SURFACE_BG, foreground=TEXT, font=(FONT_FAMILY_BOLD, 10))
-    style.configure("Subtle.TLabel", background=SURFACE_BG, foreground=TEXT_MUTED, font=(FONT_FAMILY, 9))
+    style.configure("TLabel", background=WINDOW_BG, foreground=TEXT, font=_font_spec(FONT_FAMILY, 10))
+    style.configure("Card.TLabel", background=SURFACE_BG, foreground=TEXT, font=_font_spec(FONT_FAMILY, 10))
+    style.configure("Dialog.TLabel", background=SURFACE_BG, foreground=TEXT, font=_font_spec(FONT_FAMILY, 10))
+    style.configure("Section.TLabel", background=SURFACE_BG, foreground=TEXT, font=_font_spec(FONT_FAMILY_BOLD, 10))
+    style.configure("Subtle.TLabel", background=SURFACE_BG, foreground=TEXT_MUTED, font=_font_spec(FONT_FAMILY, 9))
 
     style.configure(
         "TButton",
@@ -94,7 +98,7 @@ def apply_splunk_light_theme(root: tk.Misc) -> ttk.Style:
         "TCheckbutton",
         background=SURFACE_BG,
         foreground=TEXT,
-        font=(FONT_FAMILY, 10),
+        font=_font_spec(FONT_FAMILY, 10),
     )
     style.map(
         "TCheckbutton",
@@ -182,7 +186,7 @@ def style_listbox(widget: tk.Listbox) -> None:
         selectbackground=ACCENT,
         selectforeground="#FFFFFF",
         activestyle="none",
-        font=(FONT_FAMILY, 10),
+        font=_font_spec(FONT_FAMILY, 10),
     )
 
 
@@ -198,7 +202,7 @@ def style_text_widget(widget: tk.Text) -> None:
         insertbackground=TEXT,
         selectbackground=ACCENT,
         selectforeground="#FFFFFF",
-        font=(FONT_FAMILY, 10),
+        font=_font_spec(FONT_FAMILY, 10),
         padx=10,
         pady=8,
     )
