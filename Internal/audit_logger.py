@@ -55,7 +55,14 @@ LEVELS = {
 }
 _EMAIL_RE = re.compile(r"\b([A-Za-z0-9._%+\-]+)@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})\b")
 _WIN_PATH_RE = re.compile(r"\b[A-Za-z]:\\(?:[^<>:\"|?*\r\n]+\\)*[^<>:\"|?*\r\n]*")
-_TOKENISH_RE = re.compile(r"\b(?:\$7\$|Bearer\s+|Splunk\s+)[A-Za-z0-9._~+/=\-]{6,}", re.IGNORECASE)
+_TOKENISH_RE = re.compile(
+    r"\b(?:"
+    r"\$7\$[A-Za-z0-9._~+/=\-]{12,}"
+    r"|Bearer\s+[A-Za-z0-9._~+/=\-]{12,}"
+    r"|Splunk\s+(?=[A-Za-z0-9._~+/=\-]*\d)[A-Za-z0-9._~+/=\-]{12,}"
+    r")\b",
+    re.IGNORECASE,
+)
 SECURITY_ALWAYS_EVENTS = {
     "TOOL_START",
     "TOOL_EXIT",

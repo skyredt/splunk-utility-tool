@@ -1191,7 +1191,9 @@ def _dispatch_slice_and_wait(
         )
     except Exception as exc:
         raw_error = str(exc) or repr(exc)
-        err_msg = _build_pending_status_message(raw_error, wait_seconds=wait_seconds)
+        safe_error = redact_text(raw_error)
+        err_msg = _build_pending_status_message(safe_error, wait_seconds=wait_seconds)
+        error_type = type(exc).__name__
         _append_log(
             logs,
             f"  {log_prefix}{_display_slice_status(timeout_status)} (sid={sid}) - {err_msg}",
@@ -1203,7 +1205,8 @@ def _dispatch_slice_and_wait(
                 level="WARN",
                 slice_label=slice_label,
                 sid=sid,
-                reason=_short_error(raw_error),
+                reason=_short_error(safe_error),
+                error_type=error_type,
             )
         else:
             audit_slice_event(
@@ -1211,7 +1214,8 @@ def _dispatch_slice_and_wait(
                 level="WARN",
                 slice_label=slice_label,
                 sid=sid,
-                reason=_short_error(raw_error),
+                reason=_short_error(safe_error),
+                error_type=error_type,
             )
         audit_slice_event(
             "REPORT_SLICE_MARKED_PENDING",

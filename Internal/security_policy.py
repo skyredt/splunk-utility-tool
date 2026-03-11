@@ -33,7 +33,14 @@ _ALWAYS_ON_CONTROLS = {
     "SECRET_FILE_PATH",
     "SECRET_FILENAME_REJECTED",
 }
-_TOKENISH_RE = re.compile(r"\b(?:\$7\$|Bearer\s+|Splunk\s+)[A-Za-z0-9._~+/=\-]{6,}", re.IGNORECASE)
+_TOKENISH_RE = re.compile(
+    r"\b(?:"
+    r"\$7\$[A-Za-z0-9._~+/=\-]{12,}"
+    r"|Bearer\s+[A-Za-z0-9._~+/=\-]{12,}"
+    r"|Splunk\s+(?=[A-Za-z0-9._~+/=\-]*\d)[A-Za-z0-9._~+/=\-]{12,}"
+    r")\b",
+    re.IGNORECASE,
+)
 _AUTH_LINE_RE = re.compile(r"(authorization\s*:\s*)(.+)", re.IGNORECASE)
 _COOKIE_LINE_RE = re.compile(r"(cookie\s*:\s*)(.+)", re.IGNORECASE)
 _SECRET_ASSIGN_RE = re.compile(
