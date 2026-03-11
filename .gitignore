@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 .env
 config.ini
+config.ini.bak
 dist/
 build/
 *.spec
@@ -14,6 +15,7 @@ build/
 PRODSplunkUtilityTool*/
 restore-point*/
 *.zip
+Internal/state.json.tmp
 
 # VC runtime - do not commit DLLs
 vc_runtime/*.dll

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import configparser
 import importlib
 import json
 import logging
@@ -41,6 +40,7 @@ except ImportError:
     HAS_ZONEINFO = False
 
 import requests
+from Internal.config_manager import load_and_validate_config
 from Internal.security_policy import PolicyViolation, SecurityPolicy, load_security_policy, redact_text
 
 
@@ -354,11 +354,11 @@ def load_config(
         )
     active_policy = policy or load_security_policy(exe_dir=exe_dir, requested_config_path=requested_path)
     set_security_policy(active_policy)
-
-    cfg = configparser.ConfigParser()
-    read_files = cfg.read(active_policy.config_path)
-    if not read_files:
-        raise FileNotFoundError(f"Config file not found: {active_policy.config_path}")
+    config_root = getattr(active_policy, "exe_dir", "") or os.path.dirname(str(active_policy.config_path))
+    loaded = load_and_validate_config(exe_dir=config_root)
+    for change in loaded.changes:
+        logging.getLogger(__name__).info(change)
+    cfg = loaded.parser
 
     if "splunk" not in cfg:
         raise KeyError("Missing [splunk] section in config.ini")
