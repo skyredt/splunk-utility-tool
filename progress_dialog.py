@@ -11,6 +11,7 @@ from typing import Callable, Optional
 from gab_loader import GABLoader
 from overlay import create_overlay, remove_overlay
 from ui_prompt import show_modal_prompt
+from ui_theme import SURFACE_BG, style_window
 
 
 logger = logging.getLogger(__name__)
@@ -44,17 +45,25 @@ def run_with_progress(
     dialog.title(title)
     dialog.transient(parent)
     dialog.resizable(False, False)
+    style_window(dialog, surface=SURFACE_BG)
     try:
         dialog.attributes("-topmost", True)
     except tk.TclError:
         pass
 
-    frame = ttk.Frame(dialog, padding=16)
+    frame = ttk.Frame(dialog, padding=16, style="Dialog.TFrame")
     frame.pack(fill="both", expand=True)
     loader = GABLoader(frame)
     loader.pack(pady=(2, 10))
     status_var = tk.StringVar(value=start_message)
-    status_lbl = ttk.Label(frame, textvariable=status_var, justify="center", anchor="center", wraplength=420)
+    status_lbl = ttk.Label(
+        frame,
+        textvariable=status_var,
+        justify="center",
+        anchor="center",
+        wraplength=420,
+        style="Dialog.TLabel",
+    )
     status_lbl.pack(fill="x", pady=(0, 10))
     bar = ttk.Progressbar(frame, mode="indeterminate", length=320)
     bar.pack(fill="x")

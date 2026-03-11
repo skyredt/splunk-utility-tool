@@ -3,16 +3,19 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
+from ui_theme import ACCENT, TEXT_MUTED
+
 
 class GABLoader(ttk.Frame):
     def __init__(self, parent: tk.Misc):
-        super().__init__(parent)
+        super().__init__(parent, style="Dialog.TFrame")
         self._letters = [
-            ttk.Label(self, text="G", font=("Segoe UI", 16, "bold"), foreground="#9A9A9A"),
-            ttk.Label(self, text="A", font=("Segoe UI", 16, "bold"), foreground="#9A9A9A"),
-            ttk.Label(self, text="B", font=("Segoe UI", 16, "bold"), foreground="#9A9A9A"),
+            ttk.Label(self, text="G", style="Dialog.TLabel", font=("Segoe UI Semibold", 16)),
+            ttk.Label(self, text="A", style="Dialog.TLabel", font=("Segoe UI Semibold", 16)),
+            ttk.Label(self, text="B", style="Dialog.TLabel", font=("Segoe UI Semibold", 16)),
         ]
         for lbl in self._letters:
+            lbl.configure(foreground=TEXT_MUTED)
             lbl.pack(side="left", padx=4)
 
         self._running = False
@@ -23,7 +26,7 @@ class GABLoader(ttk.Frame):
         if not self._running:
             return
         for i, lbl in enumerate(self._letters):
-            lbl.configure(foreground="#0D6EFD" if i == self._idx else "#9A9A9A")
+            lbl.configure(foreground=ACCENT if i == self._idx else TEXT_MUTED)
         self._idx = (self._idx + 1) % len(self._letters)
         self._after_id = self.after(150, self._tick)
 
@@ -43,5 +46,5 @@ class GABLoader(ttk.Frame):
                 pass
             self._after_id = None
         for lbl in self._letters:
-            lbl.configure(foreground="#9A9A9A")
+            lbl.configure(foreground=TEXT_MUTED)
 
