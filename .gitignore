@@ -14,8 +14,13 @@ build/
 # Build outputs (do not commit)
 PRODSplunkUtilityTool*/
 restore-point*/
+out/
+out_premerge_backup_*/
 *.zip
+Internal/logs/
+Internal/state.json
 Internal/state.json.tmp
+Internal/security_baseline.initialized
 
 # VC runtime - do not commit DLLs
 vc_runtime/*.dll
