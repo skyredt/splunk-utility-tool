@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 import queue
@@ -43,6 +43,7 @@ from Internal.splunk_broker import (
     start_local_splunk_broker,
 )
 from Internal.security_policy import PolicyViolation, load_security_policy, redact_text
+from Internal.tool_logging import configure_tool_logging, debug_log as write_debug_log, runtime_log as write_runtime_log
 from mergereport_monitor import MergeReportMonitor
 from postdispatch_monitor import PostDispatchStatusMonitor
 from progress_dialog import run_with_progress
@@ -103,6 +104,7 @@ def _build_cfg_from_runtime_payload(payload: dict[str, object], exe_dir: str) ->
         logging_verbose=bool(payload.get("logging_verbose", False)),
         logging_max_bytes=int(payload.get("logging_max_bytes") or 10_485_760),
         logging_backup_count=int(payload.get("logging_backup_count") or 10),
+        file_logging_config=dict(payload.get("file_logging_config")) if isinstance(payload.get("file_logging_config"), dict) else None,
         legacy_password_present=bool(payload.get("legacy_password_present", False)),
         merge_report_enabled=bool(payload.get("merge_report_enabled", False)),
         merge_report_log_path=str(payload.get("merge_report_log_path") or ""),
@@ -121,6 +123,7 @@ def _build_cfg_from_runtime_payload(payload: dict[str, object], exe_dir: str) ->
         smtp_use_tls=bool(payload.get("smtp_use_tls", False)),
         smtp_from=str(payload.get("smtp_from") or "Splunk Notification <splunk-donotreply@localhost>"),
         postdispatch_config=dict(payload.get("postdispatch_config")) if isinstance(payload.get("postdispatch_config"), dict) else None,
+        runtime_config=dict(payload.get("runtime_config")) if isinstance(payload.get("runtime_config"), dict) else None,
     )
 
 
@@ -374,6 +377,17 @@ class ReportsApp(ttk.Frame):
 
     def _append_log(self, text: str) -> None:
         safe_text = redact_text(text)
+        runtime_level = "INFO"
+        upper_text = safe_text.upper()
+        if upper_text.startswith("ERROR") or " ERROR " in upper_text:
+            runtime_level = "ERROR"
+        elif "WARNING" in upper_text or upper_text.startswith("WARN"):
+            runtime_level = "WARN"
+        if safe_text.startswith("[Debug]"):
+            write_debug_log(safe_text, category="general")
+        else:
+            write_runtime_log(safe_text, level=runtime_level)
+            write_debug_log(f"RUNTIME_UI {safe_text}", category="general")
         self.log_text.configure(state="normal")
         self.log_text.insert("end", safe_text + "\n")
         self.log_text.see("end")
@@ -984,6 +998,12 @@ def main() -> None:
         return
 
     cfg = _build_cfg_from_runtime_payload(runtime_payload, exe_dir=exe_dir)
+    configure_tool_logging(
+        exe_dir=exe_dir,
+        config=cfg,
+        broker_url=log_broker_url,
+        broker_token=log_broker_token,
+    )
 
     audit_logger.configure(
         level=cfg.logging_level,
@@ -1061,3 +1081,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

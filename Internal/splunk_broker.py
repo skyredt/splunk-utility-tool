@@ -742,6 +742,7 @@ class _SplunkBrokerState:
             "logging_verbose": bool(cfg.logging_verbose),
             "logging_max_bytes": int(cfg.logging_max_bytes),
             "logging_backup_count": int(cfg.logging_backup_count),
+            "file_logging_config": dict(cfg.file_logging_config) if isinstance(cfg.file_logging_config, dict) else None,
             "legacy_password_present": bool(cfg.legacy_password_present),
             "merge_report_enabled": bool(cfg.merge_report_enabled),
             "merge_report_log_path": str(cfg.merge_report_log_path or ""),
@@ -760,6 +761,7 @@ class _SplunkBrokerState:
             "smtp_use_tls": bool(cfg.smtp_use_tls),
             "smtp_from": str(cfg.smtp_from),
             "postdispatch_config": dict(cfg.postdispatch_config) if isinstance(cfg.postdispatch_config, dict) else None,
+            "runtime_config": dict(cfg.runtime_config) if isinstance(cfg.runtime_config, dict) else None,
         }
 
     def op_health(self, _args: dict[str, Any]) -> dict[str, Any]:
