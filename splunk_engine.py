@@ -4,7 +4,9 @@ import importlib
 import json
 import logging
 import os
+import queue
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -48,6 +50,7 @@ from Internal.security_policy import PolicyViolation, SecurityPolicy, load_secur
 VALID_AUTH_MODES = ("password",)
 TOOL_DISPLAY_NAME = "Splunk Utility Tool v4"
 DEFAULT_DISPATCH_PER_SLICE_WAIT_SECONDS = 30
+DEFAULT_DISPATCH_CALL_TIMEOUT_SECONDS = 30
 DEFAULT_DISPATCH_CONTINUE_ON_TIMEOUT = True
 DEFAULT_DISPATCH_TIMEOUT_RESULT = "pending"
 DEFAULT_MERGEREPORT_TIMEOUT_SECONDS = 300
@@ -598,6 +601,14 @@ def load_config(
             "timeout_result": _normalize_timeout_result(
                 section.get("timeout_result", DEFAULT_DISPATCH_TIMEOUT_RESULT)
             ).lower(),
+            "dispatch_call_timeout_seconds": _parse_min_int(
+                section.get(
+                    "dispatch_call_timeout_seconds",
+                    str(DEFAULT_DISPATCH_CALL_TIMEOUT_SECONDS),
+                ),
+                DEFAULT_DISPATCH_CALL_TIMEOUT_SECONDS,
+                1,
+            ),
         }
 
     # Manual ACK + SMTP defaults
@@ -1028,27 +1039,119 @@ class SplunkClient(QObject):
             data["dispatch.earliest_time"] = earliest
         if latest is not None:
             data["dispatch.latest_time"] = latest
+        payload = {"output_mode": "json", **data}
+        dispatch_path = path + "/dispatch"
+        url = self.base_url + dispatch_path
+        connect_timeout_seconds = 10
+        read_timeout_seconds = 30
+        request_start_time = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        request_body_summary = json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        self._last_dispatch_meta = {
+            "transport_mode": "oneshot_request",
+            "request_start_time": request_start_time,
+            "request_body_summary": request_body_summary,
+            "connect_timeout_seconds": connect_timeout_seconds,
+            "read_timeout_seconds": read_timeout_seconds,
+            "rest_endpoint": dispatch_path,
+            "rest_method": "POST",
+        }
 
+        oneshot_session = requests.Session()
+        oneshot_session.trust_env = False
+        resp = None
         try:
-            resp = self._request(
-                "POST",
-                path + "/dispatch",
-                data={"output_mode": "json", **data},
-                timeout=60,
+            resp = oneshot_session.request(
+                method="POST",
+                url=url,
+                data=payload,
+                headers={
+                    "Authorization": self._auth_header,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Connection": "close",
+                },
+                timeout=(connect_timeout_seconds, read_timeout_seconds),
+                verify=self.verify_ssl,
+                allow_redirects=False,
             )
-        except Exception as e:
-            return False, None, f"Request error: {e!r}"
+        except requests.exceptions.SSLError as exc:
+            self._last_dispatch_meta["failure_classification"] = "ssl_error"
+            return False, None, f"Request error: {exc!r}"
+        except requests.exceptions.RequestException as exc:
+            self._last_dispatch_meta["failure_classification"] = "request_exception"
+            return False, None, f"Request error: {exc!r}"
+
+        response_headers_elapsed_ms = 0
+        try:
+            response_headers_elapsed_ms = int(
+                max(0.0, float(resp.elapsed.total_seconds())) * 1000
+            )
+        except Exception:
+            response_headers_elapsed_ms = 0
+        self._last_dispatch_meta["response_status_code"] = int(resp.status_code)
+        self._last_dispatch_meta["response_headers_elapsed_ms"] = response_headers_elapsed_ms
+        self._last_dispatch_meta["response_location"] = str(resp.headers.get("Location", "") or "")
 
         try:
-            payload = resp.json()
-        except json.JSONDecodeError:
-            return False, None, f"Non-JSON response: {resp.text[:500]}"
+            if resp.status_code in (401, 403):
+                self._last_dispatch_meta["failure_classification"] = "auth_error"
+                return False, None, "Request error: RuntimeError('Authentication failed (401/403).')"
+            if resp.status_code >= 400:
+                self._last_dispatch_meta["failure_classification"] = "http_error"
+                return False, None, f"Request error: RuntimeError('HTTP {resp.status_code} returned by Splunk REST API.')"
 
-        sid = payload.get("sid")
-        if not sid:
-            return False, None, f"No sid in dispatch response: {payload}"
+            location = str(resp.headers.get("Location", "") or "").strip()
+            if location:
+                sid = location.rstrip("/").rsplit("/", 1)[-1].strip()
+                if sid:
+                    self._last_dispatch_meta["sid_source"] = "location_header"
+                    self._last_dispatch_meta["sid"] = sid
+                    self._last_dispatch_meta["response_body_read_elapsed_ms"] = 0
+                    self._last_dispatch_meta["json_parse_elapsed_ms"] = 0
+                    self._last_dispatch_meta["post_sid_return_work_ms"] = 0
+                    return True, sid, ""
 
-        return True, sid, ""
+            body_read_start = time.monotonic()
+            response_text = str(resp.text or "")
+            self._last_dispatch_meta["response_body_read_elapsed_ms"] = int(
+                (time.monotonic() - body_read_start) * 1000
+            )
+            self._last_dispatch_meta["response_body_snippet"] = redact_text(response_text[:500])
+
+            json_parse_start = time.monotonic()
+            try:
+                response_payload = json.loads(response_text)
+            except json.JSONDecodeError:
+                self._last_dispatch_meta["json_parse_elapsed_ms"] = int(
+                    (time.monotonic() - json_parse_start) * 1000
+                )
+                self._last_dispatch_meta["failure_classification"] = "non_json_response"
+                return False, None, f"Non-JSON response: {response_text[:500]}"
+            self._last_dispatch_meta["json_parse_elapsed_ms"] = int(
+                (time.monotonic() - json_parse_start) * 1000
+            )
+            if isinstance(response_payload, dict):
+                self._last_dispatch_meta["response_payload"] = dict(response_payload)
+            sid = str(response_payload.get("sid", "") or "").strip() if isinstance(response_payload, dict) else ""
+            if not sid:
+                self._last_dispatch_meta["failure_classification"] = "missing_sid"
+                return False, None, f"No sid in dispatch response: {response_payload}"
+
+            self._last_dispatch_meta["sid_source"] = "json_body"
+            self._last_dispatch_meta["sid"] = sid
+            self._last_dispatch_meta["post_sid_return_work_ms"] = 0
+            return True, sid, ""
+        finally:
+            close_response = getattr(resp, "close", None)
+            if callable(close_response):
+                close_response()
+            close_session = getattr(oneshot_session, "close", None)
+            if callable(close_session):
+                close_session()
 
     def get_job_status_snapshot(
         self,
@@ -1216,6 +1319,88 @@ def _append_log(
         log_callback(line)
 
 
+def _dispatch_saved_search_with_budget(
+    client: SplunkClient,
+    *,
+    report_id_url: str,
+    earliest: Optional[str],
+    latest: Optional[str],
+    timeout_seconds: int,
+) -> Tuple[str, bool, str, str, int]:
+    dispatch_timeout = max(0.01, float(timeout_seconds))
+    start = time.monotonic()
+    result_queue: "queue.Queue[tuple[str, bool, str, str]]" = queue.Queue(maxsize=1)
+    worker_name = f"dispatch-call-{uuid.uuid4().hex[:8]}"
+
+    def _worker() -> None:
+        try:
+            ok, sid, err = client.dispatch_saved_search(
+                report_id_url,
+                earliest=earliest,
+                latest=latest,
+            )
+            result_queue.put(
+                (
+                    "RETURNED",
+                    bool(ok),
+                    str(sid or ""),
+                    redact_text(str(err or "")),
+                )
+            )
+        except Exception as exc:
+            result_queue.put(
+                (
+                    "EXCEPTION",
+                    False,
+                    "",
+                    redact_text(str(exc) or repr(exc)),
+                )
+            )
+
+    worker = threading.Thread(target=_worker, name=worker_name, daemon=True)
+    worker.start()
+    setattr(
+        client,
+        "_last_dispatch_call_budget_meta",
+        {
+            "worker_thread_name": worker.name,
+            "worker_thread_ident": worker.ident,
+            "timeout_seconds": dispatch_timeout,
+        },
+    )
+    try:
+        dispatch_state, ok, sid, err = result_queue.get(timeout=dispatch_timeout)
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        setattr(
+            client,
+            "_last_dispatch_call_budget_meta",
+            {
+                "worker_thread_name": worker.name,
+                "worker_thread_ident": worker.ident,
+                "timeout_seconds": dispatch_timeout,
+                "dispatch_state": dispatch_state,
+                "elapsed_ms": elapsed_ms,
+                "sid_present": bool(sid),
+            },
+        )
+        return dispatch_state, ok, sid, err, elapsed_ms
+    except queue.Empty:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        setattr(
+            client,
+            "_last_dispatch_call_budget_meta",
+            {
+                "worker_thread_name": worker.name,
+                "worker_thread_ident": worker.ident,
+                "timeout_seconds": dispatch_timeout,
+                "dispatch_state": "TIMEOUT_NO_SID",
+                "elapsed_ms": elapsed_ms,
+                "sid_present": False,
+            },
+        )
+        return "TIMEOUT_NO_SID", False, "", "", elapsed_ms
+
+
 def _dispatch_slice_and_wait(
     logs: List[str],
     *,
@@ -1232,6 +1417,7 @@ def _dispatch_slice_and_wait(
     wait_seconds: int,
     poll_interval: int,
     timeout_status: str,
+    dispatch_call_timeout_seconds: int,
     log_prefix: str,
     log_callback: Optional[Callable[[str], None]],
     sid_callback: Optional[Callable[[str, str], None]],
@@ -1240,11 +1426,117 @@ def _dispatch_slice_and_wait(
 ) -> Tuple[str, str]:
     slice_index = max(0, int(slice_index or 0))
     slice_total = max(0, int(slice_total or 0))
-    ok, sid, err = client.dispatch_saved_search(
-        report_id_url,
+    dispatch_call_timeout_seconds = max(1, int(dispatch_call_timeout_seconds or 0))
+    audit_slice_event(
+        "SLICE_DISPATCH_CALL_START",
+        level="INFO",
+        slice_label=slice_label,
+        slice_index=slice_index,
+        slice_total=slice_total,
+        dispatch_call_timeout_seconds=dispatch_call_timeout_seconds,
+        earliest=earliest_display,
+        latest=latest_display,
+        thread_name=threading.current_thread().name,
+        thread_ident=threading.get_ident(),
+    )
+    dispatch_state, ok, sid, err, dispatch_elapsed_ms = _dispatch_saved_search_with_budget(
+        client,
+        report_id_url=report_id_url,
         earliest=dispatch_earliest,
         latest=dispatch_latest,
+        timeout_seconds=dispatch_call_timeout_seconds,
     )
+    dispatch_call_meta = getattr(client, "_last_dispatch_call_budget_meta", {})
+    if not isinstance(dispatch_call_meta, dict):
+        dispatch_call_meta = {}
+    audit_slice_event(
+        "SLICE_DISPATCH_CALL_RETURN",
+        level="INFO",
+        slice_label=slice_label,
+        slice_index=slice_index,
+        slice_total=slice_total,
+        dispatch_call_state=dispatch_state,
+        dispatch_call_timeout_seconds=dispatch_call_timeout_seconds,
+        elapsed_ms=dispatch_elapsed_ms,
+        sid_present=bool(sid),
+        worker_thread_name=dispatch_call_meta.get("worker_thread_name"),
+        worker_thread_ident=dispatch_call_meta.get("worker_thread_ident"),
+    )
+    if dispatch_state == "TIMEOUT_NO_SID":
+        err_msg = (
+            f"Dispatch not confirmed within {dispatch_call_timeout_seconds} seconds "
+            "before SID was returned."
+        )
+        _append_log(
+            logs,
+            f"  {log_prefix}{_display_slice_status(timeout_status)} - {err_msg}",
+            log_callback,
+        )
+        audit_slice_event(
+            "REPORT_SLICE_DISPATCH_TIMEOUT_NO_SID",
+            level="WARN",
+            slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
+            elapsed_ms=dispatch_elapsed_ms,
+            sid_present=False,
+            earliest=earliest_display,
+            latest=latest_display,
+            reason=_short_error(err_msg),
+            error_phase="dispatch",
+            dispatch_call_timeout_seconds=dispatch_call_timeout_seconds,
+        )
+        audit_slice_event(
+            "REPORT_SLICE_MARKED_PENDING",
+            level="WARN",
+            slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
+            sid="",
+            reason=_short_error(err_msg),
+            error_phase="dispatch",
+        )
+        record_slice(
+            slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
+            status=timeout_status,
+            earliest=earliest_display,
+            latest=latest_display,
+            sid="",
+            outcome_code="DISPATCH_TIMEOUT_NO_SID",
+            error=err_msg,
+        )
+        return timeout_status, ""
+    if dispatch_state == "EXCEPTION":
+        safe_error = redact_text(err or "Dispatch call raised an exception before returning.")
+        _append_log(logs, f"  {log_prefix}FAILED: {safe_error}", log_callback)
+        audit_slice_event(
+            "REPORT_SLICE_DISPATCH_EXCEPTION",
+            level="WARN",
+            slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
+            elapsed_ms=dispatch_elapsed_ms,
+            sid_present=False,
+            earliest=earliest_display,
+            latest=latest_display,
+            reason=_short_error(safe_error),
+            error_type="DispatchException",
+            error_phase="dispatch",
+            dispatch_call_timeout_seconds=dispatch_call_timeout_seconds,
+        )
+        record_slice(
+            slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
+            status="FAILED",
+            earliest=earliest_display,
+            latest=latest_display,
+            outcome_code="DISPATCH_FAILED",
+            error=safe_error,
+        )
+        return "FAILED", ""
     if not ok:
         _append_log(logs, f"  {log_prefix}FAILED: {err}", log_callback)
         broker_op, broker_timeout = _extract_broker_context(text=err)
@@ -1277,29 +1569,49 @@ def _dispatch_slice_and_wait(
             error=err,
         )
         return "FAILED", ""
-    if sid is None:
-        _append_log(logs, f"  {log_prefix}FAILED: No sid returned", log_callback)
+    if not sid:
+        err_msg = "Dispatch returned without a SID."
+        _append_log(
+            logs,
+            f"  {log_prefix}{_display_slice_status(timeout_status)} - {err_msg}",
+            log_callback,
+        )
         audit_slice_event(
-            "REPORT_SLICE_FAILED",
+            "REPORT_SLICE_DISPATCH_NO_SID",
             level="WARN",
             slice_label=slice_label,
             slice_index=slice_index,
             slice_total=slice_total,
-            reason="No SID returned",
-            error_type="NoSID",
+            elapsed_ms=dispatch_elapsed_ms,
+            sid_present=False,
+            earliest=earliest_display,
+            latest=latest_display,
+            reason=_short_error(err_msg),
+            error_phase="dispatch",
+            dispatch_call_timeout_seconds=dispatch_call_timeout_seconds,
+        )
+        audit_slice_event(
+            "REPORT_SLICE_MARKED_PENDING",
+            level="WARN",
+            slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
+            sid="",
+            reason=_short_error(err_msg),
             error_phase="dispatch",
         )
         record_slice(
             slice_label=slice_label,
             slice_index=slice_index,
             slice_total=slice_total,
-            status="FAILED",
+            status=timeout_status,
             earliest=earliest_display,
             latest=latest_display,
-            outcome_code="DISPATCH_FAILED",
-            error="No SID returned",
+            sid="",
+            outcome_code="DISPATCH_NO_SID",
+            error=err_msg,
         )
-        return "FAILED", ""
+        return timeout_status, ""
 
     _append_log(
         logs,
@@ -1597,6 +1909,7 @@ def run_dispatch_single(
     regen_context: Optional[RegenContext] = None,
     continue_on_timeout: bool = DEFAULT_DISPATCH_CONTINUE_ON_TIMEOUT,
     timeout_status: str = "PENDING",
+    dispatch_call_timeout_seconds: int = DEFAULT_DISPATCH_CALL_TIMEOUT_SECONDS,
 ) -> List[str]:
     logs: List[str] = []
 
@@ -1659,6 +1972,7 @@ def run_dispatch_single(
             wait_seconds=wait_seconds,
             poll_interval=poll_interval,
             timeout_status=timeout_status,
+            dispatch_call_timeout_seconds=dispatch_call_timeout_seconds,
             log_prefix="",
             log_callback=log_callback,
             sid_callback=sid_callback,
@@ -1701,6 +2015,7 @@ def run_dispatch_single(
             wait_seconds=wait_seconds,
             poll_interval=poll_interval,
             timeout_status=timeout_status,
+            dispatch_call_timeout_seconds=dispatch_call_timeout_seconds,
             log_prefix=f"[{i}/{len(starts)}] ",
             log_callback=log_callback,
             sid_callback=sid_callback,
@@ -1965,6 +2280,20 @@ def resolve_continue_on_timeout(config: Optional[SplunkConfig]) -> bool:
     return _parse_bool(
         config.dispatch_config.get("continue_on_timeout"),
         DEFAULT_DISPATCH_CONTINUE_ON_TIMEOUT,
+    )
+
+
+def resolve_dispatch_call_timeout_seconds(config: Optional[SplunkConfig]) -> int:
+    if (
+        config is None
+        or not isinstance(config.dispatch_config, dict)
+        or "dispatch_call_timeout_seconds" not in config.dispatch_config
+    ):
+        return DEFAULT_DISPATCH_CALL_TIMEOUT_SECONDS
+    return _parse_min_int(
+        config.dispatch_config.get("dispatch_call_timeout_seconds"),
+        DEFAULT_DISPATCH_CALL_TIMEOUT_SECONDS,
+        1,
     )
 
 
@@ -2722,6 +3051,7 @@ def run_dispatch_multi(
                 regen_context=regen_context,
                 continue_on_timeout=resolve_continue_on_timeout(config),
                 timeout_status=resolve_timeout_result(config),
+                dispatch_call_timeout_seconds=resolve_dispatch_call_timeout_seconds(config),
             )
             logs.extend(report_logs)
         if _pending_slice_records(regen_context) and resolve_reconcile_pending(config):
