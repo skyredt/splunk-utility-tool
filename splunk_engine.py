@@ -57,6 +57,7 @@ DEFAULT_MERGEREPORT_TIMEOUT_SECONDS = 300
 DEFAULT_POSTDISPATCH_TIMEOUT_SECONDS = 300
 DEFAULT_POSTDISPATCH_POLL_SECONDS = 5
 DEFAULT_POSTDISPATCH_LOOKBACK_SECONDS = 900
+DEFAULT_POSTDISPATCH_ENABLED = True
 DEFAULT_STATUS_CHECK_TIMEOUT_SECONDS = DEFAULT_DISPATCH_PER_SLICE_WAIT_SECONDS
 DEFAULT_BROKER_REQUEST_TIMEOUT_SECONDS = 300
 DEFAULT_RECONCILE_PENDING_ENABLED = True
@@ -674,6 +675,10 @@ def load_config(
     if "postdispatch" in cfg:
         section = cfg["postdispatch"]
         postdispatch_config = {
+            "enabled": _parse_bool(
+                section.get("enabled", str(int(DEFAULT_POSTDISPATCH_ENABLED))),
+                DEFAULT_POSTDISPATCH_ENABLED,
+            ),
             "merge_report_enabled": section.get("merge_report_enabled", "true").lower() in ("true", "1", "yes"),
             "merge_report_log_path": section.get("merge_report_log_path", "").strip(),
             "merge_report_index": section.get("merge_report_index", "_internal"),
@@ -2399,6 +2404,15 @@ def resolve_reconcile_pending(config: Optional[SplunkConfig]) -> bool:
     )
 
 
+def resolve_postdispatch_enabled(config: Optional[SplunkConfig]) -> bool:
+    if config is None or not isinstance(config.postdispatch_config, dict):
+        return DEFAULT_POSTDISPATCH_ENABLED
+    return _parse_bool(
+        config.postdispatch_config.get("enabled"),
+        DEFAULT_POSTDISPATCH_ENABLED,
+    )
+
+
 def resolve_reconcile_wait_seconds(config: Optional[SplunkConfig]) -> int:
     if config is None or not isinstance(config.postdispatch_config, dict):
         return DEFAULT_RECONCILE_WAIT_SECONDS
@@ -3135,15 +3149,33 @@ def run_dispatch_multi(
                 dispatch_call_timeout_seconds=resolve_dispatch_call_timeout_seconds(config),
             )
             logs.extend(report_logs)
-        if _pending_slice_records(regen_context) and resolve_reconcile_pending(config):
-            reconcile_logs = _reconcile_pending_slices(
-                client,
-                regen_context,
-                wait_seconds=resolve_reconcile_wait_seconds(config),
-                poll_interval=resolve_status_check_poll_seconds(config),
-                log_callback=log_callback,
-            )
-            logs.extend(reconcile_logs)
+        pending_slices = _pending_slice_records(regen_context)
+        if pending_slices:
+            if not resolve_postdispatch_enabled(config):
+                _append_log(
+                    logs,
+                    (
+                        "Post-dispatch verification disabled by configuration; "
+                        "skipping pending reconciliation."
+                    ),
+                    log_callback,
+                )
+                _audit_event(
+                    "REPORT_POSTDISPATCH_SKIPPED_DISABLED",
+                    level="INFO",
+                    run_id=regen_context.run_id,
+                    app=app,
+                    pending_slices=len(pending_slices),
+                )
+            elif resolve_reconcile_pending(config):
+                reconcile_logs = _reconcile_pending_slices(
+                    client,
+                    regen_context,
+                    wait_seconds=resolve_reconcile_wait_seconds(config),
+                    poll_interval=resolve_status_check_poll_seconds(config),
+                    log_callback=log_callback,
+                )
+                logs.extend(reconcile_logs)
         regen_context.end_time_sgt = get_sgt_now()
         regen_context.slice_count = len(regen_context.slices)
         ok_count, fail_count, pending_count = regen_context.summary_counts()
