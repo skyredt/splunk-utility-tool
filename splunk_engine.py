@@ -1401,6 +1401,71 @@ def _dispatch_saved_search_with_budget(
         return "TIMEOUT_NO_SID", False, "", "", elapsed_ms
 
 
+def _reset_slice_transport_state(
+    logs: List[str],
+    *,
+    client: SplunkClient,
+    report_name: str,
+    slice_label: str,
+    slice_index: int,
+    slice_total: int,
+    log_callback: Optional[Callable[[str], None]],
+    audit_slice_event: Callable[..., None],
+) -> None:
+    _append_log(
+        logs,
+        f"[Debug] SLICE_RESOURCES_RESET report_name={report_name} slice_label={slice_label}",
+        log_callback,
+    )
+    audit_slice_event(
+        "SLICE_RESOURCES_RESET",
+        level="DEBUG",
+        slice_label=slice_label,
+        slice_index=slice_index,
+        slice_total=slice_total,
+    )
+    reset_actions: list[str] = []
+    if hasattr(client, "_last_dispatch_meta"):
+        try:
+            client._last_dispatch_meta = {}
+            reset_actions.append("last_dispatch_meta")
+        except Exception:
+            pass
+    if hasattr(client, "_last_snapshot_meta"):
+        try:
+            client._last_snapshot_meta = {}
+            reset_actions.append("last_snapshot_meta")
+        except Exception:
+            pass
+    if hasattr(client, "_dispatch_context"):
+        try:
+            client._dispatch_context = {}
+            reset_actions.append("dispatch_context")
+        except Exception:
+            pass
+    for method_name in ("reset_dispatch_context", "reset_transport", "close_transport"):
+        method = getattr(client, method_name, None)
+        if callable(method):
+            try:
+                method()
+                reset_actions.append(method_name)
+            except Exception:
+                reset_actions.append(f"{method_name}_failed")
+    _append_log(
+        logs,
+        f"[Debug] ACTIVE_BATCH_TRANSPORT_RESET report_name={report_name} actions={','.join(reset_actions) or 'none'}",
+        log_callback,
+    )
+    audit_slice_event(
+        "ACTIVE_BATCH_TRANSPORT_RESET",
+        level="DEBUG",
+        slice_label=slice_label,
+        slice_index=slice_index,
+        slice_total=slice_total,
+        reset_actions=",".join(reset_actions),
+    )
+
+
 def _dispatch_slice_and_wait(
     logs: List[str],
     *,
@@ -1427,12 +1492,15 @@ def _dispatch_slice_and_wait(
     slice_index = max(0, int(slice_index or 0))
     slice_total = max(0, int(slice_total or 0))
     dispatch_call_timeout_seconds = max(1, int(dispatch_call_timeout_seconds or 0))
+    dispatch_call_id = uuid.uuid4().hex[:12]
     audit_slice_event(
-        "SLICE_DISPATCH_CALL_START",
+        "ENGINE_BROKER_CALL_ENTER",
         level="INFO",
         slice_label=slice_label,
         slice_index=slice_index,
         slice_total=slice_total,
+        report_name=report_name,
+        correlation_id=dispatch_call_id,
         dispatch_call_timeout_seconds=dispatch_call_timeout_seconds,
         earliest=earliest_display,
         latest=latest_display,
@@ -1450,11 +1518,13 @@ def _dispatch_slice_and_wait(
     if not isinstance(dispatch_call_meta, dict):
         dispatch_call_meta = {}
     audit_slice_event(
-        "SLICE_DISPATCH_CALL_RETURN",
+        "ENGINE_BROKER_CALL_EXIT",
         level="INFO",
         slice_label=slice_label,
         slice_index=slice_index,
         slice_total=slice_total,
+        report_name=report_name,
+        correlation_id=dispatch_call_id,
         dispatch_call_state=dispatch_state,
         dispatch_call_timeout_seconds=dispatch_call_timeout_seconds,
         elapsed_ms=dispatch_elapsed_ms,
@@ -1995,6 +2065,17 @@ def run_dispatch_single(
         slice_label = f"[{i}/{len(starts)}]"
         earliest = to_epoch(s)
         latest = to_epoch(e)
+        if i > 1:
+            _reset_slice_transport_state(
+                logs,
+                client=client,
+                report_name=report_name,
+                slice_label=slice_label,
+                slice_index=i,
+                slice_total=len(starts),
+                log_callback=log_callback,
+                audit_slice_event=_audit_slice_event,
+            )
         _append_log(
             logs,
             f"  [{i}/{len(starts)}] Earliest: {s}, Latest: {e} - sending...",
