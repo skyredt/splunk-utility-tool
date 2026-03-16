@@ -1488,6 +1488,9 @@ def _dispatch_slice_and_wait(
     poll_interval: int,
     timeout_status: str,
     dispatch_call_timeout_seconds: int,
+    prefer_merge_report_verification: bool,
+    merge_report_log_path: str,
+    merge_report_timeout_seconds: int,
     log_prefix: str,
     log_callback: Optional[Callable[[str], None]],
     sid_callback: Optional[Callable[[str, str], None]],
@@ -1504,7 +1507,6 @@ def _dispatch_slice_and_wait(
         slice_label=slice_label,
         slice_index=slice_index,
         slice_total=slice_total,
-        report_name=report_name,
         correlation_id=dispatch_call_id,
         dispatch_call_timeout_seconds=dispatch_call_timeout_seconds,
         earliest=earliest_display,
@@ -1528,7 +1530,6 @@ def _dispatch_slice_and_wait(
         slice_label=slice_label,
         slice_index=slice_index,
         slice_total=slice_total,
-        report_name=report_name,
         correlation_id=dispatch_call_id,
         dispatch_call_state=dispatch_state,
         dispatch_call_timeout_seconds=dispatch_call_timeout_seconds,
@@ -1579,7 +1580,7 @@ def _dispatch_slice_and_wait(
             earliest=earliest_display,
             latest=latest_display,
             sid="",
-            outcome_code="DISPATCH_TIMEOUT_NO_SID",
+            outcome_code=_pending_no_sid_outcome_code(timeout_status),
             error=err_msg,
         )
         return timeout_status, ""
@@ -1683,19 +1684,10 @@ def _dispatch_slice_and_wait(
             earliest=earliest_display,
             latest=latest_display,
             sid="",
-            outcome_code="DISPATCH_NO_SID",
+            outcome_code=_pending_no_sid_outcome_code(timeout_status),
             error=err_msg,
         )
         return timeout_status, ""
-
-    _append_log(
-        logs,
-        (
-            f"  {log_prefix}DISPATCHED (sid={sid}) - "
-            f"awaiting status verification for up to {wait_seconds}s..."
-        ),
-        log_callback,
-    )
     audit_slice_event(
         "REPORT_SLICE_SID_RECEIVED",
         slice_label=slice_label,
@@ -1712,6 +1704,124 @@ def _dispatch_slice_and_wait(
     )
     if sid_callback:
         sid_callback(sid, report_name)
+
+    if prefer_merge_report_verification and merge_report_log_path:
+        verification_wait_seconds = max(1, int(merge_report_timeout_seconds or wait_seconds))
+        _append_log(
+            logs,
+            (
+                f"  {log_prefix}DISPATCHED (sid={sid}) - "
+                f"awaiting MergeReport verification for up to {verification_wait_seconds}s..."
+            ),
+            log_callback,
+        )
+        audit_slice_event(
+            "REPORT_SLICE_MERGEREPORT_WAIT_START",
+            level="INFO",
+            slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
+            sid=sid,
+            wait_seconds=verification_wait_seconds,
+            merge_report_log_path=merge_report_log_path,
+        )
+        merge_state, merge_detail, merge_elapsed_ms = _wait_for_mergereport_sid_result(
+            merge_report_log_path,
+            sid,
+            wait_seconds=verification_wait_seconds,
+            poll_interval=poll_interval,
+        )
+        audit_slice_event(
+            "REPORT_SLICE_MERGEREPORT_WAIT_END",
+            level="INFO" if merge_state == "SUCCESS" else "WARN",
+            slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
+            sid=sid,
+            result_state=merge_state,
+            elapsed_ms=merge_elapsed_ms,
+        )
+        if merge_state == "SUCCESS":
+            _append_log(logs, f"  {log_prefix}OK (sid={sid})", log_callback)
+            audit_slice_event(
+                "REPORT_SLICE_OK",
+                slice_label=slice_label,
+                slice_index=slice_index,
+                slice_total=slice_total,
+                sid=sid,
+                verification_source="merge_report",
+            )
+            record_slice(
+                slice_label=slice_label,
+                slice_index=slice_index,
+                slice_total=slice_total,
+                status="OK",
+                earliest=earliest_display,
+                latest=latest_display,
+                sid=sid,
+                outcome_code="SUCCESS_MERGEREPORT",
+            )
+            return "OK", sid
+        if merge_state == "FAILED":
+            failure_detail = merge_detail or "MergeReport reported an explicit failure marker."
+            _append_log(
+                logs,
+                f"  {log_prefix}FAILED (sid={sid}) - {_short_error(failure_detail)}",
+                log_callback,
+            )
+            audit_slice_event(
+                "REPORT_SLICE_FAILED",
+                level="WARN",
+                slice_label=slice_label,
+                slice_index=slice_index,
+                slice_total=slice_total,
+                sid=sid,
+                reason=_short_error(failure_detail),
+                error_phase="merge_report",
+                verification_source="merge_report",
+            )
+            record_slice(
+                slice_label=slice_label,
+                slice_index=slice_index,
+                slice_total=slice_total,
+                status="FAILED",
+                earliest=earliest_display,
+                latest=latest_display,
+                sid=sid,
+                outcome_code="MERGEREPORT_FAILED",
+                error=failure_detail,
+            )
+            return "FAILED", sid
+
+        fallback_detail = (
+            f"MergeReport terminal evidence not found within {verification_wait_seconds} seconds. "
+            "Falling back to native Splunk status verification."
+        )
+        _append_log(
+            logs,
+            f"  {log_prefix}{fallback_detail}",
+            log_callback,
+        )
+        audit_slice_event(
+            "REPORT_SLICE_MERGEREPORT_FALLBACK_NATIVE",
+            level="INFO",
+            slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
+            sid=sid,
+            reason=_short_error(fallback_detail),
+            error_phase="merge_report",
+            verification_source="merge_report",
+        )
+
+    _append_log(
+        logs,
+        (
+            f"  {log_prefix}DISPATCHED (sid={sid}) - "
+            f"awaiting status verification for up to {wait_seconds}s..."
+        ),
+        log_callback,
+    )
 
     status_check_start_utc = _utc_now_iso()
     status_check_start = time.monotonic()
@@ -1985,6 +2095,9 @@ def run_dispatch_single(
     continue_on_timeout: bool = DEFAULT_DISPATCH_CONTINUE_ON_TIMEOUT,
     timeout_status: str = "PENDING",
     dispatch_call_timeout_seconds: int = DEFAULT_DISPATCH_CALL_TIMEOUT_SECONDS,
+    prefer_merge_report_verification: bool = False,
+    merge_report_log_path: str = "",
+    merge_report_timeout_seconds: int = DEFAULT_MERGEREPORT_TIMEOUT_SECONDS,
 ) -> List[str]:
     logs: List[str] = []
 
@@ -2048,6 +2161,9 @@ def run_dispatch_single(
             poll_interval=poll_interval,
             timeout_status=timeout_status,
             dispatch_call_timeout_seconds=dispatch_call_timeout_seconds,
+            prefer_merge_report_verification=prefer_merge_report_verification,
+            merge_report_log_path=merge_report_log_path,
+            merge_report_timeout_seconds=merge_report_timeout_seconds,
             log_prefix="",
             log_callback=log_callback,
             sid_callback=sid_callback,
@@ -2102,6 +2218,9 @@ def run_dispatch_single(
             poll_interval=poll_interval,
             timeout_status=timeout_status,
             dispatch_call_timeout_seconds=dispatch_call_timeout_seconds,
+            prefer_merge_report_verification=prefer_merge_report_verification,
+            merge_report_log_path=merge_report_log_path,
+            merge_report_timeout_seconds=merge_report_timeout_seconds,
             log_prefix=f"[{i}/{len(starts)}] ",
             log_callback=log_callback,
             sid_callback=sid_callback,
@@ -2316,6 +2435,82 @@ def _build_pending_status_message(detail: str = "", *, wait_seconds: Optional[in
     return base
 
 
+def _pending_no_sid_outcome_code(timeout_status: str) -> str:
+    return "PENDING_NO_SID" if _is_pending_status(timeout_status) else "DISPATCH_NO_SID"
+
+
+def _classify_mergereport_terminal_message(message: str, level: str) -> Optional[Tuple[str, str]]:
+    lower_message = str(message or "").strip().lower()
+    upper_level = str(level or "").strip().upper()
+    if "action=email sent" in lower_message or lower_message.startswith("action=email sent"):
+        return ("SUCCESS", "MergeReport confirmed Action=Email sent.")
+    if upper_level == "ERROR":
+        return ("FAILED", str(message or "MergeReport reported an error.").strip())
+    failure_markers = (
+        "failed",
+        "smtp empty",
+        "smtp error",
+        "error sending",
+        "unable to send",
+    )
+    if any(marker in lower_message for marker in failure_markers):
+        return ("FAILED", str(message or "MergeReport reported a failure marker.").strip())
+    return None
+
+
+def _scan_mergereport_log_for_sid(log_path: str, sid: str) -> Tuple[str, str]:
+    sid = str(sid or "").strip()
+    if not log_path or not sid:
+        return ("RUNNING", "")
+    try:
+        from mergereport_monitor import MergeReportParser
+    except Exception as exc:
+        return ("FAILED", f"Unable to import MergeReport parser: {exc}")
+
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as handle:
+            for raw_line in handle:
+                event = MergeReportParser.parse_line(raw_line.rstrip("\r\n"))
+                if event is None or str(event.sid or "").strip() != sid:
+                    continue
+                classified = _classify_mergereport_terminal_message(
+                    event.message,
+                    event.level,
+                )
+                if classified is not None:
+                    return classified
+    except FileNotFoundError:
+        return ("RUNNING", "")
+    except Exception as exc:
+        safe_error = redact_text(str(exc) or repr(exc))
+        return ("FAILED", f"MergeReport log read failed: {safe_error}")
+    return ("RUNNING", "")
+
+
+def _wait_for_mergereport_sid_result(
+    log_path: str,
+    sid: str,
+    *,
+    wait_seconds: int,
+    poll_interval: int,
+) -> Tuple[str, str, int]:
+    wait_budget = max(1, int(wait_seconds))
+    deadline = time.monotonic() + wait_budget
+    poll_seconds = max(1.0, float(poll_interval))
+    start_time = time.monotonic()
+
+    while True:
+        state, detail = _scan_mergereport_log_for_sid(log_path, sid)
+        if state in ("SUCCESS", "FAILED"):
+            return (state, detail, int((time.monotonic() - start_time) * 1000))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_seconds, max(0.0, remaining)))
+
+    return ("TIMEOUT", "", int((time.monotonic() - start_time) * 1000))
+
+
 def resolve_status_check_timeout_seconds(config: Optional[SplunkConfig]) -> int:
     if (
         config is not None
@@ -2410,6 +2605,15 @@ def resolve_postdispatch_enabled(config: Optional[SplunkConfig]) -> bool:
     return _parse_bool(
         config.postdispatch_config.get("enabled"),
         DEFAULT_POSTDISPATCH_ENABLED,
+    )
+
+
+def resolve_primary_slice_mergereport_enabled(config: Optional[SplunkConfig]) -> bool:
+    if config is None:
+        return False
+    return bool(
+        getattr(config, "merge_report_enabled", False)
+        and str(getattr(config, "merge_report_log_path", "") or "").strip()
     )
 
 
@@ -3147,6 +3351,24 @@ def run_dispatch_multi(
                 continue_on_timeout=resolve_continue_on_timeout(config),
                 timeout_status=resolve_timeout_result(config),
                 dispatch_call_timeout_seconds=resolve_dispatch_call_timeout_seconds(config),
+                prefer_merge_report_verification=resolve_primary_slice_mergereport_enabled(config),
+                merge_report_log_path=(
+                    str(getattr(config, "merge_report_log_path", "") or "")
+                    if config is not None
+                    else ""
+                ),
+                merge_report_timeout_seconds=(
+                    int(
+                        getattr(
+                            config,
+                            "merge_report_timeout_seconds",
+                            DEFAULT_MERGEREPORT_TIMEOUT_SECONDS,
+                        )
+                        or DEFAULT_MERGEREPORT_TIMEOUT_SECONDS
+                    )
+                    if config is not None
+                    else DEFAULT_MERGEREPORT_TIMEOUT_SECONDS
+                ),
             )
             logs.extend(report_logs)
         pending_slices = _pending_slice_records(regen_context)
