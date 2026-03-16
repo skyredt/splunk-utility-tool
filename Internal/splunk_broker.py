@@ -371,6 +371,18 @@ class SplunkBrokerProxyClient:
         except Exception:
             self._request_timeout_seconds = 300.0
 
+    def reset_transport(self) -> None:
+        self._last_snapshot_meta = {}
+        for attr in ("_dispatch_trace_context", "_last_dispatch_meta", "_last_dispatch_call_budget_meta"):
+            if hasattr(self, attr):
+                try:
+                    setattr(self, attr, {})
+                except Exception:
+                    pass
+
+    def close_transport(self) -> None:
+        self.reset_transport()
+
     def _op(self, op: str, args: Optional[dict[str, Any]] = None, *, timeout: float = 30.0) -> dict[str, Any]:
         payload = {"op": op, "args": args or {}}
         body = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
@@ -950,15 +962,26 @@ class _SplunkBrokerState:
             **request_context,
         )
         op_start = time.monotonic()
+        dispatch_client = client
+        create_isolated_dispatch_client = getattr(client, "create_isolated_dispatch_client", None)
+        if callable(create_isolated_dispatch_client):
+            try:
+                dispatch_client = create_isolated_dispatch_client()
+                trace_fields["dispatch_client_mode"] = "isolated_per_slice"
+            except Exception:
+                dispatch_client = client
+                trace_fields["dispatch_client_mode"] = "shared_client_fallback"
+        else:
+            trace_fields["dispatch_client_mode"] = "shared_client"
         self.audit.log_event(
             "BROKER_DISPATCH_BACKEND_START",
             level="INFO",
             **trace_fields,
         )
-        previous_trace_context = getattr(client, "_dispatch_trace_context", None)
-        setattr(client, "_dispatch_trace_context", trace_context)
+        previous_trace_context = getattr(dispatch_client, "_dispatch_trace_context", None)
+        setattr(dispatch_client, "_dispatch_trace_context", trace_context)
         try:
-            ok, sid, err = client.dispatch_saved_search(
+            ok, sid, err = dispatch_client.dispatch_saved_search(
                 report_id_url=report_id_url,
                 earliest=earliest or None,
                 latest=latest or None,
@@ -967,11 +990,18 @@ class _SplunkBrokerState:
         finally:
             if previous_trace_context is None:
                 try:
-                    delattr(client, "_dispatch_trace_context")
+                    delattr(dispatch_client, "_dispatch_trace_context")
                 except Exception:
                     pass
             else:
-                setattr(client, "_dispatch_trace_context", previous_trace_context)
+                setattr(dispatch_client, "_dispatch_trace_context", previous_trace_context)
+            if dispatch_client is not client:
+                close_transport = getattr(dispatch_client, "close_transport", None)
+                if callable(close_transport):
+                    try:
+                        close_transport()
+                    except Exception:
+                        pass
         elapsed_ms = int((time.monotonic() - op_start) * 1000)
         self.audit.log_event(
             "BROKER_DISPATCH_BACKEND_RETURN",
@@ -981,7 +1011,7 @@ class _SplunkBrokerState:
             sid=_sanitize_text(str(sid or "")),
             exception_message=_sanitize_text(str(err or "")),
         )
-        raw_meta = getattr(client, "_last_dispatch_meta", {})
+        raw_meta = getattr(dispatch_client, "_last_dispatch_meta", {})
         client_meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
         broker_fields = {
             "operation": "dispatch_saved_search",

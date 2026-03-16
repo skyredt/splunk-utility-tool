@@ -807,6 +807,7 @@ class SplunkClient(QObject):
                 f"Only https:// endpoints are allowed: {self.base_url!r}",
             )
         self.username = (username or "").strip()
+        self._password = str(password or "")
         self.auth_mode = "password"
         self.verify_ssl = bool(verify_ssl)
         self.session = requests.Session()
@@ -818,6 +819,20 @@ class SplunkClient(QObject):
         )
         self._auth_header = f"Splunk {self._login_with_password(self.username, password)}"
         self._last_snapshot_meta: dict[str, Any] = {}
+
+    def create_isolated_dispatch_client(self) -> "SplunkClient":
+        return SplunkClient(
+            self.base_url,
+            username=self.username,
+            password=self._password,
+            verify_ssl=self.verify_ssl,
+        )
+
+    def close_transport(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
 
     def _login_with_password(self, username: str, password: str) -> str:
         if not username or not password:
