@@ -1149,6 +1149,7 @@ class _SplunkBrokerHTTPServer(http.server.ThreadingHTTPServer):
 class _SplunkBrokerRequestHandler(http.server.BaseHTTPRequestHandler):
     server_version = "SplunkBroker/1.0"
     sys_version = ""
+    _LIFECYCLE_LOCKED_OPS = {"connect", "disconnect", "shutdown"}
 
     @property
     def _server(self) -> _SplunkBrokerHTTPServer:
@@ -1198,7 +1199,13 @@ class _SplunkBrokerRequestHandler(http.server.BaseHTTPRequestHandler):
         if not isinstance(args, dict):
             raise _BrokerError(400, "invalid_args")
 
-        with self._server.state_lock:
+        # The broker server is threaded. Only lifecycle mutations should hold
+        # the global state lock; long-running per-slice operations must not
+        # serialize behind status polls or dispatch calls from other threads.
+        if op in self._LIFECYCLE_LOCKED_OPS:
+            with self._server.state_lock:
+                result = self._dispatch_operation(op, args)
+        else:
             result = self._dispatch_operation(op, args)
         self._send_json(200, {"ok": True, "result": result})
 
