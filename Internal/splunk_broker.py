@@ -16,10 +16,11 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from Internal.dpapi_store import load_or_enroll_password
 from Internal.security_policy import load_security_policy, redact_text
+from Internal.tool_logging import debug_category_enabled, debug_event
 from splunk_engine import SplunkClient, load_config, set_security_audit_logger, set_security_policy
 
 
@@ -72,6 +73,73 @@ def _sanitize_text(value: str) -> str:
 
 def _safe_error_text(exc: Exception) -> str:
     return _sanitize_text(redact_text(str(exc)))
+
+
+def _emit_broker_debug_event(event: str, *, level: str = "DEBUG", **fields: Any) -> None:
+    if not debug_category_enabled("broker"):
+        return
+    safe_fields = _redact_sensitive(fields, key_hint="broker_dispatch")
+    if not isinstance(safe_fields, dict):
+        safe_fields = {}
+    # Keep transport metadata in a single payload dict so duplicate keyword forwarding
+    # cannot raise when client meta already includes transport_mode.
+    transport_mode = safe_fields.pop("transport_mode", None)
+    if transport_mode not in (None, ""):
+        safe_fields["transport_mode"] = transport_mode
+    debug_event(
+        event,
+        category="broker",
+        level=level,
+        **safe_fields,
+    )
+
+
+def _dispatch_request_context(report_id_url: str) -> dict[str, str]:
+    requested_path = urlparse(str(report_id_url or "")).path
+    report_name = ""
+    app = ""
+    owner = ""
+    parts = [part for part in requested_path.split("/") if part]
+    if len(parts) >= 6 and parts[0] == "servicesNS":
+        owner = parts[1]
+        app = parts[2]
+        report_name = unquote(parts[-1])
+    return {
+        "requested_path": requested_path,
+        "rest_endpoint": requested_path + "/dispatch" if requested_path else "",
+        "rest_method": "POST",
+        "report_name": _sanitize_text(report_name),
+        "app": _sanitize_text(app),
+        "owner": _sanitize_text(owner),
+    }
+
+
+def _sanitize_dispatch_trace_context(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in (
+        "run_id",
+        "report_name",
+        "slice_label",
+        "correlation_id",
+        "earliest",
+        "latest",
+        "transport_mode",
+        "thread_name",
+    ):
+        raw = value.get(key)
+        if raw not in (None, ""):
+            out[key] = _sanitize_text(str(raw))
+    for key in ("slice_index", "slice_total"):
+        raw = value.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            out[key] = max(0, int(raw))
+        except Exception:
+            continue
+    return out
 
 
 def _coerce_timeout_seconds(timeout_seconds: float) -> Optional[int]:
@@ -416,12 +484,17 @@ class SplunkBrokerProxyClient:
         latest: Optional[str] = None,
         trigger_actions: bool = True,
     ):
+        trace_context = _sanitize_dispatch_trace_context(
+            getattr(self, "_dispatch_trace_context", {})
+        )
         payload = {
             "report_id_url": str(report_id_url or ""),
             "earliest": str(earliest or ""),
             "latest": str(latest or ""),
             "trigger_actions": bool(trigger_actions),
         }
+        if trace_context:
+            payload["trace_context"] = trace_context
         try:
             result = self._op(
                 "dispatch_saved_search",
@@ -854,12 +927,109 @@ class _SplunkBrokerState:
         earliest = _validate_string_field(args, "earliest", required=False, max_len=80)
         latest = _validate_string_field(args, "latest", required=False, max_len=80)
         trigger_actions = _validate_bool_field(args, "trigger_actions", default=True)
-        ok, sid, err = client.dispatch_saved_search(
-            report_id_url=report_id_url,
-            earliest=earliest or None,
-            latest=latest or None,
-            trigger_actions=trigger_actions,
+        trace_context = _sanitize_dispatch_trace_context(args.get("trace_context", {}))
+        request_context = _dispatch_request_context(report_id_url)
+        trace_fields = {
+            **trace_context,
+            "earliest": _sanitize_text(earliest),
+            "latest": _sanitize_text(latest),
+            "thread_name": threading.current_thread().name,
+        }
+        self.audit.log_event(
+            "BROKER_DISPATCH_REQUEST_RECEIVED",
+            level="INFO",
+            **trace_fields,
         )
+        _emit_broker_debug_event(
+            "DISPATCH_SAVED_SEARCH_REQUESTED",
+            operation="dispatch_saved_search",
+            request_format="form_body",
+            earliest_time=earliest,
+            latest_time=latest,
+            trigger_actions=trigger_actions,
+            **request_context,
+        )
+        op_start = time.monotonic()
+        self.audit.log_event(
+            "BROKER_DISPATCH_BACKEND_START",
+            level="INFO",
+            **trace_fields,
+        )
+        previous_trace_context = getattr(client, "_dispatch_trace_context", None)
+        setattr(client, "_dispatch_trace_context", trace_context)
+        try:
+            ok, sid, err = client.dispatch_saved_search(
+                report_id_url=report_id_url,
+                earliest=earliest or None,
+                latest=latest or None,
+                trigger_actions=trigger_actions,
+            )
+        finally:
+            if previous_trace_context is None:
+                try:
+                    delattr(client, "_dispatch_trace_context")
+                except Exception:
+                    pass
+            else:
+                setattr(client, "_dispatch_trace_context", previous_trace_context)
+        elapsed_ms = int((time.monotonic() - op_start) * 1000)
+        self.audit.log_event(
+            "BROKER_DISPATCH_BACKEND_RETURN",
+            level="INFO" if ok and sid else "WARN",
+            **trace_fields,
+            elapsed_ms=elapsed_ms,
+            sid=_sanitize_text(str(sid or "")),
+            exception_message=_sanitize_text(str(err or "")),
+        )
+        raw_meta = getattr(client, "_last_dispatch_meta", {})
+        client_meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+        broker_fields = {
+            "operation": "dispatch_saved_search",
+            "request_format": "form_body",
+            "earliest_time": earliest,
+            "latest_time": latest,
+            "trigger_actions": trigger_actions,
+            "sid": _sanitize_text(str(sid or client_meta.get("sid", "") or "")),
+            "elapsed_ms": elapsed_ms,
+            "operation_elapsed_ms": elapsed_ms,
+            "request_body_summary": str(client_meta.get("request_body_summary", "") or ""),
+            "request_start_time": str(client_meta.get("request_start_time", "") or ""),
+            "connect_timeout_seconds": client_meta.get("connect_timeout_seconds", ""),
+            "read_timeout_seconds": client_meta.get("read_timeout_seconds", ""),
+            "response_status_code": client_meta.get("response_status_code", ""),
+            "response_headers_elapsed_ms": client_meta.get("response_headers_elapsed_ms", ""),
+            "response_body_read_elapsed_ms": client_meta.get("response_body_read_elapsed_ms", ""),
+            "json_parse_elapsed_ms": client_meta.get("json_parse_elapsed_ms", ""),
+            "post_sid_return_work_ms": client_meta.get("post_sid_return_work_ms", ""),
+            "sid_source": str(client_meta.get("sid_source", "") or ""),
+            "response_location": str(client_meta.get("response_location", "") or ""),
+            "response_body_snippet": str(client_meta.get("response_body_snippet", "") or ""),
+            "failure_classification": str(client_meta.get("failure_classification", "") or ""),
+            "transport_mode": str(client_meta.get("transport_mode", "") or ""),
+            **request_context,
+        }
+        if client_meta.get("response_status_code", "") != "":
+            _emit_broker_debug_event(
+                "DISPATCH_SAVED_SEARCH_RESPONSE_HEADERS",
+                **broker_fields,
+            )
+        if broker_fields["sid"]:
+            _emit_broker_debug_event(
+                "DISPATCH_SAVED_SEARCH_SID_PARSED",
+                **broker_fields,
+            )
+        if ok and sid:
+            _emit_broker_debug_event(
+                "DISPATCH_SAVED_SEARCH_COMPLETED",
+                **broker_fields,
+            )
+        else:
+            _emit_broker_debug_event(
+                "DISPATCH_SAVED_SEARCH_FAILED",
+                level="WARN",
+                error_detail=err,
+                **broker_fields,
+            )
         return {
             "ok": bool(ok),
             "sid": _sanitize_text(str(sid or "")),

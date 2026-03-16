@@ -1050,6 +1050,9 @@ class SplunkClient(QObject):
         connect_timeout_seconds = 10
         read_timeout_seconds = 30
         request_start_time = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        trace_context = getattr(self, "_dispatch_trace_context", {})
+        if not isinstance(trace_context, dict):
+            trace_context = {}
         request_body_summary = json.dumps(
             payload,
             sort_keys=True,
@@ -1064,7 +1067,26 @@ class SplunkClient(QObject):
             "read_timeout_seconds": read_timeout_seconds,
             "rest_endpoint": dispatch_path,
             "rest_method": "POST",
+            "correlation_id": str(trace_context.get("correlation_id", "") or ""),
         }
+        backend_trace_fields = {
+            "run_id": str(trace_context.get("run_id", "") or ""),
+            "report_name": str(trace_context.get("report_name", "") or ""),
+            "slice_label": str(trace_context.get("slice_label", "") or ""),
+            "slice_index": trace_context.get("slice_index"),
+            "slice_total": trace_context.get("slice_total"),
+            "correlation_id": str(trace_context.get("correlation_id", "") or ""),
+            "earliest": str(trace_context.get("earliest", earliest or "") or ""),
+            "latest": str(trace_context.get("latest", latest or "") or ""),
+            "transport_mode": "oneshot_request",
+            "thread_name": threading.current_thread().name,
+        }
+        rest_start_monotonic = time.monotonic()
+        _audit_event(
+            "SPLUNK_DISPATCH_REST_START",
+            level="INFO",
+            **backend_trace_fields,
+        )
 
         oneshot_session = requests.Session()
         oneshot_session.trust_env = False
@@ -1085,9 +1107,25 @@ class SplunkClient(QObject):
             )
         except requests.exceptions.SSLError as exc:
             self._last_dispatch_meta["failure_classification"] = "ssl_error"
+            _audit_event(
+                "SPLUNK_DISPATCH_REST_EXCEPTION",
+                level="WARN",
+                **backend_trace_fields,
+                elapsed_ms=int((time.monotonic() - rest_start_monotonic) * 1000),
+                exception_type=type(exc).__name__,
+                exception_message=_short_error(redact_text(str(exc) or repr(exc))),
+            )
             return False, None, f"Request error: {exc!r}"
         except requests.exceptions.RequestException as exc:
             self._last_dispatch_meta["failure_classification"] = "request_exception"
+            _audit_event(
+                "SPLUNK_DISPATCH_REST_EXCEPTION",
+                level="WARN",
+                **backend_trace_fields,
+                elapsed_ms=int((time.monotonic() - rest_start_monotonic) * 1000),
+                exception_type=type(exc).__name__,
+                exception_message=_short_error(redact_text(str(exc) or repr(exc))),
+            )
             return False, None, f"Request error: {exc!r}"
 
         response_headers_elapsed_ms = 0
@@ -1100,6 +1138,13 @@ class SplunkClient(QObject):
         self._last_dispatch_meta["response_status_code"] = int(resp.status_code)
         self._last_dispatch_meta["response_headers_elapsed_ms"] = response_headers_elapsed_ms
         self._last_dispatch_meta["response_location"] = str(resp.headers.get("Location", "") or "")
+        _audit_event(
+            "SPLUNK_DISPATCH_REST_RESPONSE",
+            level="INFO" if int(resp.status_code) < 400 else "WARN",
+            **backend_trace_fields,
+            elapsed_ms=int((time.monotonic() - rest_start_monotonic) * 1000),
+            response_status_code=int(resp.status_code),
+        )
 
         try:
             if resp.status_code in (401, 403):
@@ -1118,6 +1163,14 @@ class SplunkClient(QObject):
                     self._last_dispatch_meta["response_body_read_elapsed_ms"] = 0
                     self._last_dispatch_meta["json_parse_elapsed_ms"] = 0
                     self._last_dispatch_meta["post_sid_return_work_ms"] = 0
+                    _audit_event(
+                        "SPLUNK_DISPATCH_SID_PARSED",
+                        level="INFO",
+                        **backend_trace_fields,
+                        elapsed_ms=int((time.monotonic() - rest_start_monotonic) * 1000),
+                        sid=sid,
+                        sid_source="location_header",
+                    )
                     return True, sid, ""
 
             body_read_start = time.monotonic()
@@ -1149,6 +1202,14 @@ class SplunkClient(QObject):
             self._last_dispatch_meta["sid_source"] = "json_body"
             self._last_dispatch_meta["sid"] = sid
             self._last_dispatch_meta["post_sid_return_work_ms"] = 0
+            _audit_event(
+                "SPLUNK_DISPATCH_SID_PARSED",
+                level="INFO",
+                **backend_trace_fields,
+                elapsed_ms=int((time.monotonic() - rest_start_monotonic) * 1000),
+                sid=sid,
+                sid_source="json_body",
+            )
             return True, sid, ""
         finally:
             close_response = getattr(resp, "close", None)
@@ -1331,6 +1392,7 @@ def _dispatch_saved_search_with_budget(
     earliest: Optional[str],
     latest: Optional[str],
     timeout_seconds: int,
+    trace_context: Optional[dict[str, Any]] = None,
 ) -> Tuple[str, bool, str, str, int]:
     dispatch_timeout = max(0.01, float(timeout_seconds))
     start = time.monotonic()
@@ -1338,6 +1400,9 @@ def _dispatch_saved_search_with_budget(
     worker_name = f"dispatch-call-{uuid.uuid4().hex[:8]}"
 
     def _worker() -> None:
+        previous_trace_context = getattr(client, "_dispatch_trace_context", None)
+        if trace_context:
+            setattr(client, "_dispatch_trace_context", dict(trace_context))
         try:
             ok, sid, err = client.dispatch_saved_search(
                 report_id_url,
@@ -1361,6 +1426,14 @@ def _dispatch_saved_search_with_budget(
                     redact_text(str(exc) or repr(exc)),
                 )
             )
+        finally:
+            if previous_trace_context is None:
+                try:
+                    delattr(client, "_dispatch_trace_context")
+                except Exception:
+                    pass
+            else:
+                setattr(client, "_dispatch_trace_context", previous_trace_context)
 
     worker = threading.Thread(target=_worker, name=worker_name, daemon=True)
     worker.start()
@@ -1484,6 +1557,7 @@ def _dispatch_slice_and_wait(
     latest_display: str,
     dispatch_earliest: Optional[str],
     dispatch_latest: Optional[str],
+    run_id: str,
     wait_seconds: int,
     poll_interval: int,
     timeout_status: str,
@@ -1501,6 +1575,35 @@ def _dispatch_slice_and_wait(
     slice_total = max(0, int(slice_total or 0))
     dispatch_call_timeout_seconds = max(1, int(dispatch_call_timeout_seconds or 0))
     dispatch_call_id = uuid.uuid4().hex[:12]
+    dispatch_transport_mode = (
+        "broker_proxy"
+        if client.__class__.__name__ == "SplunkBrokerProxyClient"
+        else "direct_client"
+    )
+    dispatch_trace_context = {
+        "run_id": str(run_id or "").strip(),
+        "report_name": report_name,
+        "slice_label": slice_label,
+        "slice_index": slice_index,
+        "slice_total": slice_total,
+        "correlation_id": dispatch_call_id,
+        "earliest": earliest_display,
+        "latest": latest_display,
+        "transport_mode": dispatch_transport_mode,
+        "thread_name": threading.current_thread().name,
+    }
+    audit_slice_event(
+        "SLICE_DISPATCH_ENGINE_START",
+        level="INFO",
+        slice_label=slice_label,
+        slice_index=slice_index,
+        slice_total=slice_total,
+        correlation_id=dispatch_call_id,
+        earliest=earliest_display,
+        latest=latest_display,
+        transport_mode=dispatch_transport_mode,
+        thread_name=threading.current_thread().name,
+    )
     audit_slice_event(
         "ENGINE_BROKER_CALL_ENTER",
         level="INFO",
@@ -1511,8 +1614,21 @@ def _dispatch_slice_and_wait(
         dispatch_call_timeout_seconds=dispatch_call_timeout_seconds,
         earliest=earliest_display,
         latest=latest_display,
+        transport_mode=dispatch_transport_mode,
         thread_name=threading.current_thread().name,
         thread_ident=threading.get_ident(),
+    )
+    audit_slice_event(
+        "SLICE_DISPATCH_ENGINE_CALL_BROKER",
+        level="INFO",
+        slice_label=slice_label,
+        slice_index=slice_index,
+        slice_total=slice_total,
+        correlation_id=dispatch_call_id,
+        earliest=earliest_display,
+        latest=latest_display,
+        transport_mode=dispatch_transport_mode,
+        thread_name=threading.current_thread().name,
     )
     dispatch_state, ok, sid, err, dispatch_elapsed_ms = _dispatch_saved_search_with_budget(
         client,
@@ -1520,6 +1636,7 @@ def _dispatch_slice_and_wait(
         earliest=dispatch_earliest,
         latest=dispatch_latest,
         timeout_seconds=dispatch_call_timeout_seconds,
+        trace_context=dispatch_trace_context,
     )
     dispatch_call_meta = getattr(client, "_last_dispatch_call_budget_meta", {})
     if not isinstance(dispatch_call_meta, dict):
@@ -1535,8 +1652,26 @@ def _dispatch_slice_and_wait(
         dispatch_call_timeout_seconds=dispatch_call_timeout_seconds,
         elapsed_ms=dispatch_elapsed_ms,
         sid_present=bool(sid),
+        transport_mode=dispatch_transport_mode,
         worker_thread_name=dispatch_call_meta.get("worker_thread_name"),
         worker_thread_ident=dispatch_call_meta.get("worker_thread_ident"),
+    )
+    audit_slice_event(
+        "SLICE_DISPATCH_ENGINE_RETURN",
+        level="INFO" if dispatch_state == "RETURNED" else "WARN",
+        slice_label=slice_label,
+        slice_index=slice_index,
+        slice_total=slice_total,
+        correlation_id=dispatch_call_id,
+        earliest=earliest_display,
+        latest=latest_display,
+        elapsed_ms=dispatch_elapsed_ms,
+        transport_mode=dispatch_transport_mode,
+        sid=sid if sid else None,
+        dispatch_call_state=dispatch_state,
+        exception_type="DispatchException" if dispatch_state == "EXCEPTION" else None,
+        exception_message=_short_error(err) if dispatch_state == "EXCEPTION" and err else None,
+        thread_name=threading.current_thread().name,
     )
     if dispatch_state == "TIMEOUT_NO_SID":
         err_msg = (
@@ -2157,6 +2292,7 @@ def run_dispatch_single(
             latest_display=str(end),
             dispatch_earliest=None,
             dispatch_latest=None,
+            run_id=(regen_context.run_id if regen_context is not None else ""),
             wait_seconds=wait_seconds,
             poll_interval=poll_interval,
             timeout_status=timeout_status,
@@ -2214,6 +2350,7 @@ def run_dispatch_single(
             latest_display=str(e),
             dispatch_earliest=earliest,
             dispatch_latest=latest,
+            run_id=(regen_context.run_id if regen_context is not None else ""),
             wait_seconds=wait_seconds,
             poll_interval=poll_interval,
             timeout_status=timeout_status,
