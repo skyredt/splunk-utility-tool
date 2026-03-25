@@ -1,0 +1,94 @@
+# TEMPLATE ONLY - copy to config.ini before use.
+# Do not commit real config.ini or secrets to source control.
+
+[splunk]
+host = https://your-splunk-host:8089
+servers = https://your-splunk-host:8089
+auth_mode = password
+verify_ssl = true
+
+[Credentials]
+username = your_service_account
+secret_file = secret.dpapi
+dpapi_scope = machine
+
+[Security]
+build_mode = production
+policy_mode = enforced
+allow_insecure_overrides = false
+
+[Logging]
+level = INFO
+verbose = false
+max_bytes = 10485760
+backup_count = 10
+runtime_log_enabled = 1
+runtime_log_level = INFO
+runtime_log_path = Internal/logs/runtime.log
+debug_log_enabled = 0
+debug_log_level = DEBUG
+debug_log_path = Internal/logs/debug.log
+debug_broker_enabled = 0
+debug_rest_enabled = 0
+debug_dispatch_enabled = 0
+debug_tracebacks_enabled = 0
+
+[runtime]
+test_mode = false
+backend_health_timeout_seconds = 8
+backend_reconnect_enabled = true
+simulate_stale_backend_once = false
+
+[diagnostics]
+snapshot_probe_enabled = 0
+
+[mergereport]
+enabled = false
+log_path =
+timeout_seconds = 300
+
+[dispatch]
+per_slice_wait_seconds = 30
+continue_on_timeout = true
+timeout_result = pending
+max_slice_runtime_seconds = 120
+slice_cooldown_seconds = 60
+
+[email]
+ack_enabled = 1
+ack_on_pending = 0
+ack_recipients =
+ack_use_savedsearch_recipients = 0
+ack_attach_manifest = 0
+smtp_host = your-smtp-relay
+smtp_port = 25
+smtp_tls = 0
+smtp_user =
+smtp_pass =
+from_addr = Splunk Notification <noreply@example.com>
+
+[postdispatch]
+enabled = true
+stage2_enabled = true
+max_verification_duration_seconds = 300
+pending_on_inconclusive = true
+
+native_email_enabled = true
+native_email_index = _internal
+native_email_source_contains = python.log
+native_email_sourcetype =
+native_email_timeout_seconds = 300
+native_email_strict_success = false
+
+merge_report_enabled = false
+merge_report_log_path =
+merge_report_index = _internal
+merge_report_source_contains = mergeReport_alert.log
+merge_report_sourcetype =
+merge_report_timeout_seconds = 300
+
+broker_request_timeout_seconds = 300
+reconcile_pending = true
+reconcile_wait_seconds = 60
+poll_seconds = 5
+lookback_seconds = 900

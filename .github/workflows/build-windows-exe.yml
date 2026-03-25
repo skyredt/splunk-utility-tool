@@ -1,0 +1,104 @@
+name: Build Windows EXE (PyInstaller)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/tag/commit to build (leave blank = default branch)"
+        required: false
+        default: ""
+  push:
+    branches:
+      - portable-env
+      - main
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout (workflow_dispatch with ref)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.ref != '' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Checkout (workflow_dispatch default)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.ref == '' }}
+        uses: actions/checkout@v4
+
+      - name: Checkout (push)
+        if: ${{ github.event_name == 'push' }}
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Prepare VC runtime folder (minimal allowlist)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force vc_runtime | Out-Null
+
+          $dlls = @(
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "msvcp140.dll",
+            "msvcp140_1.dll",
+            "concrt140.dll",
+            "msvcp140_2.dll"
+          )
+
+          foreach ($d in $dlls) {
+            $src = Join-Path $env:WINDIR "System32\$d"
+            if (Test-Path $src) {
+              Copy-Item $src -Destination vc_runtime -Force
+            } else {
+              Write-Host "WARNING: missing $src"
+            }
+          }
+
+      - name: Diagnostics
+        shell: pwsh
+        run: |
+          python -c "import sys; print('sys.executable:', sys.executable); print('sys.base_prefix:', sys.base_prefix)"
+          Write-Host "vc_runtime folder contents:"
+          Get-ChildItem vc_runtime -Force | Select-Object Name,Length | Format-Table -AutoSize
+
+          Write-Host "HEAD:"; git rev-parse HEAD
+          Write-Host "First 60 lines of spec:"
+          Get-Content .\SplunkUtilityTool_v3.spec -TotalCount 60
+
+          $has = Select-String -Path .\SplunkUtilityTool_v3.spec -Pattern "__file__" -Quiet
+          if ($has) {
+            Write-Error "FOUND __file__ in spec (must be absent)"
+            exit 1
+          } else {
+            Write-Host "No __file__ in spec (good)"
+          }
+
+      - name: Build (PyInstaller spec)
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean SplunkUtilityTool_v3.spec
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          $zip = "out\SplunkUtilityTool_${{ github.sha }}.zip"
+          Compress-Archive -Path "dist\*" -DestinationPath $zip -Force
+          Get-ChildItem out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SplunkUtilityTool_${{ github.sha }}
+          path: out\*.zip

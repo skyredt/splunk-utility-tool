@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments / local tooling
+.venv/
+env/
+.env
+.vscode/
+.devcontainer/
+.DS_Store
+
+# Local runtime config and secrets
+config.ini
+config.ini.bak
+secret.dpapi
+
+# Local runtime output
+stdout.log
+stderr.log
+Internal/logs/
+Internal/state.json
+Internal/state.json.tmp
+Internal/baseline/
+Internal/security_baseline.json
+Internal/security_baseline.initialized
+
+# Build and packaging
+build/
+dist/
+out/
+*.zip
+
+# Temp and OS artifacts
+*.tmp
+*.temp
+*.bak
+Thumbs.db
