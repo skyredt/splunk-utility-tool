@@ -18,9 +18,13 @@ out/
 out_premerge_backup_*/
 *.zip
 Internal/logs/
+Internal/baseline/
 Internal/state.json
 Internal/state.json.tmp
 Internal/security_baseline.initialized
+secret.dpapi
+stdout.log
+stderr.log
 
 # VC runtime - do not commit DLLs
 vc_runtime/*.dll

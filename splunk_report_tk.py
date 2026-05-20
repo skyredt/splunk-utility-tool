@@ -2,6 +2,7 @@
 
 import os
 import queue
+import re
 import socket
 import sys
 from datetime import datetime, date
@@ -22,6 +23,10 @@ from splunk_engine import (
     SplunkConfig,
     build_slices,
     get_effective_username,
+    inspect_unfinished_batch_journals,
+    recover_unfinished_batch_journal,
+    resolve_merge_report_runtime_settings,
+    resolve_primary_slice_mergereport_enabled,
     resolve_broker_request_timeout_seconds,
     resolve_status_check_poll_seconds,
     resolve_status_check_timeout_seconds,
@@ -55,10 +60,106 @@ from ui_theme import (
     style_text_widget,
     style_window,
 )
-from ui_prompt import show_modal_prompt
+from ui_prompt import show_choice_prompt, show_modal_prompt
 
 
 TOOL_VERSION = "v4"
+_RUNNING_SLICE_RE = re.compile(r"^Running slice (\d+) of (\d+)\.\.\.$")
+_RECOVERY_BATCH_RE = re.compile(r"batch_id=([A-Za-z0-9_.:-]+)")
+
+
+def _dispatch_final_outcome_from_log_lines(log_lines: list[str]) -> str:
+    for raw_line in reversed(list(log_lines or [])):
+        text = str(raw_line or "").strip()
+        if not text:
+            continue
+        if text.startswith("Report generation completed successfully."):
+            return "success"
+        if text.startswith("Report processing completed, but final verification is still pending."):
+            return "pending_verification"
+        if text.startswith("Reports were generated, but evidence confirmation could not be fully completed."):
+            return "evidence_warning"
+        if text.startswith("Report completed with issues."):
+            return "partial_success"
+        if text.startswith("Unable to connect to Splunk services."):
+            return "connectivity_prestart"
+        if text.startswith("The report could not be started."):
+            return "could_not_start"
+    return ""
+
+
+def _should_show_dispatch_terminal_error(final_outcome: str, error_payload: object) -> bool:
+    if error_payload is None:
+        return False
+    normalized = str(final_outcome or "").strip().lower()
+    if normalized in {"success", "partial_success", "pending_verification", "evidence_warning"}:
+        return False
+    return True
+
+
+def _operator_display_line(raw_text: str) -> str:
+    text = str(raw_text or "").strip()
+    if not text:
+        return ""
+    if text.startswith("[Debug]"):
+        return ""
+    if text.startswith("Reference ID: "):
+        return text
+    if text in {
+        "Starting report generation...",
+        "Preparing report...",
+        "Finalizing results...",
+        "Recovery journal detected.",
+        "No unfinished recovery journals detected.",
+        "Temporary dispatch uncertainty detected. Verifying status...",
+        "Retrying slice in a fresh execution context...",
+    }:
+        return text
+    if text.startswith("Recovery journal detected."):
+        return "Recovery journal detected."
+    if _RUNNING_SLICE_RE.match(text):
+        return text
+    if text.startswith("Recovery journal detected for batch_id="):
+        match = _RECOVERY_BATCH_RE.search(text)
+        if match:
+            return f"Recovery journal detected.\nReference ID: {match.group(1)}"
+        return "Recovery journal detected."
+    if text.startswith("Incomplete batch detected:"):
+        match = _RECOVERY_BATCH_RE.search(text)
+        if match:
+            return f"Recovery journal detected.\nReference ID: {match.group(1)}"
+        return "Recovery journal detected."
+    if text.startswith("Blocked by overlap lock."):
+        return "Blocked by overlap lock."
+    if "Local Splunk broker unavailable" in text:
+        return "Unable to connect to Splunk services."
+    if text.startswith("Connected.") or text.startswith("Loading reports") or text.startswith("Loaded "):
+        return text
+    if text.startswith("Unable to connect to Splunk services."):
+        return text
+    if text.startswith("The report could not be started."):
+        return text
+    if text.startswith("Report generation completed successfully."):
+        return text
+    if text.startswith("All reports have been sent."):
+        return text
+    if text.startswith("Report completed with issues."):
+        return text
+    if text.startswith("Some reports may not have been generated or sent."):
+        return text
+    if text.startswith("Report processing completed, but final verification is still pending."):
+        return text
+    if text.startswith("Reports were generated, but evidence confirmation could not be fully completed."):
+        return text
+    if text.startswith("Please contact the Splunk team and provide:"):
+        return text
+    if text.startswith("Please verify manually or contact the Splunk team and provide:"):
+        return text
+    if text.startswith("Recovery action selected:"):
+        return text
+    if text.startswith("Recovery reconcile requires an active Splunk connection."):
+        return text
+    return ""
 
 
 def _resolve_app_icon_path() -> str | None:
@@ -162,6 +263,13 @@ class ReportsApp(ttk.Frame):
         self._dispatch_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self._merge_report_monitor: MergeReportMonitor | None = None
         self._postdispatch_monitor: PostDispatchStatusMonitor | None = None
+        self._recovery_payloads: list[dict[str, object]] = []
+        self._startup_recovery_prompted = False
+        self._last_display_line = ""
+        self._current_reference_id = ""
+        self._dispatch_final_outcome = ""
+        self._dispatch_pending_error: Exception | None = None
+        self._dispatch_pending_error_text = ""
 
         self._build_ui()
         self._set_connected_state(False)
@@ -213,6 +321,9 @@ class ReportsApp(ttk.Frame):
 
         self.reload_button = ttk.Button(top, text="Reload", command=self.on_reload_clicked, state="disabled")
         self.reload_button.pack(side="left", padx=(8, 0))
+
+        self.recover_button = ttk.Button(top, text="Recover", command=self.on_recover_clicked)
+        self.recover_button.pack(side="left", padx=(8, 0))
 
         # Spacer
         top_spacer = ttk.Label(top, style="Card.TLabel")
@@ -363,6 +474,7 @@ class ReportsApp(ttk.Frame):
         self.app_combo.configure(state=state_app)
         self.reload_button.configure(state=state_btn)
         self.send_button.configure(state=state_btn)
+        self.recover_button.configure(state="normal")
 
         if not connected:
             self.client = None
@@ -377,6 +489,8 @@ class ReportsApp(ttk.Frame):
 
     def _append_log(self, text: str) -> None:
         safe_text = redact_text(text)
+        if not safe_text.strip():
+            return
         runtime_level = "INFO"
         upper_text = safe_text.upper()
         if upper_text.startswith("ERROR") or " ERROR " in upper_text:
@@ -388,10 +502,22 @@ class ReportsApp(ttk.Frame):
         else:
             write_runtime_log(safe_text, level=runtime_level)
             write_debug_log(f"RUNTIME_UI {safe_text}", category="general")
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", safe_text + "\n")
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+        display_text = _operator_display_line(safe_text)
+        if not display_text:
+            return
+        for line in display_text.splitlines():
+            cleaned = line.strip()
+            if not cleaned:
+                continue
+            if cleaned == self._last_display_line:
+                continue
+            if cleaned.startswith("Reference ID: "):
+                self._current_reference_id = cleaned.split(":", 1)[1].strip()
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", cleaned + "\n")
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+            self._last_display_line = cleaned
 
     def _show_prompt(self, title: str, message: str, prompt_type: str = "info"):
         return show_modal_prompt(self.master, title, message, prompt_type)
@@ -420,6 +546,7 @@ class ReportsApp(ttk.Frame):
             self.server_combo.configure(state="disabled")
             self.app_combo.configure(state="disabled")
             self.reload_button.configure(state="disabled")
+            self.recover_button.configure(state="disabled")
             self.send_button.configure(state="disabled")
             self.frequency_combo.configure(state="disabled")
             self.no_change_chk.configure(state="disabled")
@@ -430,6 +557,34 @@ class ReportsApp(ttk.Frame):
             self.no_change_chk.configure(state="normal")
             self.on_no_change_toggled()
 
+    def _reset_run_scoped_state(self) -> tuple[int, int]:
+        stopped_monitors = 0
+        drained_events = 0
+        self._dispatch_final_outcome = ""
+        self._dispatch_pending_error = None
+        self._dispatch_pending_error_text = ""
+        if self._merge_report_monitor is not None:
+            try:
+                self._merge_report_monitor.stop()
+            except Exception:
+                pass
+            self._merge_report_monitor = None
+            stopped_monitors += 1
+        if self._postdispatch_monitor is not None:
+            try:
+                self._postdispatch_monitor.stop()
+            except Exception:
+                pass
+            self._postdispatch_monitor = None
+            stopped_monitors += 1
+        while True:
+            try:
+                self._dispatch_queue.get_nowait()
+                drained_events += 1
+            except queue.Empty:
+                break
+        return stopped_monitors, drained_events
+
     def _apply_search_filter(self) -> None:
         term = self.search_var.get().strip().lower()
         self.reports_list.delete(0, "end")
@@ -439,8 +594,139 @@ class ReportsApp(ttk.Frame):
                 self.reports_list.insert("end", name)
                 self.filtered_indices.append(idx)
 
+    def _load_recovery_payloads(self, *, announce: bool) -> list[dict[str, object]]:
+        payloads, lines = inspect_unfinished_batch_journals()
+        self._recovery_payloads = [dict(item) for item in payloads if isinstance(item, dict)]
+        if announce:
+            for line in lines:
+                self._append_log(line)
+            if self._recovery_payloads:
+                self._append_log(
+                    "Recovery journal detected. Use Recover to inspect, reconcile/finalize, or dismiss/archive unfinished work."
+                )
+        return list(self._recovery_payloads)
+
+    def _recovery_prompt_message(self, payload: dict[str, object]) -> str:
+        batch_id = str(payload.get("batch_id") or "unknown-batch").strip()
+        batch_state = str(payload.get("batch_state") or "UNKNOWN").strip()
+        report_names = payload.get("report_names") or []
+        invalid_reason = str(payload.get("invalid_reason") or "").strip()
+        if isinstance(report_names, list):
+            reports_text = ", ".join(str(name) for name in report_names if str(name).strip()) or "(unknown)"
+        else:
+            reports_text = "(unknown)"
+        action_hint = (
+            "Choose Reconcile to run a bounded finalize sweep using the current Splunk connection."
+            if self.client is not None
+            else "Connect first if you want the tool to reconcile/finalize against Splunk."
+        )
+        if bool(payload.get("invalid_journal")):
+            return (
+                "Recovery journal detected.\n\n"
+                f"Reference ID: {batch_id}\n"
+                f"State: {batch_state}\n"
+                f"Recovery journal issue: {invalid_reason or 'invalid or incompatible journal'}\n\n"
+                "Use Inspect to review the situation or Dismiss to archive the invalid journal."
+            )
+        return (
+            f"Recovery journal detected.\n\n"
+            f"Reference ID: {batch_id}\n"
+            f"State: {batch_state}\n"
+            f"Reports: {reports_text}\n"
+            f"{action_hint}"
+        )
+
+    def _run_recovery_action(self, payload: dict[str, object], action: str) -> None:
+        action_name = str(action or "").strip().lower()
+        if action_name == "later":
+            self._append_log("Recovery action deferred by operator.")
+            return
+        if action_name == "reconcile" and self.client is None:
+            self._append_log("Recovery reconcile requires an active Splunk connection. Connect first, then retry Recover.")
+            self._show_prompt(
+                "Recovery requires connection",
+                "Connect to Splunk before using reconcile/finalize on an unfinished journal.",
+                "info",
+            )
+            return
+
+        def _task(set_status: Callable[[str], None]):
+            if action_name == "reconcile":
+                set_status("Reconciling unfinished batch...")
+            elif action_name == "dismiss":
+                set_status("Archiving unfinished batch journal...")
+            else:
+                set_status("Inspecting unfinished batch journal...")
+            return recover_unfinished_batch_journal(
+                client=self.client if action_name == "reconcile" else None,
+                journal_payload=payload,
+                action=action_name,
+                wait_seconds=resolve_status_check_timeout_seconds(self.cfg),
+                poll_interval=resolve_status_check_poll_seconds(self.cfg),
+                prefer_merge_report_verification=resolve_primary_slice_mergereport_enabled(self.cfg),
+                merge_report_log_path=self.cfg.merge_report_log_path,
+                merge_report_settings=resolve_merge_report_runtime_settings(self.cfg),
+            )
+
+        def _on_success(result: object) -> None:
+            lines = result if isinstance(result, list) else []
+            for line in lines:
+                self._append_log(str(line))
+            self._load_recovery_payloads(announce=False)
+
+        def _on_error(exc: Exception) -> None:
+            self._append_log(f"Recovery action failed: {redact_text(str(exc))}")
+            self._show_prompt(
+                "Recovery error",
+                "Recovery action failed. Review the activity log for details.",
+                "error",
+            )
+
+        if action_name == "inspect":
+            _on_success(_task(lambda _text: None))
+            return
+
+        run_with_progress(
+            self.master,
+            "Recovery",
+            "Processing recovery action...",
+            _task,
+            on_success=_on_success,
+            on_error=_on_error,
+        )
+
     def _startup_connectivity_check(self) -> None:
-        return
+        payloads = self._load_recovery_payloads(announce=True)
+        if payloads and not self._startup_recovery_prompted:
+            self._startup_recovery_prompted = True
+            self.after(50, self.on_recover_clicked)
+
+    def on_recover_clicked(self) -> None:
+        payloads = self._load_recovery_payloads(announce=False)
+        if not payloads:
+            self._append_log("No unfinished recovery journals detected.")
+            self._show_prompt("Recovery", "No unfinished recovery journals were found.", "info")
+            return
+
+        payload = payloads[0]
+        choices = [
+            ("inspect", "Inspect/report"),
+            ("dismiss", "Dismiss/archive"),
+        ]
+        if self.client is not None:
+            choices.insert(0, ("reconcile", "Reconcile/finalize"))
+        else:
+            choices.append(("later", "Later"))
+        action = show_choice_prompt(
+            self.master,
+            "Recovery journal detected",
+            self._recovery_prompt_message(payload),
+            choices,
+            default_value="later",
+        )
+        if not action:
+            action = "later"
+        self._run_recovery_action(payload, action)
 
     # --------------- Event handlers ---------------
 
@@ -589,8 +875,9 @@ class ReportsApp(ttk.Frame):
     ) -> None:
         def log_callback(line: str) -> None:
             self._dispatch_queue.put(("log", line))
-            if status_callback and line.strip():
-                status_callback(line.strip()[:120])
+            friendly = _operator_display_line(line)
+            if status_callback and friendly:
+                status_callback(friendly.splitlines()[0][:120])
 
         def sid_callback(sid: str, search_name: str) -> None:
             # Register SID with MergeReport monitor if enabled
@@ -601,10 +888,53 @@ class ReportsApp(ttk.Frame):
                 self._postdispatch_monitor.register_sid(sid, search_name)
 
         try:
-            run_dispatch_multi(log_callback=log_callback, sid_callback=sid_callback, config=self.cfg, **params)
-            self._dispatch_queue.put(("done", None))
+            logs = run_dispatch_multi(log_callback=log_callback, sid_callback=sid_callback, config=self.cfg, **params)
+            self._dispatch_queue.put(
+                (
+                    "done",
+                    {
+                        "final_outcome": _dispatch_final_outcome_from_log_lines(logs),
+                    },
+                )
+            )
         except Exception as e:
             self._dispatch_queue.put(("err", e))
+
+    def _finalize_dispatch_ui_result(self) -> None:
+        final_outcome = str(self._dispatch_final_outcome or "").strip().lower()
+        pending_error = self._dispatch_pending_error
+        safe_error = str(self._dispatch_pending_error_text or "").strip()
+        show_modal = _should_show_dispatch_terminal_error(final_outcome, pending_error)
+        self._append_log(
+            f"[Debug] UI_DISPATCH_MODAL_DECISION final_outcome={final_outcome or '-'} "
+            f"pending_error={bool(pending_error)} show_modal={show_modal}"
+        )
+        if pending_error is None:
+            return
+        if not show_modal:
+            self._append_log(
+                f"[Debug] UI_DISPATCH_ERROR_SUPPRESSED final_outcome={final_outcome or '-'} "
+                f"detail={safe_error or '-'}"
+            )
+            return
+        if "overlapping local batch is still active" in safe_error.lower():
+            self._append_log("Blocked by overlap lock. Resolve or dismiss the unfinished batch journal before rerunning the same report/window.")
+            self._load_recovery_payloads(announce=True)
+        self._append_log(f"[Debug] UI_DISPATCH_ERROR detail={safe_error}")
+        if self._current_reference_id and not final_outcome:
+            self._append_log("The report could not be started.")
+            self._append_log("Please contact the Splunk team and provide:")
+            self._append_log(f"Reference ID: {self._current_reference_id}")
+        self._show_prompt(
+            "Dispatch error",
+            (
+                "The report could not be completed.\n\n"
+                f"Reference ID: {self._current_reference_id}"
+                if self._current_reference_id
+                else "The report could not be completed. Review the runtime logs for details."
+            ),
+            "error",
+        )
 
     def _poll_dispatch_queue(self) -> None:
         done = False
@@ -629,26 +959,23 @@ class ReportsApp(ttk.Frame):
                 # Internal post-dispatch error (won't crash the dispatch)
                 self._append_log(f"[PostDispatch Monitor Error] {payload}")
             elif status == "err":
-                self._append_log(f"ERROR during dispatch: {redact_text(str(payload))}")
-                self._show_prompt(
-                    "Dispatch error",
-                    "Error while dispatching reports. Review security audit logs for details.",
-                    "error",
-                )
+                safe_error = redact_text(str(payload))
+                self._dispatch_pending_error = payload if isinstance(payload, Exception) else RuntimeError(safe_error)
+                self._dispatch_pending_error_text = safe_error
+                self._append_log(f"[Debug] UI_DISPATCH_ERROR_CAPTURED detail={safe_error}")
                 done = True
             elif status == "done":
+                if isinstance(payload, dict):
+                    self._dispatch_final_outcome = str(payload.get("final_outcome") or "").strip()
+                self._append_log(
+                    f"[Debug] UI_DISPATCH_DONE final_outcome={self._dispatch_final_outcome or '-'}"
+                )
                 done = True
 
         if done:
+            self._finalize_dispatch_ui_result()
             self._set_dispatch_state(False)
-            # Stop MergeReport monitor if it was running
-            if self._merge_report_monitor is not None:
-                self._merge_report_monitor.stop()
-                self._merge_report_monitor = None
-            # Post-dispatch monitor disabled (not needed for simple summary)
-            if self._postdispatch_monitor is not None:
-                self._postdispatch_monitor.stop()
-                self._postdispatch_monitor = None
+            self._reset_run_scoped_state()
         elif self._dispatch_in_progress:
             self.after(150, self._poll_dispatch_queue)
 
@@ -694,6 +1021,10 @@ class ReportsApp(ttk.Frame):
             return
         if self._dispatch_in_progress:
             self._show_prompt("Dispatch running", "A dispatch is already in progress.", "info")
+            return
+        if self._load_recovery_payloads(announce=True):
+            self._append_log("Recovery journal detected. Resolve unfinished work before starting a new overlapping batch.")
+            self.on_recover_clicked()
             return
 
         # Selected reports
@@ -791,14 +1122,26 @@ class ReportsApp(ttk.Frame):
             f"Sending {len(selected_indices)} report(s) - frequency={frequency}, "
             f"range={start} -> {end}, no_change={no_change}"
         )
+        self._last_display_line = ""
+        self._current_reference_id = ""
+        stopped_monitors, drained_events = self._reset_run_scoped_state()
+        if stopped_monitors > 0 or drained_events > 0:
+            self._append_log(
+                f"[Debug] RUN_UI_STATE_RESET stopped_monitors={stopped_monitors} drained_events={drained_events}"
+            )
 
-        # Initialize MergeReport monitor if enabled
-        if self.cfg.merge_report_enabled and self.cfg.merge_report_log_path:
+        merge_report_settings = resolve_merge_report_runtime_settings(self.cfg)
+
+        # Initialize optional local MergeReport file monitor only when this host can read the file.
+        if bool(merge_report_settings.get("enabled")) and bool(merge_report_settings.get("local_file_available")):
             try:
                 self._merge_report_monitor = MergeReportMonitor(
-                    log_path=self.cfg.merge_report_log_path,
+                    log_path=str(merge_report_settings.get("local_file_path", "") or ""),
                     ui_queue=self._dispatch_queue,
-                    timeout_seconds=self.cfg.merge_report_timeout_seconds,
+                    timeout_seconds=int(
+                        merge_report_settings.get("timeout_seconds", self.cfg.merge_report_timeout_seconds)
+                        or self.cfg.merge_report_timeout_seconds
+                    ),
                 )
                 self._merge_report_monitor.start()
                 self._append_log("[MergeReport] Monitor started.")
@@ -806,10 +1149,16 @@ class ReportsApp(ttk.Frame):
                 self._append_log(f"[MergeReport] WARNING: Could not start monitor: {redact_text(str(e))}")
                 self._merge_report_monitor = None
         else:
-            if self.cfg.merge_report_enabled and not self.cfg.merge_report_log_path:
+            if bool(merge_report_settings.get("enabled")):
                 self._append_log(
-                    "[MergeReport] WARNING: enabled but log_path not configured; skipping"
+                    (
+                        f"[Debug] MERGEREPORT_FILE_UNAVAILABLE local_path="
+                        f"{str(merge_report_settings.get('requested_log_path', '') or '(blank)')} "
+                        f"reason={str(merge_report_settings.get('local_file_reason', '') or 'unknown')} "
+                        "falling back to non-file verification"
+                    )
                 )
+                self._append_log("[MergeReport] Local file monitor skipped; non-file verification remains active.")
             self._merge_report_monitor = None
 
         # Initialize post-dispatch status monitor if enabled (Phase 2)
@@ -839,11 +1188,6 @@ class ReportsApp(ttk.Frame):
             "poll_interval": resolve_status_check_poll_seconds(self.cfg),
             "app": self.app_var.get().strip(),
         }
-        while True:
-            try:
-                self._dispatch_queue.get_nowait()
-            except queue.Empty:
-                break
         self._set_dispatch_state(True)
         self.after(150, self._poll_dispatch_queue)
 

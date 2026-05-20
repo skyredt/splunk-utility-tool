@@ -39,6 +39,8 @@ def run_with_progress(
     *,
     on_success: Optional[Callable[[object], None]] = None,
     on_error: Optional[Callable[[Exception], None]] = None,
+    on_cancel_request: Optional[Callable[[Callable[[str], None]], None]] = None,
+    cancel_button_text: str = "Cancel",
 ) -> None:
     overlay = create_overlay(parent)
     dialog = tk.Toplevel(parent)
@@ -67,6 +69,13 @@ def run_with_progress(
     status_lbl.pack(fill="x", pady=(0, 10))
     bar = ttk.Progressbar(frame, mode="indeterminate", length=320)
     bar.pack(fill="x")
+    if on_cancel_request is not None:
+        button_row = ttk.Frame(frame, style="Dialog.TFrame")
+        button_row.pack(fill="x", pady=(12, 0))
+        cancel_btn = ttk.Button(button_row, text=cancel_button_text)
+        cancel_btn.pack(side="right")
+    else:
+        cancel_btn = None
 
     _center_dialog(parent, dialog)
     dialog.grab_set()
@@ -106,6 +115,17 @@ def run_with_progress(
         if dialog.winfo_exists():
             dialog.destroy()
         remove_overlay(overlay)
+
+    def _handle_cancel() -> None:
+        if on_cancel_request is None:
+            return
+        try:
+            on_cancel_request(_status_update)
+        except Exception as exc:
+            logger.error("Cancel handler failed: %s", type(exc).__name__)
+
+    if cancel_btn is not None:
+        cancel_btn.configure(command=_handle_cancel)
 
     def _poll() -> None:
         if not dialog.winfo_exists():

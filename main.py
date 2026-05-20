@@ -1,4 +1,4 @@
-"""Launcher for Splunk Utility Tool v4 (Tkinter).
+"""Launcher for CIO Splunk Utility Tool 4.0 (Tkinter).
 
 This launcher calls the Tk-based GUI implemented in `splunk_report_tk.py`.
 It intentionally avoids Qt/PySide6 so the tool can run on Windows machines

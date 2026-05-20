@@ -145,6 +145,11 @@ class MergeReportMonitor:
                 "last_seen_time": time.time(),
             }
 
+    def unregister_sid(self, sid: str) -> None:
+        """Stop tracking a SID once terminal MergeReport activity has been observed."""
+        with self._lock:
+            self.tracked_sids.pop(str(sid or ""), None)
+
     def start(self) -> None:
         """Start monitoring the log file."""
         if self._monitor_thread is not None and self._monitor_thread.is_alive():
@@ -160,6 +165,8 @@ class MergeReportMonitor:
         self.tailer.stop()
         if self._monitor_thread is not None:
             self._monitor_thread.join(timeout=2.0)
+        with self._lock:
+            self.tracked_sids.clear()
 
     def _run(self) -> None:
         """Background thread loop: consume tailer lines and emit events."""
@@ -196,6 +203,13 @@ class MergeReportMonitor:
         # Emit to UI queue
         ui_line = event.format_for_ui()
         self.ui_queue.put(("mergereport", ui_line))
+        lower_message = str(event.message or "").lower()
+        if (
+            "app excution completed" in lower_message
+            or "app execution completed" in lower_message
+            or event.level == "ERROR"
+        ):
+            self.unregister_sid(event.sid)
 
     def _check_timeouts(self) -> None:
         """Emit 'no activity' warnings for SIDs that haven't been seen recently."""

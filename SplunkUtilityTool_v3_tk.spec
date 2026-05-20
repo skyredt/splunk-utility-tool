@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec for Splunk Utility Tool v4 (Tkinter version).
+PyInstaller spec for CIO Splunk Utility Tool 4.0 (Tkinter version).
 
 Recommended for hardened production environments:
 - Tk-only (no PySide6/Qt)

@@ -89,6 +89,7 @@ SECURITY_ALWAYS_EVENTS = {
     "POLICY_BREAK_GLASS_USED",
     "HARDENING_REVERSAL_BLOCKED",
     "HARDENING_BASELINE_UPDATED",
+    "BASELINE_BOOTSTRAPPED",
 }
 
 # Try to import zoneinfo for proper SGT timezone handling (Python 3.9+)

@@ -1,4 +1,4 @@
-Splunk Utility Tool v4
+CIO Splunk Utility Tool 4.0
 
 Files
 - `main.py`: launcher and internal broker entry points
@@ -28,13 +28,28 @@ Canonical INI Rules
 Pilot Dispatch Defaults
 - `[dispatch]` uses a 30 second active wait budget per slice
 - Timeout after a valid SID becomes `PENDING`, not `FAILED`
-- `[postdispatch]` performs one bounded reconciliation pass after submission
+- `[postdispatch]` performs bounded stage 1 direct SID checks followed by bounded stage 2 targeted confirmation only for inconclusive items
 - `[email]` keeps acknowledgement email enabled by default
+- `[runtime]` performs one lightweight backend reconnect attempt after stale-session detection, then resets safely to the main menu if recovery fails
+- `Use saved search time range` now resolves from the saved search's actual `dispatch.earliest_time` and `dispatch.latest_time` values and reuses that same resolved range in dispatch, logs, and acknowledgement content
+- The execution progress dialog includes `Cancel`, which terminates tracked current-batch SIDs and stops the local batch workflow
+
+Runtime And Debug Logs
+- `[Logging].runtime_log_*` writes a concise operational log to `Internal/logs/runtime.log`
+- `[Logging].debug_log_*` writes broker/REST/dispatch diagnostics to `Internal/logs/debug.log`
+- `debug_broker_enabled`, `debug_rest_enabled`, `debug_dispatch_enabled`, and `debug_tracebacks_enabled` control verbose troubleshooting categories independently
+- Runtime and debug logs rotate with the same `max_bytes` and `backup_count` limits used for audit logging
+- Template defaults keep debug logging disabled for production-style runs; set the debug flags explicitly during test investigations
 
 Hardening Errors
 - `Configuration error`: missing template, malformed INI, duplicate sections/keys, or unsupported formatting
 - `Security policy blocked startup`: valid config parsed, but hardening settings violate policy
 - `Security configuration blocked`: baseline downgrade detected after config and policy loaded successfully
+
+Testing Notes
+- Set `[runtime].test_mode = true` to keep the extra recovery/cancel/time-range debug instrumentation visible during validation.
+- For backend stale-state testing, `[runtime].simulate_stale_backend_once = true` forces the next UI health check to exercise the reconnect/reset path.
+- Post-dispatch outcomes are conservative by design: `Success` and `Failed` require explicit evidence; bounded inconclusive results remain `Pending`.
 
 Validation
 - `python -m unittest test_config_runtime_behavior.py`

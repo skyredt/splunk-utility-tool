@@ -152,6 +152,30 @@ class PostDispatchStatusMonitor:
             clauses.append(f'("SID={sid}" OR "sid={sid}" OR "sid=\\"{sid}\\"")'.replace('"', '"'))
         return " OR ".join(clauses)
 
+    @staticmethod
+    def _prepare_export_search(search_query: str) -> str:
+        normalized = str(search_query or "").strip()
+        if not normalized:
+            return normalized
+        lower = normalized.lower()
+        if lower.startswith(("search ", "|", "from ", "tstats ", "datamodel ", "makeresults ")):
+            return normalized
+        return f"search {normalized}"
+
+    @staticmethod
+    def _classify_search_error(exc: Exception) -> tuple[str, str]:
+        message = str(exc or "").strip() or repr(exc)
+        lower = message.lower()
+        if "unknown search command 'index'" in lower or 'unknown search command "index"' in lower:
+            return (
+                "malformed_spl",
+                (
+                    "Malformed SPL sent to /services/search/jobs/export. "
+                    "The search must start with the 'search' command."
+                ),
+            )
+        return ("search_error", message)
+
     def _poll_merge_report(self, sids: list[str], sid_or_clause: str) -> None:
         """Poll for MergeReport verification events."""
         config = self.config
@@ -165,7 +189,7 @@ class PostDispatchStatusMonitor:
         if config.get("merge_report_sourcetype"):
             search_parts.append(f'sourcetype="{config["merge_report_sourcetype"]}"')
 
-        search_query = " ".join(search_parts)
+        search_query = self._prepare_export_search(" ".join(search_parts))
 
         # Determine earliest
         earliest = self._get_earliest("merge_report")
@@ -188,7 +212,8 @@ class PostDispatchStatusMonitor:
             self._last_search_time = time.time()
 
         except Exception as e:
-            self.ui_queue.put(("postdispatch_error", f"MergeReport search failed: {e}"))
+            error_code, detail = self._classify_search_error(e)
+            self.ui_queue.put(("postdispatch_error", f"MergeReport search failed [{error_code}]: {detail}"))
 
     def _poll_native_email(self, sids: list[str], sid_or_clause: str) -> None:
         """Poll for native email verification events."""
@@ -204,7 +229,7 @@ class PostDispatchStatusMonitor:
         if config.get("native_email_sourcetype"):
             search_parts.append(f'sourcetype="{config["native_email_sourcetype"]}"')
 
-        search_query = " ".join(search_parts)
+        search_query = self._prepare_export_search(" ".join(search_parts))
 
         # Determine earliest
         earliest = self._get_earliest("native_email")
@@ -227,7 +252,8 @@ class PostDispatchStatusMonitor:
             self._last_search_time = time.time()
 
         except Exception as e:
-            self.ui_queue.put(("postdispatch_error", f"Native email search failed: {e}"))
+            error_code, detail = self._classify_search_error(e)
+            self.ui_queue.put(("postdispatch_error", f"Native email search failed [{error_code}]: {detail}"))
 
     def _get_earliest(self, channel: str) -> str:
         """Get earliest time for search (incremental)."""

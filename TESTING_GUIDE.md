@@ -24,6 +24,45 @@ The tool has started without errors:
 
 ## Testing Checklist
 
+## Validation Scenarios
+
+### 1. Idle Reconnect / Stale Session
+- [ ] Start the tool and connect normally
+- [ ] Leave the tool idle until the old stale-session behaviour would normally appear
+- [ ] Click `Reload` or try another connected action
+- [ ] Expected: one reconnect attempt occurs
+- [ ] Expected: either the tool reconnects and returns to a usable idle state, or it clears stale state and returns to the main menu
+- [ ] Expected: the UI never stays stuck in a broken state
+
+### 2. Saved Search Time Range Resolution
+- [ ] Select `Use saved search time range (no override)` for a weekly report and a monthly report
+- [ ] Confirm the prompt shows the exact resolved window(s) from Splunk saved-search configuration
+- [ ] Verify the same resolved window is present in dispatch logs, slice summaries, and acknowledgement content
+- [ ] Expected debug lines:
+  - `Saved search dispatch.earliest_time`
+  - `Saved search dispatch.latest_time`
+  - `Resolved earliest`
+  - `Resolved latest`
+  - `Final display range`
+
+### 3. Post-Dispatch Verification
+- [ ] Validate an explicit success case -> final slice status becomes `OK`
+- [ ] Validate an explicit failure case -> final slice status becomes `FAILED`
+- [ ] Validate an inconclusive case -> final slice status remains `PENDING`
+- [ ] Confirm logs show `Stage 1 result` and `Stage 2 result` lines
+- [ ] Confirm no indefinite waiting occurs
+
+### 4. Cancel Workflow
+- [ ] Start a batch with multiple slices
+- [ ] Click `Cancel`, choose `No - Continue Execution`, and confirm the batch resumes
+- [ ] Click `Cancel` again, choose `Yes - Terminate Jobs`
+- [ ] Confirm the tool stops dispatching new work, terminates tracked current-batch SIDs, and returns to the main menu
+
+### 5. Test-Friendly Runtime Controls
+- [ ] Set `[runtime].test_mode = true` for additional debug instrumentation
+- [ ] Optional: set `[runtime].simulate_stale_backend_once = true` to force the next health check down the reconnect/reset path
+- [ ] Lower `[postdispatch]` and `[dispatch]` timers in the test INI to validate bounded behaviour quickly
+
 ### Phase 1: Basic Functionality (MergeReport File Monitoring)
 
 #### Test 1: Connect to Splunk Server

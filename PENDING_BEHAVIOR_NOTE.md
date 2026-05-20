@@ -1,6 +1,6 @@
 ## Pending Slice Behavior
 
-Splunk Utility Tool v4 now uses a bounded active wait per slice.
+CIO Splunk Utility Tool 4.0 now uses a bounded active wait per slice.
 
 - The tool waits up to `per_slice_wait_seconds` for active confirmation after a SID is issued.
 - If Splunk explicitly reports a failed state, the slice is marked `FAILED`.

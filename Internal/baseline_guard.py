@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import getpass
 import hashlib
 import json
 import os
@@ -27,6 +28,111 @@ def fingerprint_hash(fingerprint: dict) -> str:
     return hashlib.sha256(_canonical_payload_bytes(fingerprint)).hexdigest()
 
 
+def _canonical_path(path_value: str) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(path_value)))
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _current_user_scope_hash() -> str:
+    domain = os.environ.get("USERDOMAIN", "").strip()
+    username = ""
+    try:
+        username = getpass.getuser().strip()
+    except Exception:
+        username = ""
+    if not username:
+        username = os.environ.get("USERNAME", "").strip() or os.environ.get("USER", "").strip()
+    identity = f"{domain}\\{username}".strip("\\") or "unknown-user"
+    return _sha256_text(identity)[:16]
+
+
+def _install_root_hash(exe_dir: str) -> str:
+    return _sha256_text(_canonical_path(exe_dir))[:16]
+
+
+def _local_appdata_tool_root() -> str:
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if not local_app_data:
+        return ""
+    return _canonical_path(os.path.join(local_app_data, "SplunkUtilityTool"))
+
+
+def _is_subpath(path_value: str, parent_value: str) -> bool:
+    if not path_value or not parent_value:
+        return False
+    try:
+        return os.path.commonpath([path_value, parent_value]) == parent_value
+    except ValueError:
+        return False
+
+
+def _approved_current_user_artifact_roots(exe_dir: Optional[str]) -> list[str]:
+    roots: list[str] = []
+    if exe_dir:
+        exe_root = _canonical_path(exe_dir)
+        roots.append(exe_root)
+        roots.append(_canonical_path(os.path.join(exe_root, "Internal")))
+    local_tool_root = _local_appdata_tool_root()
+    if local_tool_root:
+        roots.append(local_tool_root)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        if root and root not in seen:
+            seen.add(root)
+            deduped.append(root)
+    return deduped
+
+
+def _temp_roots() -> list[str]:
+    candidates = [
+        os.environ.get("TEMP", "").strip(),
+        os.environ.get("TMP", "").strip(),
+        os.path.join(os.environ.get("LOCALAPPDATA", "").strip(), "Temp"),
+        r"C:\Windows\Temp",
+    ]
+    roots: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        canonical = _canonical_path(candidate)
+        if canonical not in seen:
+            seen.add(canonical)
+            roots.append(canonical)
+    return roots
+
+
+def _looks_user_profile_path(path_value: str) -> bool:
+    value = (path_value or "").replace("/", "\\").lower()
+    return ("\\users\\" in value) or ("\\appdata\\" in value) or ("\\local\\temp\\" in value)
+
+
+def _infer_exe_dir_from_fingerprint(current: dict) -> Optional[str]:
+    for raw_path in current.get("allowed_artifact_roots", []):
+        candidate = _canonical_path(str(raw_path))
+        if os.path.basename(candidate).lower() == "internal":
+            return os.path.dirname(candidate)
+    return None
+
+
+def _artifact_root_is_weaker(path_value: str, *, exe_dir: Optional[str]) -> bool:
+    candidate = _canonical_path(path_value)
+    approved_roots = _approved_current_user_artifact_roots(exe_dir)
+    if any(_is_subpath(candidate, approved_root) for approved_root in approved_roots):
+        return False
+    if any(_is_subpath(candidate, temp_root) for temp_root in _temp_roots()):
+        return True
+    return _looks_user_profile_path(candidate)
+
+
+def _scoped_baseline_path(root_dir: str, install_root_hash: str, user_scope_hash: str) -> str:
+    return os.path.join(root_dir, "baseline", install_root_hash, user_scope_hash, BASELINE_FILENAME)
+
+
 def build_security_fingerprint(
     *,
     tool_version: str,
@@ -36,9 +142,13 @@ def build_security_fingerprint(
     logging_backup_count: int,
 ) -> dict:
     allowed_roots = [
-        os.path.normcase(os.path.realpath(os.path.join(policy.exe_dir, "Internal"))),
-        os.path.normcase(os.path.realpath(FIXED_PROGRAMDATA_ROOT)),
+        _canonical_path(policy.exe_dir),
+        _canonical_path(os.path.join(policy.exe_dir, "Internal")),
+        _canonical_path(FIXED_PROGRAMDATA_ROOT),
     ]
+    local_tool_root = _local_appdata_tool_root()
+    if local_tool_root:
+        allowed_roots.append(local_tool_root)
     return {
         "tool_version": tool_version,
         "build_mode": policy.build_mode,
@@ -59,14 +169,9 @@ def build_security_fingerprint(
     }
 
 
-def _looks_user_profile_path(path_value: str) -> bool:
-    value = (path_value or "").replace("/", "\\").lower()
-    return ("\\users\\" in value) or ("\\appdata\\" in value) or ("\\local\\temp\\" in value)
-
-
-def is_weaker_fingerprint(previous: dict, current: dict) -> bool:
+def is_weaker_fingerprint(previous: dict, current: dict, *, exe_dir: Optional[str] = None) -> bool:
     if not previous:
-        return True
+        return False
     if previous.get("build_mode", "production") == "production" and current.get("build_mode") != "production":
         return True
     if current.get("policy_mode") == "permissive":
@@ -83,8 +188,9 @@ def is_weaker_fingerprint(previous: dict, current: dict) -> bool:
         return True
     if not bool(current.get("audit_min_retention_ok")):
         return True
+    current_exe_dir = exe_dir or _infer_exe_dir_from_fingerprint(current)
     for path_value in current.get("allowed_artifact_roots", []):
-        if _looks_user_profile_path(str(path_value)):
+        if _artifact_root_is_weaker(str(path_value), exe_dir=current_exe_dir):
             return True
     required_events = set(SECURITY_ALWAYS_EVENTS)
     current_events = set(current.get("audit_always_events", []))
@@ -95,18 +201,16 @@ def is_weaker_fingerprint(previous: dict, current: dict) -> bool:
 
 def _resolve_baseline_candidates(
     exe_dir: str,
-    *,
-    is_production: bool,
-    allow_local_appdata: bool,
 ) -> list[str]:
+    install_root_hash = _install_root_hash(exe_dir)
+    user_scope_hash = _current_user_scope_hash()
     candidates = [
-        os.path.join(exe_dir, "Internal", BASELINE_FILENAME),
-        os.path.join(FIXED_PROGRAMDATA_ROOT, BASELINE_FILENAME),
+        _scoped_baseline_path(os.path.join(exe_dir, "Internal"), install_root_hash, user_scope_hash),
+        _scoped_baseline_path(FIXED_PROGRAMDATA_ROOT, install_root_hash, user_scope_hash),
     ]
-    if (not is_production) and allow_local_appdata:
-        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
-        if local_app_data:
-            candidates.append(os.path.join(local_app_data, "SplunkUtilityTool", BASELINE_FILENAME))
+    local_tool_root = _local_appdata_tool_root()
+    if local_tool_root:
+        candidates.append(_scoped_baseline_path(local_tool_root, install_root_hash, user_scope_hash))
     return candidates
 
 
@@ -159,15 +263,20 @@ def _save_baseline(
     baseline_hash: str,
     config_hash: str,
     fingerprint: dict,
+    scope_user: str,
+    install_root_hash: str,
     created_at: Optional[str] = None,
 ) -> None:
     now = _utc_now_iso()
     payload = {
+        "baseline_scope_version": 2,
         "baseline_hash": baseline_hash,
         "created_at": created_at or now,
         "last_seen_at": now,
         "last_seen_hash": baseline_hash,
         "config_hash": config_hash,
+        "scope_user": scope_user,
+        "install_root_hash": install_root_hash,
         "baseline_fingerprint": fingerprint,
     }
     parent = os.path.dirname(path)
@@ -192,12 +301,9 @@ def enforce_security_baseline(
     audit_event_fn: Optional[Callable[..., None]] = None,
 ) -> tuple[bool, str]:
     current_hash = fingerprint_hash(fingerprint)
-    allow_local_appdata = (not policy.is_production) and policy.insecure_overrides_active
-    candidates = _resolve_baseline_candidates(
-        exe_dir,
-        is_production=policy.is_production,
-        allow_local_appdata=allow_local_appdata,
-    )
+    scope_user = _current_user_scope_hash()
+    install_root_hash = _install_root_hash(exe_dir)
+    candidates = _resolve_baseline_candidates(exe_dir)
     existing = _first_existing(candidates)
     prior_indicator = _has_prior_baseline_indicator(candidates)
 
@@ -238,8 +344,32 @@ def enforce_security_baseline(
             return False, "Security baseline file is invalid."
         baseline_hash = str(record.get("baseline_hash", "")).strip()
         previous_fp = record.get("baseline_fingerprint", {})
+        previous_fp_dict = previous_fp if isinstance(previous_fp, dict) else {}
+        created_at = str(record.get("created_at", "")).strip() or None
+        if not previous_fp_dict:
+            _save_baseline(
+                path=existing,
+                baseline_hash=current_hash,
+                config_hash=config_hash,
+                fingerprint=fingerprint,
+                scope_user=scope_user,
+                install_root_hash=install_root_hash,
+                created_at=created_at,
+            )
+            _audit(
+                "BASELINE_BOOTSTRAPPED",
+                level="INFO",
+                baseline_path=existing,
+                scope_user=scope_user,
+                install_root_hash=install_root_hash,
+                reason="missing_prior_fingerprint",
+            )
+            consumed_ok, consumed_msg = _consume_break_glass_if_needed()
+            if not consumed_ok:
+                return False, consumed_msg
+            return True, "baseline_bootstrapped"
         if baseline_hash and baseline_hash != current_hash:
-            weaker = is_weaker_fingerprint(previous_fp if isinstance(previous_fp, dict) else {}, fingerprint)
+            weaker = is_weaker_fingerprint(previous_fp_dict, fingerprint, exe_dir=exe_dir)
             if policy.is_production and weaker:
                 if not policy.break_glass_token.valid:
                     _audit("HARDENING_REVERSAL_BLOCKED", level="ERROR", reason="weaker_fingerprint_without_breakglass")
@@ -259,7 +389,9 @@ def enforce_security_baseline(
                     baseline_hash=current_hash,
                     config_hash=config_hash,
                     fingerprint=fingerprint,
-                    created_at=str(record.get("created_at", "")).strip() or None,
+                    scope_user=scope_user,
+                    install_root_hash=install_root_hash,
+                    created_at=created_at,
                 )
                 _audit(
                     "HARDENING_BASELINE_UPDATED",
@@ -276,7 +408,9 @@ def enforce_security_baseline(
                 baseline_hash=current_hash,
                 config_hash=config_hash,
                 fingerprint=fingerprint,
-                created_at=str(record.get("created_at", "")).strip() or None,
+                scope_user=scope_user,
+                install_root_hash=install_root_hash,
+                created_at=created_at,
             )
             _audit(
                 "HARDENING_BASELINE_UPDATED",
@@ -293,7 +427,9 @@ def enforce_security_baseline(
             baseline_hash=current_hash,
             config_hash=config_hash,
             fingerprint=fingerprint,
-            created_at=str(record.get("created_at", "")).strip() or None,
+            scope_user=scope_user,
+            install_root_hash=install_root_hash,
+            created_at=created_at,
         )
         consumed_ok, consumed_msg = _consume_break_glass_if_needed()
         if not consumed_ok:
@@ -314,9 +450,19 @@ def enforce_security_baseline(
         baseline_hash=current_hash,
         config_hash=config_hash,
         fingerprint=fingerprint,
+        scope_user=scope_user,
+        install_root_hash=install_root_hash,
         created_at=None,
+    )
+    _audit(
+        "BASELINE_BOOTSTRAPPED",
+        level="INFO",
+        baseline_path=target,
+        scope_user=scope_user,
+        install_root_hash=install_root_hash,
+        reason="new_scope",
     )
     consumed_ok, consumed_msg = _consume_break_glass_if_needed()
     if not consumed_ok:
         return False, consumed_msg
-    return True, "baseline_created"
+    return True, "baseline_bootstrapped"

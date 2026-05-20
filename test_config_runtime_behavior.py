@@ -43,6 +43,25 @@ BASE_TEMPLATE = textwrap.dedent(
     verbose = false
     max_bytes = 10485760
     backup_count = 10
+    runtime_log_enabled = 1
+    runtime_log_level = INFO
+    runtime_log_path = Internal/logs/runtime.log
+    debug_log_enabled = 0
+    debug_log_level = DEBUG
+    debug_log_path = Internal/logs/debug.log
+    debug_broker_enabled = 0
+    debug_rest_enabled = 0
+    debug_dispatch_enabled = 0
+    debug_tracebacks_enabled = 0
+
+    [runtime]
+    test_mode = false
+    backend_health_timeout_seconds = 8
+    backend_reconnect_enabled = true
+    simulate_stale_backend_once = false
+
+    [diagnostics]
+    snapshot_probe_enabled = 0
 
     [dispatch]
     per_slice_wait_seconds = 30
@@ -63,6 +82,10 @@ BASE_TEMPLATE = textwrap.dedent(
     from_addr = Splunk Notification <splunk-donotreply@localhost>
 
     [postdispatch]
+    enabled = true
+    stage2_enabled = true
+    max_verification_duration_seconds = 300
+    pending_on_inconclusive = true
     merge_report_enabled = true
     merge_report_index = _internal
     merge_report_source_contains = mergeReport_alert.log
@@ -199,6 +222,102 @@ class ConfigRuntimeBehaviorTests(unittest.TestCase):
             self.assertEqual(os.path.normcase(cfg.config_path), os.path.normcase(os.path.join(tmpdir, "config.ini")))
             self.assertEqual(cfg.username, "splunk_service")
             self.assertEqual(cfg.servers, ["https://splunk.example:8089"])
+
+    def test_load_config_parses_file_logging_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_template(tmpdir)
+            policy = load_security_policy(exe_dir=tmpdir)
+            cfg = load_config(exe_dir=tmpdir, policy=policy)
+
+            self.assertIsInstance(cfg.file_logging_config, dict)
+            self.assertTrue(cfg.file_logging_config["runtime_log_enabled"])
+            self.assertFalse(cfg.file_logging_config["debug_log_enabled"])
+            self.assertTrue(cfg.file_logging_config["runtime_log_path"].endswith(os.path.join("Internal", "logs", "runtime.log")))
+            self.assertTrue(cfg.file_logging_config["debug_log_path"].endswith(os.path.join("Internal", "logs", "debug.log")))
+            self.assertIsInstance(cfg.diagnostics_config, dict)
+            self.assertFalse(cfg.diagnostics_config["snapshot_probe_enabled"])
+
+    def test_load_config_parses_diagnostics_settings(self) -> None:
+        diagnostic_template = BASE_TEMPLATE.replace(
+            "[diagnostics]\nsnapshot_probe_enabled = 0",
+            "[diagnostics]\nsnapshot_probe_enabled = 1",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_template(tmpdir, diagnostic_template)
+            policy = load_security_policy(exe_dir=tmpdir)
+            cfg = load_config(exe_dir=tmpdir, policy=policy)
+
+            self.assertIsInstance(cfg.diagnostics_config, dict)
+            self.assertTrue(cfg.diagnostics_config["snapshot_probe_enabled"])
+
+    def test_load_config_keeps_blank_canonical_mergereport_path_without_legacy_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            legacy_log_path = os.path.join(tmpdir, "mergeReport_alert.log")
+            template = BASE_TEMPLATE + textwrap.dedent(
+                f"""
+
+                [mergereport]
+                enabled = false
+                log_path = {legacy_log_path}
+                timeout_seconds = 300
+                """
+            )
+            self._write_template(tmpdir, template)
+            policy = load_security_policy(exe_dir=tmpdir)
+            cfg = load_config(exe_dir=tmpdir, policy=policy)
+
+            self.assertTrue(cfg.merge_report_enabled)
+            self.assertEqual(cfg.merge_report_log_path, "")
+            self.assertEqual(cfg.postdispatch_config.get("merge_report_log_path"), "")
+
+    def test_load_config_maps_legacy_only_mergereport_section_to_runtime_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            legacy_log_path = os.path.join(tmpdir, "mergeReport_alert.log")
+            template = BASE_TEMPLATE.replace(
+                textwrap.dedent(
+                    """\
+                    [postdispatch]
+                    enabled = true
+                    stage2_enabled = true
+                    max_verification_duration_seconds = 300
+                    pending_on_inconclusive = true
+                    merge_report_enabled = true
+                    merge_report_index = _internal
+                    merge_report_source_contains = mergeReport_alert.log
+                    merge_report_sourcetype =
+                    merge_report_timeout_seconds = 300
+                    native_email_enabled = true
+                    native_email_index = _internal
+                    native_email_source_contains = python.log
+                    native_email_sourcetype =
+                    native_email_timeout_seconds = 300
+                    broker_request_timeout_seconds = 300
+                    reconcile_pending = true
+                    reconcile_wait_seconds = 60
+                    native_email_strict_success = false
+                    poll_seconds = 5
+                    lookback_seconds = 900
+                    """
+                ),
+                "",
+            ) + textwrap.dedent(
+                f"""
+
+                [mergereport]
+                enabled = true
+                log_path = {legacy_log_path}
+                timeout_seconds = 444
+                """
+            )
+            self._write_template(tmpdir, template)
+            policy = load_security_policy(exe_dir=tmpdir)
+            cfg = load_config(exe_dir=tmpdir, policy=policy)
+
+            self.assertTrue(cfg.merge_report_enabled)
+            self.assertEqual(cfg.merge_report_log_path, legacy_log_path)
+            self.assertIsInstance(cfg.postdispatch_config, dict)
+            self.assertEqual(cfg.postdispatch_config.get("merge_report_log_path"), legacy_log_path)
+            self.assertEqual(cfg.postdispatch_config.get("merge_report_timeout_seconds"), 444)
 
     def test_unsupported_legacy_config_is_rejected_after_parse(self) -> None:
         legacy = BASE_TEMPLATE.replace("auth_mode = password", "auth_mode = token")

@@ -23,6 +23,7 @@ from Internal.audit_logger import (
     MIN_MAX_BYTES,
     SecurityAuditLogger,
 )
+from Internal.tool_logging import PlainTextLogSet, normalize_file_logging_settings
 
 
 BROKER_BIND_HOST = "127.0.0.1"
@@ -253,6 +254,15 @@ _EVENT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "required": (),
     },
+    "BASELINE_BOOTSTRAPPED": {
+        "fields": {
+            "baseline_path": _TYPE_STR,
+            "scope_user": _TYPE_STR,
+            "install_root_hash": _TYPE_STR,
+            "reason": _TYPE_STR,
+        },
+        "required": (),
+    },
     "CONFIG_LEGACY_PASSWORD_IGNORED": {"fields": {}, "required": ()},
     "CONFIG_LOAD_FAILED": {"fields": {"reason": _TYPE_STR}, "required": ()},
     "LEGACY_FEATURE_BLOCKED": {
@@ -425,13 +435,25 @@ class _BrokerHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
-    def __init__(self, backend_logger: SecurityAuditLogger, auth_token: str):
+    def __init__(self, backend_logger: SecurityAuditLogger, auth_token: str, *, exe_dir: str):
         super().__init__((BROKER_BIND_HOST, 0), _BrokerRequestHandler)
         self.backend_logger = backend_logger
         self.auth_token = auth_token
+        self.exe_dir = exe_dir
         self.logger_lock = threading.Lock()
         self.rate_lock = threading.Lock()
         self.request_times: deque[float] = deque()
+        self.text_logs = PlainTextLogSet(
+            exe_dir=exe_dir,
+            settings=normalize_file_logging_settings(
+                {},
+                exe_dir=exe_dir,
+                max_bytes=backend_logger.max_bytes,
+                backup_count=backend_logger.backup_count,
+                verbose=backend_logger.verbose,
+                test_mode=False,
+            ),
+        )
 
     def consume_rate_limit_slot(self) -> bool:
         now = time.monotonic()
@@ -471,6 +493,15 @@ class _BrokerRequestHandler(http.server.BaseHTTPRequestHandler):
 
         if self.path == "/v1/log":
             self._handle_log()
+            return
+        if self.path == "/v1/runtime-line":
+            self._handle_text_line(channel="runtime")
+            return
+        if self.path == "/v1/debug-line":
+            self._handle_text_line(channel="debug")
+            return
+        if self.path == "/v1/text-config":
+            self._handle_text_config()
             return
         if self.path == "/v1/configure":
             self._handle_configure()
@@ -531,6 +562,41 @@ class _BrokerRequestHandler(http.server.BaseHTTPRequestHandler):
         with self._server.logger_lock:
             self._server.backend_logger.log_event(event, level=level, **fields)
         self._send_json(200, {"ok": True})
+
+    def _handle_text_line(self, *, channel: str) -> None:
+        payload = self._read_payload()
+        level = str(payload.get("level", "INFO")).strip().upper()
+        if level not in _LEVELS:
+            raise _BrokerRequestError(400, "invalid_level")
+        message = payload.get("message", "")
+        if not isinstance(message, str):
+            raise _BrokerRequestError(400, "invalid_message")
+        clean_message = _sanitize_string(message, key_hint="message")
+        if not clean_message:
+            raise _BrokerRequestError(400, "missing_message")
+        with self._server.logger_lock:
+            self._server.text_logs.write(channel, level, clean_message)
+        self._send_json(200, {"ok": True})
+
+    def _handle_text_config(self) -> None:
+        payload = self._read_payload()
+        raw_settings = payload.get("settings", {})
+        if raw_settings is None:
+            raw_settings = {}
+        if not isinstance(raw_settings, dict):
+            raise _BrokerRequestError(400, "invalid_settings")
+        with self._server.logger_lock:
+            current = normalize_file_logging_settings(
+                raw_settings,
+                exe_dir=self._server.exe_dir,
+                max_bytes=self._server.backend_logger.max_bytes,
+                backup_count=self._server.backend_logger.backup_count,
+                verbose=self._server.backend_logger.verbose,
+                test_mode=False,
+            )
+            self._server.text_logs.configure(current)
+            status = self._server.text_logs.status()
+        self._send_json(200, {"ok": True, "current": status})
 
     def _handle_configure(self) -> None:
         payload = self._read_payload()
@@ -608,6 +674,8 @@ class _BrokerRequestHandler(http.server.BaseHTTPRequestHandler):
                 "level": self._server.backend_logger.level,
                 "max_bytes": int(self._server.backend_logger.max_bytes),
                 "backup_count": int(self._server.backend_logger.backup_count),
+                "runtime_log_path": str(self._server.text_logs.status().get("runtime_log_path", "")),
+                "debug_log_path": str(self._server.text_logs.status().get("debug_log_path", "")),
             }
         self._send_json(200, payload)
 
@@ -888,7 +956,11 @@ def start_local_logging_broker(
 
     auth_token = secrets.token_urlsafe(32)
     try:
-        server = _BrokerHTTPServer(backend_logger=backend_logger, auth_token=auth_token)
+        server = _BrokerHTTPServer(
+            backend_logger=backend_logger,
+            auth_token=auth_token,
+            exe_dir=exe_dir,
+        )
         thread = threading.Thread(target=server.serve_forever, name="LocalAuditBroker", daemon=True)
         thread.start()
         bind_port = int(server.server_address[1])
