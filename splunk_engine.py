@@ -98,6 +98,10 @@ CORRELATION_MODE_TOOL_LOCAL_ONLY = "tool_local_only"
 CORRELATION_MODE_SPLUNK_UI_CONTEXT_BEST_EFFORT = "splunk_ui_context_best_effort"
 CORRELATION_MODE_SPLUNK_UI_CONTEXT_PROPAGATED = "splunk_ui_context_propagated"
 CORRELATION_MODE_TOOL_LOCAL_FALLBACK = "tool_local_fallback"
+DATE_MODE_CUSTOM_RANGE = "Custom Range"
+DATE_MODES = ("Daily", "Weekly", "Monthly", DATE_MODE_CUSTOM_RANGE)
+HANDLING_MODE_PREMIUM = "Premium Handling"
+HANDLING_MODE_THROUGHPUT = "Throughput Handling"
 DISPATCH_REQUEST_CLASS = "dispatch_critical"
 _DISPATCH_MINIMAL_FORM_FIELDS = (
     "output_mode",
@@ -446,6 +450,232 @@ class RegenSliceRecord:
     execution_outcome: str = ""
     evidence_outcome: str = ""
     business_outcome: str = ""
+
+
+@dataclass
+class RunPlanExecution:
+    """One planned saved-search dispatch execution."""
+    report_id: str
+    report_title: str
+    app: str
+    owner: str = ""
+    date_mode: str = ""
+    earliest_time: str = ""
+    latest_time: str = ""
+    dispatch_earliest: Optional[str] = None
+    dispatch_latest: Optional[str] = None
+    slice_number: int = 1
+    slice_total: int = 1
+    dispatch_status: str = "planned"
+    verify_status: str = "verification_pending"
+    retry_count: int = 0
+    job_sid: str = ""
+    evidence: str = ""
+    final_status: str = "planned"
+
+    @property
+    def slice_label(self) -> str:
+        if self.date_mode == DATE_MODE_CUSTOM_RANGE:
+            return "custom range"
+        if self.slice_total <= 1:
+            return "single run"
+        return f"[{self.slice_number}/{self.slice_total}]"
+
+
+@dataclass
+class RunPlan:
+    """Explicit dispatch plan generated before execution starts."""
+    selected_report_count: int
+    planned_execution_count: int
+    handling_mode: str
+    date_mode: str
+    executions: List[RunPlanExecution] = field(default_factory=list)
+
+
+def stable_report_id(
+    report_id_url: str,
+    report_title: str,
+    *,
+    app: str = "",
+    owner: str = "",
+) -> str:
+    """Build a stable selection key for report inventory rows."""
+    raw_id = str(report_id_url or "").strip()
+    if raw_id:
+        return raw_id
+    return "|".join(
+        part.strip()
+        for part in (app or "-", owner or "-", report_title or "-")
+    )
+
+
+def selected_handling_mode(selected_report_count: int) -> str:
+    count = max(0, int(selected_report_count or 0))
+    return HANDLING_MODE_PREMIUM if count <= 7 else HANDLING_MODE_THROUGHPUT
+
+
+def parse_hhmm_time(value: str) -> Tuple[int, int]:
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not match:
+        raise ValueError("Time must use HH:MM format.")
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        raise ValueError("Time must be a valid 24-hour HH:MM value.")
+    return hour, minute
+
+
+def combine_date_time(date_value: Any, time_value: str) -> datetime:
+    if date_value is None:
+        raise ValueError("Date is required.")
+    hour, minute = parse_hhmm_time(time_value)
+    return datetime(
+        int(date_value.year),
+        int(date_value.month),
+        int(date_value.day),
+        hour,
+        minute,
+    )
+
+
+def validate_custom_range(start_dt: Optional[datetime], end_dt: Optional[datetime]) -> Tuple[bool, str]:
+    if start_dt is None:
+        return False, "Start datetime is required."
+    if end_dt is None:
+        return False, "End datetime is required."
+    if end_dt <= start_dt:
+        return False, "End datetime must be later than start datetime."
+    return True, ""
+
+
+def filter_report_indices(
+    report_names: List[str],
+    report_ids: List[str],
+    *,
+    search_term: str = "",
+    selected_report_ids: Optional[set[str]] = None,
+    show_selected_only: bool = False,
+    app: str = "",
+) -> List[int]:
+    term = str(search_term or "").strip().lower()
+    selected = selected_report_ids or set()
+    indices: List[int] = []
+    for idx, name in enumerate(report_names):
+        report_key = stable_report_id(
+            report_ids[idx] if idx < len(report_ids) else "",
+            name,
+            app=app,
+        )
+        if show_selected_only:
+            if report_key in selected:
+                indices.append(idx)
+            continue
+        if not term or term in str(name or "").lower():
+            indices.append(idx)
+    return indices
+
+
+def format_execution_progress(
+    current: int,
+    total: int,
+    action: str,
+    execution: RunPlanExecution,
+) -> str:
+    prefix = f"[{max(1, int(current or 1))}/{max(1, int(total or 1))}]"
+    detail = execution.slice_label
+    if execution.date_mode == DATE_MODE_CUSTOM_RANGE:
+        detail = f"custom range {execution.earliest_time} to {execution.latest_time}"
+    elif execution.slice_total > 1:
+        detail = f"slice {execution.slice_number} of {execution.slice_total}"
+    return f"{prefix} {action}: {execution.report_title} - {detail}"
+
+
+def build_run_plan(
+    report_ids: List[str],
+    report_names: List[str],
+    selected_indices: List[int],
+    *,
+    date_mode: str,
+    start: datetime,
+    end: datetime,
+    no_change: bool = False,
+    app: str = "",
+) -> RunPlan:
+    selected = [idx for idx in selected_indices if 0 <= idx < len(report_names)]
+    executions: List[RunPlanExecution] = []
+    mode = str(date_mode or "Daily")
+
+    if no_change:
+        for idx in selected:
+            executions.append(
+                RunPlanExecution(
+                    report_id=report_ids[idx],
+                    report_title=report_names[idx],
+                    app=app,
+                    date_mode=mode,
+                    earliest_time=str(start),
+                    latest_time=str(end),
+                    dispatch_earliest=None,
+                    dispatch_latest=None,
+                    slice_number=1,
+                    slice_total=1,
+                )
+            )
+    elif mode == DATE_MODE_CUSTOM_RANGE:
+        ok, error = validate_custom_range(start, end)
+        if not ok:
+            raise ValueError(error)
+        earliest = to_epoch(start)
+        latest = to_epoch(end)
+        start_text = start.strftime("%Y-%m-%d %H:%M")
+        end_text = end.strftime("%Y-%m-%d %H:%M")
+        for idx in selected:
+            executions.append(
+                RunPlanExecution(
+                    report_id=report_ids[idx],
+                    report_title=report_names[idx],
+                    app=app,
+                    date_mode=mode,
+                    earliest_time=start_text,
+                    latest_time=end_text,
+                    dispatch_earliest=earliest,
+                    dispatch_latest=latest,
+                    slice_number=1,
+                    slice_total=1,
+                )
+            )
+    else:
+        starts, ends = build_slices(start, end, mode)
+        if len(starts) == 0:
+            raise ValueError("Selected date range generates 0 slices/emails.")
+        if len(starts) > 12:
+            raise ValueError("Selected date range generates more than 12 slices/emails.")
+        slice_total = len(starts)
+        for idx in selected:
+            for slice_number, (slice_start, slice_end) in enumerate(zip(starts, ends), start=1):
+                executions.append(
+                    RunPlanExecution(
+                        report_id=report_ids[idx],
+                        report_title=report_names[idx],
+                        app=app,
+                        date_mode=mode,
+                        earliest_time=str(slice_start),
+                        latest_time=str(slice_end),
+                        dispatch_earliest=to_epoch(slice_start),
+                        dispatch_latest=to_epoch(slice_end),
+                        slice_number=slice_number,
+                        slice_total=slice_total,
+                    )
+                )
+
+    return RunPlan(
+        selected_report_count=len(selected),
+        planned_execution_count=len(executions),
+        handling_mode=selected_handling_mode(len(selected)),
+        date_mode=mode,
+        executions=executions,
+    )
 
 
 @dataclass
@@ -3751,6 +3981,37 @@ def _build_batch_slice_blueprints(
         )
         return blueprints
 
+    if frequency == DATE_MODE_CUSTOM_RANGE:
+        dispatch_earliest = to_epoch(start)
+        dispatch_latest = to_epoch(end)
+        slice_label = "custom range"
+        slice_id = _derive_slice_id(
+            batch_id,
+            report_id_url,
+            report_name,
+            slice_label,
+            dispatch_earliest,
+            dispatch_latest,
+        )
+        blueprints.append(
+            {
+                "slice_id": slice_id,
+                "slice_label": slice_label,
+                "slice_index": 1,
+                "slice_total": 1,
+                "earliest": start.strftime("%Y-%m-%d %H:%M"),
+                "latest": end.strftime("%Y-%m-%d %H:%M"),
+                "dispatch_earliest": dispatch_earliest,
+                "dispatch_latest": dispatch_latest,
+                "report_owner": owner,
+                "report_app": app,
+                "verification_mode": verification_mode,
+                "correlation_tag": _build_correlation_tag(batch_id, slice_id, 1),
+                "correlation_mode": correlation_mode,
+            }
+        )
+        return blueprints
+
     starts, ends = build_slices(start, end, frequency)
     total = len(starts)
     for index, (slice_start, slice_end) in enumerate(zip(starts, ends), start=1):
@@ -5974,6 +6235,7 @@ def _dispatch_slice_and_wait(
     report_app: str = "",
     verification_mode: str = "",
     business_effect_guard: Optional[Callable[[SliceExecutionContext], bool]] = None,
+    dispatch_only: bool = False,
 ) -> Tuple[str, str, str]:
     slice_index = max(0, int(slice_index or 0))
     slice_total = max(0, int(slice_total or 0))
@@ -6424,7 +6686,7 @@ def _dispatch_slice_and_wait(
             report_name=report_name,
             earliest=earliest_display,
             latest=latest_display,
-            status=timeout_status,
+            status="FAILED",
             log_callback=log_callback,
         )
         audit_slice_event(
@@ -6455,21 +6717,20 @@ def _dispatch_slice_and_wait(
             slice_label=slice_label,
             slice_index=slice_index,
             slice_total=slice_total,
-            status=timeout_status,
+            status="FAILED",
             earliest=earliest_display,
             latest=latest_display,
             sid="",
-            outcome_code=_pending_no_sid_outcome_code(timeout_status),
+            outcome_code="DISPATCH_FAILED",
             error=err_msg,
             dispatch_earliest=dispatch_earliest or "",
             dispatch_latest=dispatch_latest or "",
-            lifecycle_state=SLICE_STATE_PENDING_RECONCILE,
+            lifecycle_state=SLICE_STATE_FAILED_DISPATCH,
             state_reason=err_msg,
             retry_count=execution_context.retry_count,
-            pending_since_utc=_utc_now_iso(),
             execution_context_id=execution_context.execution_context_id,
         )
-        return timeout_status, "", pending_detail_mode
+        return "FAILED", "", pending_detail_mode
     _clear_registered_dispatch()
     execution_context.sid = sid
     execution_context.mark_state(SLICE_STATE_DISPATCHED)
@@ -6489,6 +6750,56 @@ def _dispatch_slice_and_wait(
     )
     if sid_callback:
         sid_callback(sid, report_name)
+
+    if dispatch_only:
+        detail = "Verification deferred until post-dispatch reconciliation."
+        _append_log(
+            logs,
+            f"  {log_prefix}DISPATCHED (sid={sid}) - {detail}",
+            log_callback,
+        )
+        audit_slice_event(
+            "REPORT_SLICE_VERIFICATION_DEFERRED",
+            level="INFO",
+            slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
+            sid=sid,
+            reason=detail,
+            error_phase="verification",
+        )
+        record_slice(
+            batch_id=execution_context.batch_id,
+            slice_id=execution_context.slice_id,
+            attempt_id=execution_context.attempt_id,
+            slice_label=slice_label,
+            slice_index=slice_index,
+            slice_total=slice_total,
+            status=timeout_status,
+            earliest=earliest_display,
+            latest=latest_display,
+            sid=sid,
+            outcome_code="DISPATCHED_PENDING",
+            error=detail,
+            dispatch_earliest=dispatch_earliest or "",
+            dispatch_latest=dispatch_latest or "",
+            lifecycle_state=SLICE_STATE_PENDING_RECONCILE,
+            state_reason=detail,
+            retry_count=execution_context.retry_count,
+            pending_since_utc=_utc_now_iso(),
+            execution_context_id=execution_context.execution_context_id,
+            correlation_tag=execution_context.correlation_tag,
+            correlation_mode=execution_context.correlation_mode,
+            report_owner=execution_context.report_owner,
+            report_app=execution_context.report_app,
+            verification_mode=execution_context.verification_mode,
+            dispatch_outcome="SUCCESS",
+            execution_outcome="PENDING",
+            evidence_outcome="DEFERRED",
+            business_outcome="UNKNOWN",
+        )
+        return timeout_status, sid, pending_detail_mode
+
     return _verify_dispatched_slice(
         logs,
         client=client,
@@ -6529,6 +6840,7 @@ def run_dispatch_single(
     merge_report_log_path: str = "",
     merge_report_timeout_seconds: int = DEFAULT_MERGEREPORT_TIMEOUT_SECONDS,
     merge_report_settings: Optional[dict[str, Any]] = None,
+    dispatch_only: bool = False,
 ) -> List[str]:
     logs: List[str] = []
     default_owner = str(getattr(client, "username", "") or "").strip()
@@ -6915,6 +7227,7 @@ def run_dispatch_single(
             report_app=str(blueprint.get("report_app", "") or "").strip(),
             verification_mode=str(blueprint.get("verification_mode", "") or "").strip(),
             business_effect_guard=_business_effect_guard,
+            dispatch_only=dispatch_only,
         )
         return logs
 
@@ -6995,6 +7308,7 @@ def run_dispatch_single(
             report_app=str(blueprint.get("report_app", "") or "").strip(),
             verification_mode=str(blueprint.get("verification_mode", "") or "").strip(),
             business_effect_guard=_business_effect_guard,
+            dispatch_only=dispatch_only,
         )
         if str(pending_detail_mode or "").strip().lower() == "dispatch_unconfirmed":
             force_transport_reset_next_slice = True
@@ -7231,9 +7545,9 @@ def _poll_job_status_with_budget(
     if not can_snapshot:
         while True:
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or remaining < 1.0:
+            if poll_count > 0 and (remaining <= 0 or remaining < 1.0):
                 break
-            request_timeout = min(poll_seconds, remaining)
+            request_timeout = min(poll_seconds, max(1.0, remaining))
             poll_count += 1
             poll_start = time.monotonic()
             state, content = client.check_job_status(
@@ -7271,10 +7585,10 @@ def _poll_job_status_with_budget(
 
     while True:
         remaining = deadline - time.monotonic()
-        if remaining <= 0 or remaining < 1.0:
+        if poll_count > 0 and (remaining <= 0 or remaining < 1.0):
             break
 
-        request_timeout = min(poll_seconds, remaining)
+        request_timeout = min(poll_seconds, max(1.0, remaining))
         poll_count += 1
         poll_start = time.monotonic()
         state, content = _call_snapshot_with_retry(
@@ -9421,16 +9735,32 @@ def run_dispatch_multi(
     try:
         if not selected_indices:
             raise ValueError("No reports selected.")
+        run_plan = build_run_plan(
+            report_ids,
+            report_names,
+            selected_indices,
+            date_mode=frequency,
+            start=start,
+            end=end,
+            no_change=no_change,
+            app=app,
+        )
+        if run_plan.selected_report_count <= 0:
+            raise ValueError("No reports selected.")
+        selected_indices = [idx for idx in selected_indices if 0 <= idx < len(report_names)]
         selected_report_names = [report_names[i] for i in selected_indices]
         selected_report_ids = [report_ids[i] for i in selected_indices]
         start_time_sgt = get_sgt_now()
         if no_change:
-            slices_per_report = 1
             mode_description = "single run"
+        elif frequency == DATE_MODE_CUSTOM_RANGE:
+            mode_description = "custom range"
         else:
-            starts, _ = build_slices(start, end, frequency)
-            slices_per_report = len(starts)
-            mode_description = f"{frequency.lower()} slices: {slices_per_report}"
+            first_report_slices = max(
+                (execution.slice_total for execution in run_plan.executions),
+                default=0,
+            )
+            mode_description = f"{frequency.lower()} slices: {first_report_slices}"
         batch_id = f"batch-{start_time_sgt.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
         regen_context = RegenContext(
             run_id=f"regen-{start_time_sgt.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}",
@@ -9443,11 +9773,11 @@ def run_dispatch_multi(
             start_time_sgt=start_time_sgt,
             end_time_sgt=None,
             slicing_enabled=not no_change,
-            slice_count=max(0, slices_per_report * len(selected_indices)),
+            slice_count=run_plan.planned_execution_count,
             frequency=frequency,
             earliest_configured=start.strftime("%Y-%m-%d %H:%M:%S"),
             latest_configured=end.strftime("%Y-%m-%d %H:%M:%S"),
-            mode_description=mode_description,
+            mode_description=f"{mode_description}; {run_plan.handling_mode}",
             ack_attach_manifest=(config.ack_attach_manifest if config else False),
             correlation_mode=CORRELATION_MODE_SPLUNK_UI_CONTEXT_BEST_EFFORT,
         )
@@ -9580,9 +9910,11 @@ def run_dispatch_multi(
             app=app,
             report_names=selected_report_names,
             slicing_mode=mode_description,
+            handling_mode=run_plan.handling_mode,
             earliest=regen_context.earliest_configured,
             latest=regen_context.latest_configured,
-            report_count=len(selected_indices),
+            report_count=run_plan.selected_report_count,
+            planned_executions=run_plan.planned_execution_count,
         )
         _set_batch_state(
             regen_context,
@@ -9677,45 +10009,107 @@ def run_dispatch_multi(
         _append_log(
             logs,
             (
-                f"Starting dispatch for {len(selected_indices)} report(s) - "
+                f"Run plan: {run_plan.selected_report_count} selected report(s), "
+                f"{run_plan.planned_execution_count} planned execution(s), "
+                f"handling mode={run_plan.handling_mode}."
+            ),
+            log_callback,
+        )
+        _append_log(
+            logs,
+            (
+                f"Starting dispatch for {run_plan.selected_report_count} report(s) - "
                 f"frequency={frequency}, range={start} -> {end}, no_change={no_change}"
             ),
             log_callback,
         )
-        for idx_num, i in enumerate(selected_indices, start=1):
-            report_id_url = report_ids[i]
-            report_name = report_names[i]
-            _append_log(logs, "", log_callback)
+        if run_plan.handling_mode == HANDLING_MODE_PREMIUM:
+            for idx_num, i in enumerate(selected_indices, start=1):
+                report_id_url = report_ids[i]
+                report_name = report_names[i]
+                _append_log(logs, "", log_callback)
+                _append_log(
+                    logs,
+                    f"=== [{idx_num}/{len(selected_indices)}] {report_name} ===",
+                    log_callback,
+                )
+                report_logs = run_dispatch_single(
+                    client,
+                    report_id_url=report_id_url,
+                    report_name=report_name,
+                    frequency=frequency,
+                    start=start,
+                    end=end,
+                    no_change=no_change,
+                    wait_seconds=wait_seconds,
+                    poll_interval=poll_interval,
+                    log_callback=log_callback,
+                    sid_callback=sid_callback,
+                    regen_context=regen_context,
+                    continue_on_timeout=resolve_continue_on_timeout(config),
+                    timeout_status=resolve_timeout_result(config),
+                    dispatch_call_timeout_seconds=resolve_dispatch_call_timeout_seconds(config),
+                    prefer_merge_report_verification=resolve_primary_slice_mergereport_enabled(config),
+                    merge_report_log_path=(
+                        str(getattr(config, "merge_report_log_path", "") or "")
+                        if config is not None
+                        else ""
+                    ),
+                    merge_report_timeout_seconds=(
+                        int(
+                            getattr(
+                                config,
+                                "merge_report_timeout_seconds",
+                                DEFAULT_MERGEREPORT_TIMEOUT_SECONDS,
+                            )
+                            or DEFAULT_MERGEREPORT_TIMEOUT_SECONDS
+                        )
+                        if config is not None
+                        else DEFAULT_MERGEREPORT_TIMEOUT_SECONDS
+                    ),
+                )
+                logs.extend(report_logs)
+        else:
             _append_log(
                 logs,
-                f"=== [{idx_num}/{len(selected_indices)}] {report_name} ===",
+                "Throughput Handling: dispatching planned executions first; verification follows afterward.",
                 log_callback,
             )
-            report_logs = run_dispatch_single(
-                client,
-                report_id_url=report_id_url,
-                report_name=report_name,
-                frequency=frequency,
-                start=start,
-                end=end,
-                no_change=no_change,
-                wait_seconds=wait_seconds,
-                poll_interval=poll_interval,
-                log_callback=log_callback,
-                sid_callback=sid_callback,
-                regen_context=regen_context,
-                continue_on_timeout=resolve_continue_on_timeout(config),
-                timeout_status=resolve_timeout_result(config),
-                dispatch_call_timeout_seconds=resolve_dispatch_call_timeout_seconds(config),
-                prefer_merge_report_verification=bool(merge_report_settings.get("enabled")),
-                merge_report_log_path=str(merge_report_settings.get("local_file_path", "") or ""),
-                merge_report_timeout_seconds=int(
-                    merge_report_settings.get("timeout_seconds", DEFAULT_MERGEREPORT_TIMEOUT_SECONDS)
-                    or DEFAULT_MERGEREPORT_TIMEOUT_SECONDS
-                ),
-                merge_report_settings=merge_report_settings,
-            )
-            logs.extend(report_logs)
+            for idx_num, i in enumerate(selected_indices, start=1):
+                report_id_url = report_ids[i]
+                report_name = report_names[i]
+                _append_log(logs, "", log_callback)
+                _append_log(
+                    logs,
+                    f"=== [{idx_num}/{len(selected_indices)}] Dispatching: {report_name} ===",
+                    log_callback,
+                )
+                report_logs = run_dispatch_single(
+                    client,
+                    report_id_url=report_id_url,
+                    report_name=report_name,
+                    frequency=frequency,
+                    start=start,
+                    end=end,
+                    no_change=no_change,
+                    wait_seconds=wait_seconds,
+                    poll_interval=poll_interval,
+                    log_callback=log_callback,
+                    sid_callback=sid_callback,
+                    regen_context=regen_context,
+                    continue_on_timeout=resolve_continue_on_timeout(config),
+                    timeout_status=resolve_timeout_result(config),
+                    dispatch_call_timeout_seconds=resolve_dispatch_call_timeout_seconds(config),
+                    prefer_merge_report_verification=bool(merge_report_settings.get("enabled")),
+                    merge_report_log_path=str(merge_report_settings.get("local_file_path", "") or ""),
+                    merge_report_timeout_seconds=int(
+                        merge_report_settings.get("timeout_seconds", DEFAULT_MERGEREPORT_TIMEOUT_SECONDS)
+                        or DEFAULT_MERGEREPORT_TIMEOUT_SECONDS
+                    ),
+                    merge_report_settings=merge_report_settings,
+                    dispatch_only=True,
+                )
+                logs.extend(report_logs)
         pending_slices = _pending_slice_records(regen_context)
         if pending_slices:
             if not resolve_postdispatch_enabled(config):

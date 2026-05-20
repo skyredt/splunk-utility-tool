@@ -19,9 +19,14 @@ except ImportError:  # fall back to simple Entry if tkcalendar is not installed
     HAS_TKCALENDAR = False
 
 from splunk_engine import (
+    DATE_MODE_CUSTOM_RANGE,
+    DATE_MODES,
     TOOL_DISPLAY_NAME,
     SplunkConfig,
-    build_slices,
+    build_run_plan,
+    combine_date_time,
+    filter_report_indices,
+    selected_handling_mode,
     get_effective_username,
     inspect_unfinished_batch_journals,
     recover_unfinished_batch_journal,
@@ -33,6 +38,8 @@ from splunk_engine import (
     run_dispatch_multi,
     set_security_audit_logger,
     set_security_policy,
+    stable_report_id,
+    validate_custom_range,
 )
 from Internal.baseline_guard import build_security_fingerprint, enforce_security_baseline
 from Internal.config_manager import ConfigError
@@ -259,6 +266,8 @@ class ReportsApp(ttk.Frame):
         self.report_names: list[str] = []
         self.report_email_flags: list[bool] = []
         self.filtered_indices: list[int] = []
+        self.selected_report_ids: set[str] = set()
+        self._applying_report_filter = False
         self._dispatch_in_progress = False
         self._dispatch_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self._merge_report_monitor: MergeReportMonitor | None = None
@@ -272,6 +281,7 @@ class ReportsApp(ttk.Frame):
         self._dispatch_pending_error_text = ""
 
         self._build_ui()
+        self.on_no_change_toggled()
         self._set_connected_state(False)
         audit_warning = ""
         if self.audit_logger is not None and hasattr(self.audit_logger, "unavailable_warning"):
@@ -349,11 +359,30 @@ class ReportsApp(ttk.Frame):
         self.clear_search_button = ttk.Button(search_row, text="Clear", command=self.on_clear_search)
         self.clear_search_button.pack(side="left")
 
+        selection_row = ttk.Frame(left, style="Card.TFrame")
+        selection_row.pack(fill="x", pady=(0, 6))
+        self.selected_count_var = tk.StringVar(value="Selected: 0 reports")
+        ttk.Label(selection_row, textvariable=self.selected_count_var, style="Card.TLabel").pack(side="left")
+        self.show_selected_only_var = tk.BooleanVar(value=False)
+        self.show_selected_only_chk = ttk.Checkbutton(
+            selection_row,
+            text="Show selected only",
+            variable=self.show_selected_only_var,
+            command=self.on_show_selected_only_toggled,
+            style="TCheckbutton",
+        )
+        self.show_selected_only_chk.pack(side="left", padx=(12, 0))
+        self.review_selected_button = ttk.Button(selection_row, text="Review selected", command=self.on_review_selected)
+        self.review_selected_button.pack(side="left", padx=(8, 0))
+        self.clear_selected_button = ttk.Button(selection_row, text="Clear selected", command=self.on_clear_selected)
+        self.clear_selected_button.pack(side="left", padx=(8, 0))
+
         self.reports_list = tk.Listbox(
             left,
             selectmode="extended",
             exportselection=False,
         )
+        self.reports_list.bind("<<ListboxSelect>>", self.on_report_selection_changed)
         self.reports_list.pack(side="left", fill="both", expand=True)
         style_listbox(self.reports_list)
 
@@ -372,10 +401,11 @@ class ReportsApp(ttk.Frame):
         self.frequency_combo = ttk.Combobox(
             right,
             textvariable=self.frequency_var,
-            values=["Daily", "Weekly", "Monthly"],
+            values=list(DATE_MODES),
             state="readonly",
             width=15,
         )
+        self.frequency_combo.bind("<<ComboboxSelected>>", self.on_frequency_changed)
         self.frequency_combo.grid(row=1, column=1, sticky="w", pady=(0, 4))
 
         # Start date
@@ -388,6 +418,16 @@ class ReportsApp(ttk.Frame):
         self.end_date_widget = self._make_date_widget(right)
         self.end_date_widget.grid(row=3, column=1, sticky="w", pady=4)
 
+        ttk.Label(right, text="Start time:", style="Card.TLabel").grid(row=4, column=0, sticky="w", pady=4)
+        self.start_time_var = tk.StringVar(value="00:00")
+        self.start_time_entry = ttk.Entry(right, textvariable=self.start_time_var, width=8)
+        self.start_time_entry.grid(row=4, column=1, sticky="w", pady=4)
+
+        ttk.Label(right, text="End time:", style="Card.TLabel").grid(row=5, column=0, sticky="w", pady=4)
+        self.end_time_var = tk.StringVar(value="00:00")
+        self.end_time_entry = ttk.Entry(right, textvariable=self.end_time_var, width=8)
+        self.end_time_entry.grid(row=5, column=1, sticky="w", pady=4)
+
         # No change checkbox
         self.no_change_var = tk.BooleanVar(value=False)
         self.no_change_chk = ttk.Checkbutton(
@@ -397,7 +437,16 @@ class ReportsApp(ttk.Frame):
             command=self.on_no_change_toggled,
             style="TCheckbutton",
         )
-        self.no_change_chk.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        self.no_change_chk.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 4))
+
+        self.run_plan_preview_var = tk.StringVar(value="Selected reports: 0\nPlanned executions: 0\nHandling mode: Premium Handling")
+        self.run_plan_preview_label = ttk.Label(
+            right,
+            textvariable=self.run_plan_preview_var,
+            style="Subtle.TLabel",
+            justify="left",
+        )
+        self.run_plan_preview_label.grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         # Send button
         self.send_button = ttk.Button(
@@ -407,7 +456,7 @@ class ReportsApp(ttk.Frame):
             state="disabled",
             style="Primary.TButton",
         )
-        self.send_button.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        self.send_button.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(16, 0))
 
         # User info display (audit info)
         username = get_effective_username()
@@ -415,7 +464,7 @@ class ReportsApp(ttk.Frame):
         tool_name = TOOL_DISPLAY_NAME
         user_info_text = f"Hi {username}.\nYou are using {tool_name} on {hostname}."
         self.user_info_label = ttk.Label(right, text=user_info_text, style="Subtle.TLabel", justify="left")
-        self.user_info_label.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.user_info_label.grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         for i in range(2):
             right.grid_columnconfigure(i, weight=1)
@@ -457,6 +506,25 @@ class ReportsApp(ttk.Frame):
             except ValueError:
                 return None
 
+    def _resolve_selected_datetime_range(self, frequency: str) -> tuple[datetime, datetime]:
+        start_d = self._get_date_from_widget(self.start_date_widget)
+        end_d = self._get_date_from_widget(self.end_date_widget)
+        if start_d is None:
+            raise ValueError("Start date is required.")
+        if end_d is None:
+            raise ValueError("End date is required.")
+        if frequency == DATE_MODE_CUSTOM_RANGE:
+            start = combine_date_time(start_d, self.start_time_var.get())
+            end = combine_date_time(end_d, self.end_time_var.get())
+            ok, error = validate_custom_range(start, end)
+            if not ok:
+                raise ValueError(error)
+            return start, end
+        return (
+            datetime(start_d.year, start_d.month, start_d.day),
+            datetime(end_d.year, end_d.month, end_d.day),
+        )
+
     # --------------- State helpers ---------------
 
     def _load_servers(self) -> None:
@@ -485,7 +553,10 @@ class ReportsApp(ttk.Frame):
             self.report_names = []
             self.report_email_flags = []
             self.filtered_indices = []
+            self.selected_report_ids.clear()
+            self.show_selected_only_var.set(False)
             self.search_var.set("")
+            self._update_selection_controls()
 
     def _append_log(self, text: str) -> None:
         safe_text = redact_text(text)
@@ -552,9 +623,17 @@ class ReportsApp(ttk.Frame):
             self.no_change_chk.configure(state="disabled")
             self.start_date_widget.configure(state="disabled")
             self.end_date_widget.configure(state="disabled")
+            self.start_time_entry.configure(state="disabled")
+            self.end_time_entry.configure(state="disabled")
+            self.show_selected_only_chk.configure(state="disabled")
+            self.review_selected_button.configure(state="disabled")
+            self.clear_selected_button.configure(state="disabled")
         else:
             self._set_connected_state(self.client is not None)
             self.no_change_chk.configure(state="normal")
+            self.show_selected_only_chk.configure(state="normal")
+            self.review_selected_button.configure(state="normal")
+            self.clear_selected_button.configure(state="normal")
             self.on_no_change_toggled()
 
     def _reset_run_scoped_state(self) -> tuple[int, int]:
@@ -585,14 +664,82 @@ class ReportsApp(ttk.Frame):
                 break
         return stopped_monitors, drained_events
 
+    def _report_key(self, idx: int) -> str:
+        report_id = self.report_ids[idx] if idx < len(self.report_ids) else ""
+        report_name = self.report_names[idx] if idx < len(self.report_names) else ""
+        return stable_report_id(report_id, report_name, app=self.app_var.get().strip())
+
+    def _selected_indices_from_state(self) -> list[int]:
+        indices: list[int] = []
+        for idx, _name in enumerate(self.report_names):
+            if self._report_key(idx) in self.selected_report_ids:
+                indices.append(idx)
+        return indices
+
+    def _selected_report_names_from_state(self) -> list[str]:
+        return [self.report_names[i] for i in self._selected_indices_from_state()]
+
+    def _update_selection_controls(self) -> None:
+        count = len(self.selected_report_ids)
+        noun = "report" if count == 1 else "reports"
+        self.selected_count_var.set(f"Selected: {count} {noun}")
+        self.review_selected_button.configure(state="normal" if count and not self._dispatch_in_progress else "disabled")
+        self.clear_selected_button.configure(state="normal" if count and not self._dispatch_in_progress else "disabled")
+        self._update_run_plan_preview()
+
+    def _update_run_plan_preview(self) -> None:
+        selected_indices = self._selected_indices_from_state()
+        selected_count = len(selected_indices)
+        handling_mode = selected_handling_mode(selected_count)
+        frequency = self.frequency_var.get()
+        planned = 0
+        range_line = ""
+        if selected_count:
+            try:
+                if self.no_change_var.get():
+                    planned = selected_count
+                else:
+                    start, end = self._resolve_selected_datetime_range(frequency)
+                    plan = build_run_plan(
+                        self.report_ids,
+                        self.report_names,
+                        selected_indices,
+                        date_mode=frequency,
+                        start=start,
+                        end=end,
+                        no_change=False,
+                        app=self.app_var.get().strip(),
+                    )
+                    planned = plan.planned_execution_count
+                    if frequency == DATE_MODE_CUSTOM_RANGE:
+                        range_line = f"\nRange: {start.strftime('%Y-%m-%d %H:%M')} to {end.strftime('%Y-%m-%d %H:%M')}"
+            except Exception:
+                planned = 0
+        self.run_plan_preview_var.set(
+            f"Selected reports: {selected_count}\n"
+            f"Planned executions: {planned}\n"
+            f"Handling mode: {handling_mode}\n"
+            f"Date mode: {frequency}{range_line}"
+        )
+
     def _apply_search_filter(self) -> None:
-        term = self.search_var.get().strip().lower()
+        self._applying_report_filter = True
         self.reports_list.delete(0, "end")
-        self.filtered_indices = []
-        for idx, name in enumerate(self.report_names):
-            if not term or term in name.lower():
-                self.reports_list.insert("end", name)
-                self.filtered_indices.append(idx)
+        self.filtered_indices = filter_report_indices(
+            self.report_names,
+            self.report_ids,
+            search_term=self.search_var.get(),
+            selected_report_ids=self.selected_report_ids,
+            show_selected_only=self.show_selected_only_var.get(),
+            app=self.app_var.get().strip(),
+        )
+        for display_idx, idx in enumerate(self.filtered_indices):
+            name = self.report_names[idx]
+            self.reports_list.insert("end", name)
+            if self._report_key(idx) in self.selected_report_ids:
+                self.reports_list.selection_set(display_idx)
+        self._applying_report_filter = False
+        self._update_selection_controls()
 
     def _load_recovery_payloads(self, *, announce: bool) -> list[dict[str, object]]:
         payloads, lines = inspect_unfinished_batch_journals()
@@ -833,6 +980,8 @@ class ReportsApp(ttk.Frame):
             self.report_ids = ids
             self.report_names = names
             self.report_email_flags = email_flags
+            self.selected_report_ids.clear()
+            self.show_selected_only_var.set(False)
             self._apply_search_filter()
             self._append_log(f"Loaded {len(names)} report(s).")
 
@@ -848,6 +997,9 @@ class ReportsApp(ttk.Frame):
             self.report_email_flags = []
             self.reports_list.delete(0, "end")
             self.filtered_indices = []
+            self.selected_report_ids.clear()
+            self.show_selected_only_var.set(False)
+            self._update_selection_controls()
 
         run_with_progress(
             self.master,
@@ -864,9 +1016,52 @@ class ReportsApp(ttk.Frame):
         else:
             self.reports_list.delete(0, "end")
             self.filtered_indices = []
+            self._update_selection_controls()
 
     def on_clear_search(self) -> None:
         self.search_var.set("")
+
+    def on_report_selection_changed(self, event=None) -> None:
+        if self._applying_report_filter:
+            return
+        visible_selected = set(self.reports_list.curselection())
+        for display_idx, report_idx in enumerate(self.filtered_indices):
+            report_key = self._report_key(report_idx)
+            if display_idx in visible_selected:
+                self.selected_report_ids.add(report_key)
+            else:
+                self.selected_report_ids.discard(report_key)
+        if self.show_selected_only_var.get():
+            self._apply_search_filter()
+        else:
+            self._update_selection_controls()
+
+    def on_show_selected_only_toggled(self) -> None:
+        self._apply_search_filter()
+
+    def on_review_selected(self) -> None:
+        selected_names = self._selected_report_names_from_state()
+        if not selected_names:
+            self._show_prompt("Selected reports", "No reports selected.", "info")
+            return
+        shown = "\n".join(f"- {name}" for name in selected_names[:25])
+        if len(selected_names) > 25:
+            shown += f"\n... and {len(selected_names) - 25} more"
+        self._show_prompt("Selected reports", shown, "info")
+
+    def on_clear_selected(self) -> None:
+        self.selected_report_ids.clear()
+        self._apply_search_filter()
+
+    def on_frequency_changed(self, event=None) -> None:
+        if self.frequency_var.get() == DATE_MODE_CUSTOM_RANGE:
+            if self.end_time_var.get() == "00:00":
+                self.end_time_var.set("23:59")
+        else:
+            self.start_time_var.set("00:00")
+            self.end_time_var.set("00:00")
+        self.on_no_change_toggled()
+        self._update_run_plan_preview()
 
     def _dispatch_worker(
         self,
@@ -993,6 +1188,10 @@ class ReportsApp(ttk.Frame):
         else:
             self.start_date_widget.configure(state=state)
             self.end_date_widget.configure(state=state)
+        time_state = "normal" if (not no_change and self.frequency_var.get() == DATE_MODE_CUSTOM_RANGE) else "disabled"
+        self.start_time_entry.configure(state=time_state)
+        self.end_time_entry.configure(state=time_state)
+        self._update_run_plan_preview()
 
     def _manual_regen_prompt_text(
         self,
@@ -1027,16 +1226,10 @@ class ReportsApp(ttk.Frame):
             self.on_recover_clicked()
             return
 
-        # Selected reports
-        selected_display_indices = list(self.reports_list.curselection())
-        if not selected_display_indices:
+        selected_indices = self._selected_indices_from_state()
+        if not selected_indices:
             self._show_prompt("No reports selected", "Please select at least one report.", "info")
             return
-        selected_indices = [
-            self.filtered_indices[i]
-            for i in selected_display_indices
-            if i < len(self.filtered_indices)
-        ]
 
         selected_report_names = [self.report_names[i] for i in selected_indices]
         frequency = self.frequency_var.get()
@@ -1044,38 +1237,44 @@ class ReportsApp(ttk.Frame):
 
         # Dates
         if not no_change:
-            start_d = self._get_date_from_widget(self.start_date_widget)
-            end_d = self._get_date_from_widget(self.end_date_widget)
-            if start_d is None or end_d is None:
+            try:
+                start, end = self._resolve_selected_datetime_range(frequency)
+            except ValueError as exc:
                 self._show_prompt(
-                    "Invalid dates",
-                    "Please enter valid Start and End dates (YYYY-MM-DD).",
+                    "Invalid date range",
+                    str(exc),
                     "warning",
                 )
                 return
-
-            start = datetime(start_d.year, start_d.month, start_d.day)
-            end = datetime(end_d.year, end_d.month, end_d.day)
             if end <= start:
                 self._show_prompt("Invalid date range", "End date must be after start date.", "warning")
                 return
-            starts, _ = build_slices(start, end, frequency)
-            if len(starts) == 0:
-                self._show_prompt("Invalid range", "Selected date range generates 0 slices.", "warning")
-                return
-            if len(starts) > 12:
-                self._show_prompt(
-                    "Invalid range",
-                    "Selected date range generates more than 12 slices.",
-                    "warning",
+            try:
+                run_plan = build_run_plan(
+                    self.report_ids,
+                    self.report_names,
+                    selected_indices,
+                    date_mode=frequency,
+                    start=start,
+                    end=end,
+                    no_change=False,
+                    app=self.app_var.get().strip(),
                 )
+            except ValueError as exc:
+                self._show_prompt("Invalid range", str(exc), "warning")
                 return
-            range_text = f"{start_d.isoformat()} to {end_d.isoformat()}"
-            total_runs = len(starts) * len(selected_indices)
-            mode_text = (
-                f"{frequency.lower()} slices: {len(starts)} per report "
-                f"({total_runs} total)"
-            )
+            if frequency == DATE_MODE_CUSTOM_RANGE:
+                range_text = f"{start.strftime('%Y-%m-%d %H:%M')} to {end.strftime('%Y-%m-%d %H:%M')} (local/Splunk convention)"
+                mode_text = f"custom range ({run_plan.planned_execution_count} total)"
+            else:
+                range_text = f"{start.date().isoformat()} to {end.date().isoformat()}"
+                per_report = run_plan.planned_execution_count // max(1, run_plan.selected_report_count)
+                mode_text = (
+                    f"{frequency.lower()} slices: {per_report} per report "
+                    f"({run_plan.planned_execution_count} total)"
+                )
+            handling_mode = run_plan.handling_mode
+            planned_execution_count = run_plan.planned_execution_count
         else:
             start_d = self._get_date_from_widget(self.start_date_widget)
             end_d = self._get_date_from_widget(self.end_date_widget)
@@ -1088,12 +1287,30 @@ class ReportsApp(ttk.Frame):
                 start = datetime(today.year, today.month, today.day)
                 end = start
                 range_text = "saved search time range (no override)"
-            mode_text = f"single run per report ({len(selected_indices)} total)"
+            run_plan = build_run_plan(
+                self.report_ids,
+                self.report_names,
+                selected_indices,
+                date_mode=frequency,
+                start=start,
+                end=end,
+                no_change=True,
+                app=self.app_var.get().strip(),
+            )
+            mode_text = f"single run per report ({run_plan.planned_execution_count} total)"
+            handling_mode = run_plan.handling_mode
+            planned_execution_count = run_plan.planned_execution_count
 
         prompt_text = self._manual_regen_prompt_text(
             selected_report_names=selected_report_names,
             range_text=range_text,
-            mode_text=mode_text,
+            mode_text=(
+                f"{mode_text}\n"
+                f"Selected reports: {len(selected_indices)}\n"
+                f"Planned executions: {planned_execution_count}\n"
+                f"Handling mode: {handling_mode}\n"
+                f"Date mode: {frequency}"
+            ),
         )
         proceed = self._show_prompt(
             "Confirm Manual Regeneration",
@@ -1119,8 +1336,8 @@ class ReportsApp(ttk.Frame):
 
         self._append_log("")
         self._append_log(
-            f"Sending {len(selected_indices)} report(s) - frequency={frequency}, "
-            f"range={start} -> {end}, no_change={no_change}"
+            f"Sending {len(selected_indices)} report(s) - planned_executions={planned_execution_count}, "
+            f"handling_mode={handling_mode}, frequency={frequency}, range={start} -> {end}, no_change={no_change}"
         )
         self._last_display_line = ""
         self._current_reference_id = ""
