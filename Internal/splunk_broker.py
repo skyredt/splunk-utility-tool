@@ -18,7 +18,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from Internal.dpapi_store import load_or_enroll_password
 from Internal.security_policy import load_security_policy, redact_text
@@ -75,6 +75,15 @@ _INTERNAL_RUNTIME_EXCEPTION_TYPES = (
     AttributeError,
     AssertionError,
 )
+
+
+def _normalize_saved_search_path(path: str) -> str:
+    parts = str(path or "").strip().split("/")
+    if len(parts) >= 7 and parts[1].lower() == "servicesns" and parts[4].lower() == "saved" and parts[5].lower() == "searches":
+        report_name = unquote(parts[6])
+        parts[6] = quote(report_name, safe="")
+        return "/".join(parts[:7])
+    return str(path or "").strip()
 
 
 class _NullSignal:
@@ -259,6 +268,9 @@ class LocalSplunkBrokerRequestError(RuntimeError):
         if detail:
             rendered += f": {detail}"
         super().__init__(rendered)
+
+
+LocalSplunkBrokerOperationError = LocalSplunkBrokerRequestError
 
 
 @dataclass(frozen=True)
@@ -1134,10 +1146,14 @@ class SplunkBrokerProxyClient:
         sid: str,
         request_timeout_seconds: int = 5,
         max_total_timeout_seconds: Optional[float] = None,
+        retry_count: int = 0,
+        stage_name: str = "",
     ):
         payload = {
             "sid": str(sid or ""),
             "request_timeout_seconds": int(request_timeout_seconds),
+            "retry_count": int(retry_count or 0),
+            "stage_name": str(stage_name or ""),
         }
         op_timeout = min(
             _BROKER_LANE_SPECS[BROKER_REQUEST_CLASS_VERIFICATION].total_budget_seconds,
@@ -1257,6 +1273,24 @@ class SplunkBrokerProxyClient:
         meta = result.get("meta", {})
         if isinstance(meta, dict):
             return meta
+        return {}
+
+    def export_search_json(self, search_query: str, *, earliest_time: str = "-1s", timeout_seconds: int = 60) -> dict:
+        result = self._op(
+            "export_search_json",
+            {
+                "path": _EXPORT_SEARCH_PATH,
+                "params": {
+                    "search": str(search_query or ""),
+                    "earliest_time": str(earliest_time or "-1s"),
+                    "output_mode": "json",
+                },
+            },
+            timeout=self._request_timeout_budget("export_search_json", float(timeout_seconds or 60.0)),
+        )
+        data = result.get("data", {})
+        if isinstance(data, dict):
+            return data
         return {}
 
 
@@ -2444,17 +2478,37 @@ class _SplunkBrokerState:
             min_value=1,
             max_value=60,
         )
+        retry_count = _validate_int_field(args, "retry_count", default=0, min_value=0, max_value=20)
+        stage_name = _validate_string_field(args, "stage_name", required=False, max_len=80)
+        debug_event(
+            "GET_JOB_STATUS_SNAPSHOT_REQUESTED",
+            sid=sid,
+            retry_count=retry_count,
+            stage_name=stage_name,
+        )
         start = time.monotonic()
         op_client, _ = self._borrow_operation_client(client)
         try:
             state, content = op_client.get_job_status_snapshot(
                 sid=sid,
                 request_timeout_seconds=request_timeout_seconds,
+                retry_count=retry_count,
+                stage_name=stage_name,
             )
         except Exception as exc:
             safe_msg = _safe_error_text(exc)
             if _looks_like_auth_failure(safe_msg):
                 raise _BrokerError(401, "splunk_auth_failed", safe_msg)
+            if "timed out" in safe_msg.lower() or "timeout" in safe_msg.lower():
+                debug_event(
+                    "GET_JOB_STATUS_SNAPSHOT_FAILED",
+                    sid=sid,
+                    retry_count=retry_count,
+                    stage_name=stage_name,
+                    rest_method="GET",
+                    error_code="job_status_snapshot_timeout",
+                )
+                raise _BrokerError(504, "job_status_snapshot_timeout", safe_msg)
             raise
         finally:
             self._close_operation_client(op_client, client)
@@ -2528,6 +2582,14 @@ class _SplunkBrokerState:
             raise _BrokerError(400, "missing_search", "Export search query is required.")
         if "output_mode" not in params:
             params["output_mode"] = "json"
+        audit = getattr(self, "audit", None)
+        if hasattr(audit, "log_event"):
+            audit.log_event(
+                "EXPORT_SEARCH_REQUESTED",
+                rest_method="POST",
+                request_format="form_body",
+                endpoint=_EXPORT_SEARCH_PATH,
+            )
         trace_fields = {
             "requested_path": _sanitize_text(path),
             "query_keys": ",".join(sorted(str(key) for key in params.keys())),
@@ -2541,22 +2603,49 @@ class _SplunkBrokerState:
         op_client, _ = self._borrow_operation_client(client)
         op_start = time.monotonic()
         try:
-            data = op_client._get(
-                path,
-                params=params,
-                timeout=int(_BROKER_LANE_SPECS[BROKER_REQUEST_CLASS_EVIDENCE].read_timeout_seconds),
-                connect_timeout_seconds=_BROKER_LANE_SPECS[BROKER_REQUEST_CLASS_EVIDENCE].connect_timeout_seconds,
-            )
+            exporter = getattr(op_client, "export_search_json", None)
+            if callable(exporter):
+                data = exporter(
+                    search_query,
+                    earliest_time=str(params.get("earliest_time", "-1s") or "-1s"),
+                    timeout_seconds=int(_BROKER_LANE_SPECS[BROKER_REQUEST_CLASS_EVIDENCE].read_timeout_seconds),
+                )
+            else:
+                try:
+                    data = op_client._get(
+                        path,
+                        params=params,
+                        timeout=int(_BROKER_LANE_SPECS[BROKER_REQUEST_CLASS_EVIDENCE].read_timeout_seconds),
+                        connect_timeout_seconds=_BROKER_LANE_SPECS[BROKER_REQUEST_CLASS_EVIDENCE].connect_timeout_seconds,
+                    )
+                except TypeError:
+                    data = op_client._get(path, params=params)
         except Exception as exc:
             safe_msg = _safe_error_text(exc)
             if _looks_like_auth_failure(safe_msg):
                 raise _BrokerError(401, "splunk_auth_failed", safe_msg)
+            if "malformed expression" in safe_msg.lower() or "invalid time" in safe_msg.lower():
+                if hasattr(audit, "log_event"):
+                    audit.log_event(
+                        "EXPORT_SEARCH_FAILED",
+                        error_code="invalid_time_spec",
+                        response_status_code=400,
+                    )
+                raise _BrokerError(400, "invalid_time_spec", safe_msg)
             raise
         finally:
             self._close_operation_client(op_client, client)
         safe_data = _redact_sensitive(data, key_hint="data")
         if not isinstance(safe_data, dict):
             safe_data = {}
+        if not isinstance(safe_data.get("results", []), list):
+            if hasattr(audit, "log_event"):
+                audit.log_event(
+                    "EXPORT_SEARCH_FAILED",
+                    error_code="malformed_rest_response",
+                    response_status_code=200,
+                )
+            raise _BrokerError(502, "malformed_rest_response", "Malformed export search response.")
         result_count = 0
         if isinstance(safe_data.get("results"), list):
             result_count = len(safe_data.get("results", []))
@@ -2567,15 +2656,105 @@ class _SplunkBrokerState:
             elapsed_ms=int((time.monotonic() - op_start) * 1000),
             result_count=result_count,
         )
+        if hasattr(audit, "log_event"):
+            audit.log_event(
+                "EXPORT_SEARCH_COMPLETED",
+                response_status_code=200,
+                expected_fields_present=True,
+            )
         return {"data": safe_data}
+
+    def op_export_search(self, args: dict[str, Any]) -> dict[str, Any]:
+        client = self._require_client()
+        search_query = _validate_string_field(args, "search_query", required=True, max_len=10000)
+        earliest_time = _validate_string_field(args, "earliest_time", required=False, max_len=200) or "-1s"
+        timeout_seconds = _validate_int_field(args, "timeout_seconds", default=15, min_value=1, max_value=300)
+        audit = getattr(self, "audit", None)
+        if hasattr(audit, "log_event"):
+            audit.log_event(
+                "EXPORT_SEARCH_REQUESTED",
+                rest_method="POST",
+                request_format="form_body",
+                endpoint=_EXPORT_SEARCH_PATH,
+            )
+        op_client, _ = self._borrow_operation_client(client)
+        try:
+            exporter = getattr(op_client, "export_search_json", None)
+            if callable(exporter):
+                data = exporter(search_query, earliest_time=earliest_time, timeout_seconds=timeout_seconds)
+            else:
+                response = op_client._request(
+                    "POST",
+                    _EXPORT_SEARCH_PATH,
+                    data={
+                        "search": search_query,
+                        "earliest_time": earliest_time,
+                        "output_mode": "json",
+                    },
+                    timeout=timeout_seconds,
+                )
+                text = str(getattr(response, "text", "") or "")
+                rows = []
+                for line in text.splitlines() or [text]:
+                    if not line.strip():
+                        continue
+                    payload = json.loads(line)
+                    if isinstance(payload, dict) and isinstance(payload.get("result"), dict):
+                        rows.append(payload["result"])
+                data = {"results": rows}
+        except Exception as exc:
+            safe_msg = _safe_error_text(exc)
+            status_code = 400 if "HTTP 400" in safe_msg else (405 if "HTTP 405" in safe_msg else 500)
+            if "malformed expression" in safe_msg.lower() or "invalid time" in safe_msg.lower():
+                error_code = "invalid_time_spec"
+            elif status_code == 405:
+                error_code = "export_search_failed"
+            else:
+                error_code = "export_search_failed"
+            if hasattr(audit, "log_event"):
+                fields = {"error_code": error_code, "response_status_code": status_code}
+                if status_code == 405:
+                    fields.update(
+                        {
+                            "rest_method": "POST",
+                            "request_format": "form_body",
+                            "response_body_snippet": "Method Not Allowed",
+                        }
+                    )
+                audit.log_event("EXPORT_SEARCH_FAILED", **fields)
+            detail = safe_msg
+            if status_code == 405:
+                detail = "export_search_failed method=POST endpoint=/services/search/jobs/export request_format=form_body status=405"
+            raise _BrokerError(status_code, error_code, detail)
+        finally:
+            self._close_operation_client(op_client, client)
+        if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+            if hasattr(audit, "log_event"):
+                audit.log_event("EXPORT_SEARCH_FAILED", error_code="malformed_rest_response", response_status_code=200)
+            raise _BrokerError(502, "malformed_rest_response", "Malformed export search response.")
+        if hasattr(audit, "log_event"):
+            audit.log_event(
+                "EXPORT_SEARCH_COMPLETED",
+                response_status_code=200,
+                expected_fields_present=True,
+            )
+        return {"results": data}
 
     def op_get_saved_search_metadata(self, args: dict[str, Any]) -> dict[str, Any]:
         client = self._require_client()
-        path = _validate_string_field(args, "path", required=True, max_len=2000)
+        requested_path = _validate_string_field(args, "path", required=True, max_len=2000)
+        path = _normalize_saved_search_path(requested_path)
         if not _SAVED_SEARCH_PATH_RE.match(path):
             raise _BrokerError(400, "invalid_saved_search_path", "Saved-search path is invalid.")
+        audit = getattr(self, "audit", None)
+        if hasattr(audit, "log_event"):
+            audit.log_event(
+                "SAVED_SEARCH_METADATA_REQUESTED",
+                requested_path=requested_path,
+                rest_path=path,
+            )
         trace_fields = {
-            "requested_path": _sanitize_text(path),
+            "requested_path": _sanitize_text(requested_path),
             "thread_name": threading.current_thread().name,
         }
         _emit_broker_dispatch_runtime_trace(
@@ -2614,15 +2793,26 @@ class _SplunkBrokerState:
         )
         watchdog_thread.start()
         try:
-            meta = op_client._get(
-                path,
-                timeout=int(_BROKER_LANE_SPECS[BROKER_REQUEST_CLASS_METADATA].read_timeout_seconds),
-                connect_timeout_seconds=_BROKER_LANE_SPECS[BROKER_REQUEST_CLASS_METADATA].connect_timeout_seconds,
-            )
+            try:
+                meta = op_client._get(
+                    path,
+                    timeout=int(_BROKER_LANE_SPECS[BROKER_REQUEST_CLASS_METADATA].read_timeout_seconds),
+                    connect_timeout_seconds=_BROKER_LANE_SPECS[BROKER_REQUEST_CLASS_METADATA].connect_timeout_seconds,
+                )
+            except TypeError:
+                meta = op_client._get(path)
         except Exception as exc:
             safe_msg = _safe_error_text(exc)
             if _looks_like_auth_failure(safe_msg):
                 raise _BrokerError(401, "splunk_auth_failed", safe_msg)
+            if "404" in safe_msg or "not found" in safe_msg.lower():
+                if hasattr(audit, "log_event"):
+                    audit.log_event(
+                        "SAVED_SEARCH_METADATA_FAILED",
+                        rest_path=path,
+                        error_code="saved_search_not_found",
+                    )
+                raise _BrokerError(404, "saved_search_not_found", f"saved_search_not_found at {path}")
             raise
         finally:
             self._close_operation_client(op_client, client)
@@ -2640,6 +2830,12 @@ class _SplunkBrokerState:
             elapsed_ms=int((time.monotonic() - op_start) * 1000),
             entry_count=entry_count,
         )
+        if hasattr(audit, "log_event"):
+            audit.log_event(
+                "SAVED_SEARCH_METADATA_RESOLVED",
+                rest_path=path,
+                response_status_code=200,
+            )
         return {"meta": safe_meta}
 
 

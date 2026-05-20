@@ -6,7 +6,7 @@ import os
 import tempfile
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 
 STATE_SCHEMA_VERSION = 2
@@ -94,7 +94,17 @@ def _atomic_write_json(path: str, payload: dict[str, Any]) -> None:
         handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temp_path, path)
+    replace_error: Optional[Exception] = None
+    for attempt in range(5):
+        try:
+            os.replace(temp_path, path)
+            replace_error = None
+            break
+        except PermissionError as exc:
+            replace_error = exc
+            time.sleep(0.05 * (attempt + 1))
+    if replace_error is not None:
+        raise replace_error
     _best_effort_fsync_directory(path)
 
 

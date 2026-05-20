@@ -670,6 +670,11 @@ class ReportsApp(ttk.Frame):
         return stable_report_id(report_id, report_name, app=self.app_var.get().strip())
 
     def _selected_indices_from_state(self) -> list[int]:
+        if not hasattr(self, "selected_report_ids"):
+            try:
+                return [self.filtered_indices[i] for i in self.reports_list.curselection()]
+            except Exception:
+                return []
         indices: list[int] = []
         for idx, _name in enumerate(self.report_names):
             if self._report_key(idx) in self.selected_report_ids:
@@ -1349,24 +1354,11 @@ class ReportsApp(ttk.Frame):
 
         merge_report_settings = resolve_merge_report_runtime_settings(self.cfg)
 
-        # Initialize optional local MergeReport file monitor only when this host can read the file.
-        if bool(merge_report_settings.get("enabled")) and bool(merge_report_settings.get("local_file_available")):
-            try:
-                self._merge_report_monitor = MergeReportMonitor(
-                    log_path=str(merge_report_settings.get("local_file_path", "") or ""),
-                    ui_queue=self._dispatch_queue,
-                    timeout_seconds=int(
-                        merge_report_settings.get("timeout_seconds", self.cfg.merge_report_timeout_seconds)
-                        or self.cfg.merge_report_timeout_seconds
-                    ),
-                )
-                self._merge_report_monitor.start()
-                self._append_log("[MergeReport] Monitor started.")
-            except Exception as e:
-                self._append_log(f"[MergeReport] WARNING: Could not start monitor: {redact_text(str(e))}")
-                self._merge_report_monitor = None
-        else:
-            if bool(merge_report_settings.get("enabled")):
+        self._merge_report_monitor = None
+        if bool(merge_report_settings.get("enabled")):
+            if bool(merge_report_settings.get("local_file_available")):
+                self._append_log("[MergeReport] Local file monitor skipped; engine verification is active.")
+            else:
                 self._append_log(
                     (
                         f"[Debug] MERGEREPORT_FILE_UNAVAILABLE local_path="
@@ -1376,7 +1368,6 @@ class ReportsApp(ttk.Frame):
                     )
                 )
                 self._append_log("[MergeReport] Local file monitor skipped; non-file verification remains active.")
-            self._merge_report_monitor = None
 
         # Initialize post-dispatch status monitor if enabled (Phase 2)
         # DISABLED: Not needed for simple dispatch summary

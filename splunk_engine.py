@@ -57,6 +57,12 @@ from Internal.batch_state import (
 )
 from Internal.config_manager import load_and_validate_config
 from Internal.security_policy import PolicyViolation, SecurityPolicy, load_security_policy, redact_text
+from Internal.tool_logging import (
+    debug_category_enabled as _tool_debug_category_enabled,
+    debug_event as _tool_debug_event,
+    normalize_file_logging_settings,
+    runtime_log as _tool_runtime_log,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +108,15 @@ DATE_MODE_CUSTOM_RANGE = "Custom Range"
 DATE_MODES = ("Daily", "Weekly", "Monthly", DATE_MODE_CUSTOM_RANGE)
 HANDLING_MODE_PREMIUM = "Premium Handling"
 HANDLING_MODE_THROUGHPUT = "Throughput Handling"
+REPORT_TYPE_MERGEREPORT = "merge_report"
+REPORT_TYPE_NATIVE = "native_email"
+REPORT_TYPE_UNKNOWN = "unknown"
+VERIFICATION_MODE_MERGEREPORT = "merge_report"
+VERIFICATION_MODE_NATIVE = "native_email"
+VERIFICATION_MODE_FALLBACK = "fallback"
+VERIFICATION_SOURCE_MERGEREPORT = "merge_report"
+VERIFICATION_SOURCE_NATIVE = "native_email"
+VERIFICATION_SOURCE_FALLBACK = "fallback"
 DISPATCH_REQUEST_CLASS = "dispatch_critical"
 _DISPATCH_MINIMAL_FORM_FIELDS = (
     "output_mode",
@@ -125,6 +140,7 @@ SLICE_STATE_FAILED_VERIFICATION = "FAILED_VERIFICATION"
 SLICE_STATE_TIMEOUT_UNCERTAIN = "TIMEOUT_UNCERTAIN"
 SLICE_STATE_PENDING_RECONCILE = "PENDING_RECONCILE"
 SLICE_STATE_EXPIRED = "EXPIRED"
+SLICE_STATE_CANCELLED = "CANCELLED"
 PENDING_SLICE_STATES = {
     SLICE_STATE_TIMEOUT_UNCERTAIN,
     SLICE_STATE_PENDING_RECONCILE,
@@ -222,6 +238,7 @@ class SplunkConfig:
     postdispatch_config: Optional[dict] = None
     # Plain-text logging settings propagated to the UI runtime payload
     file_logging_config: Optional[dict] = None
+    diagnostics_config: Optional[dict] = None
     runtime_config: Optional[dict] = None
 
     def load_auth_token(self) -> str:
@@ -450,6 +467,10 @@ class RegenSliceRecord:
     execution_outcome: str = ""
     evidence_outcome: str = ""
     business_outcome: str = ""
+    verification_source: str = ""
+    verification_timeline: dict[str, Any] = field(default_factory=dict)
+    display_range: str = ""
+    time_source: str = ""
 
 
 @dataclass
@@ -678,15 +699,649 @@ def build_run_plan(
     )
 
 
+class ReportClassificationResolutionError(RuntimeError):
+    """Raised when saved-search metadata is insufficient for safe classification."""
+
+
+@dataclass(frozen=True)
+class ReportClassificationDecision:
+    report_type: str
+    verification_mode: str
+    verification_source: str
+    classification_reason: str
+    rejected_alternatives: List[str] = field(default_factory=list)
+    action_inputs: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ReportingWindow:
+    report_name: str
+    report_earliest: datetime
+    report_latest: datetime
+    dispatch_earliest: str
+    dispatch_latest: str
+    display_range: str
+    time_source: str = "manual"
+    resolution_path: str = "manual"
+    cron_schedule: str = ""
+    app: str = ""
+    owner: str = ""
+
+
+@dataclass
+class _MergeReportEvidence:
+    success: bool = False
+    failed: bool = False
+    email_sent: bool = False
+    artifact_created: bool = False
+    success_marker: str = ""
+    failure_marker: str = ""
+    last_detail: str = ""
+    timeline: list[dict[str, Any]] = field(default_factory=list)
+
+
+def tool_runtime_log(message: str, level: str = "INFO") -> bool:
+    return _tool_runtime_log(message, level=level)
+
+
+def tool_debug_category_enabled(category: str) -> bool:
+    return _tool_debug_category_enabled(category)
+
+
+def tool_debug_event(event: str, **fields: Any) -> bool:
+    return _tool_debug_event(event, category="dispatch", **fields)
+
+
+def _emit_dispatch_debug_event(event: str, **fields: Any) -> None:
+    level = str(fields.pop("level", "INFO") or "INFO")
+    if tool_debug_category_enabled("dispatch"):
+        tool_debug_event(event, **fields)
+    tool_runtime_log(event, level=level)
+
+
+def _truthy_action(value: Any) -> bool:
+    return value in (1, "1", True, "true", "True", "yes", "on")
+
+
+def _content_has_merge_report(content: Optional[dict[str, Any]]) -> bool:
+    if not isinstance(content, dict):
+        return False
+    if _truthy_action(content.get("action.mergeReport")) or _truthy_action(content.get("action.mergereport")):
+        return True
+    return any(key.lower().startswith("action.mergereport") and str(value).strip() for key, value in content.items())
+
+
+def _content_has_native_email(content: Optional[dict[str, Any]]) -> bool:
+    if not isinstance(content, dict):
+        return False
+    if _truthy_action(content.get("action.email")) or str(content.get("action.email.to", "")).strip():
+        return True
+    actions = content.get("actions")
+    return (isinstance(actions, dict) and bool(actions.get("email"))) or (
+        isinstance(actions, list) and "email" in actions
+    )
+
+
+def _classify_report_type(content: Optional[dict[str, Any]]) -> Tuple[str, str]:
+    merge_found = _content_has_merge_report(content)
+    native_found = _content_has_native_email(content)
+    if merge_found:
+        return REPORT_TYPE_MERGEREPORT, "MergeReport markers found"
+    if native_found:
+        return REPORT_TYPE_NATIVE, "Native email markers found"
+    return REPORT_TYPE_UNKNOWN, "metadata_incomplete"
+
+
+def _classify_report_type_with_fallback(
+    client: Any,
+    report_name: str,
+    content: Optional[dict[str, Any]],
+    config: Optional[SplunkConfig] = None,
+) -> Tuple[str, str]:
+    del client, report_name, config
+    return _classify_report_type(content)
+
+
+def _resolve_verification_mode(report_type: str, config: Optional[SplunkConfig]) -> Tuple[str, str]:
+    postdispatch = dict(config.postdispatch_config) if config is not None and isinstance(config.postdispatch_config, dict) else {}
+    merge_enabled = _parse_bool(postdispatch.get("merge_report_enabled", True), True)
+    native_enabled = _parse_bool(postdispatch.get("native_email_enabled", True), True)
+    if report_type == REPORT_TYPE_MERGEREPORT and merge_enabled:
+        return VERIFICATION_MODE_MERGEREPORT, VERIFICATION_SOURCE_MERGEREPORT
+    if report_type == REPORT_TYPE_NATIVE and native_enabled:
+        return VERIFICATION_MODE_NATIVE, VERIFICATION_SOURCE_NATIVE
+    if native_enabled:
+        return VERIFICATION_MODE_FALLBACK, VERIFICATION_SOURCE_FALLBACK
+    return VERIFICATION_MODE_FALLBACK, VERIFICATION_SOURCE_FALLBACK
+
+
+def _resolve_report_classification(
+    *,
+    report_name: str,
+    content: Optional[dict[str, Any]],
+    entry: Optional[dict[str, Any]],
+    metadata_path: str,
+    namespace_used: Optional[dict[str, Any]],
+    config: Optional[SplunkConfig],
+) -> ReportClassificationDecision:
+    del metadata_path, namespace_used
+    if not isinstance(content, dict):
+        raise ReportClassificationResolutionError(f"metadata unavailable for classification: {report_name}")
+    entry_content = entry.get("content", {}) if isinstance(entry, dict) else {}
+    merged_content = dict(content)
+    if isinstance(entry_content, dict):
+        merged_content.update(entry_content)
+    report_type, reason = _classify_report_type(merged_content)
+    merge_found = _content_has_merge_report(merged_content)
+    native_found = _content_has_native_email(merged_content)
+    rejected: List[str] = []
+    if merge_found and native_found:
+        rejected.append("native rejected because MergeReport markers take precedence")
+    mode, source = _resolve_verification_mode(report_type, config)
+    return ReportClassificationDecision(
+        report_type=report_type,
+        verification_mode=mode,
+        verification_source=source,
+        classification_reason=reason,
+        rejected_alternatives=rejected,
+        action_inputs={
+            "merge_markers_found": merge_found,
+            "native_markers_found": native_found,
+        },
+    )
+
+
+def _should_warn_missing_addinfo(report_type: str, content: Optional[dict[str, Any]]) -> bool:
+    if report_type != REPORT_TYPE_MERGEREPORT:
+        return False
+    search = str((content or {}).get("search", "") or "").lower()
+    return "addinfo" not in search
+
+
+def _fetch_saved_search_entry(
+    client: Any,
+    *,
+    report_id_url: str,
+    report_name: str,
+    app: str = "",
+    username: str = "",
+    namespace_meta: Optional[dict[str, Any]] = None,
+) -> tuple[dict[str, Any], str, dict[str, Any], dict[str, Any]]:
+    meta = dict(namespace_meta or {})
+    candidate_path = str(meta.get("rest_path", "") or urlparse(report_id_url).path or "")
+    if not candidate_path:
+        candidate_path = _build_saved_search_candidate_paths(report_id_url, report_name, app, username)[0]
+    candidate_paths = [candidate_path]
+    for candidate in _build_saved_search_candidate_paths(report_id_url, report_name, app, username):
+        if candidate not in candidate_paths:
+            candidate_paths.append(candidate)
+    owner_hint = str(meta.get("owner", "") or "").strip()
+    app_hint = str(meta.get("app", app) or app).strip()
+    if owner_hint and app_hint:
+        generated = f"/servicesNS/{owner_hint}/{app_hint}/saved/searches/{quote(report_name, safe='')}"
+        if generated not in candidate_paths:
+            candidate_paths.append(generated)
+    getter = getattr(client, "get_saved_search_metadata", None)
+    data: dict[str, Any] = {}
+    entries: list[Any] = []
+    used_path = candidate_path
+    for path_candidate in candidate_paths:
+        try:
+            if callable(getter):
+                data = getter(
+                    path=path_candidate,
+                    report_name=report_name,
+                    app=str(meta.get("app", app) or app),
+                    owner=str(meta.get("owner", username) or username),
+                    sharing=str(meta.get("sharing", "") or ""),
+                    namespace_meta=meta,
+                    candidate_label="exact_namespace_metadata" if meta.get("rest_path") else "classification",
+                )
+            else:
+                data = client._get(path_candidate)
+        except Exception:
+            continue
+        entries = data.get("entry", []) if isinstance(data, dict) else []
+        if entries:
+            used_path = path_candidate
+            break
+    if not entries:
+        raise ReportClassificationResolutionError(f"metadata unavailable for classification: {report_name}")
+    entry = dict(entries[0])
+    content = dict(entry.get("content", {}) or {})
+    acl = dict(entry.get("acl", {}) or {})
+    namespace_used = {
+        "app": str(acl.get("app", meta.get("app", app)) or ""),
+        "owner": str(acl.get("owner", meta.get("owner", username)) or ""),
+        "sharing": str(acl.get("sharing", meta.get("sharing", "")) or ""),
+    }
+    return content, used_path, entry, namespace_used
+
+
+def build_manual_reporting_window(report_name: str, start: datetime, end: datetime) -> ReportingWindow:
+    return ReportingWindow(
+        report_name=report_name,
+        report_earliest=start,
+        report_latest=end,
+        dispatch_earliest=to_epoch(start),
+        dispatch_latest=to_epoch(end),
+        display_range=f"{start} to {end}",
+        time_source="manual",
+        resolution_path="manual",
+    )
+
+
+def _extract_savedsearch_window_tokens(content: dict[str, Any]) -> tuple[str, str, str]:
+    earliest = str(content.get("dispatch.earliest_time", "") or content.get("earliest_time", "") or "").strip()
+    latest = str(content.get("dispatch.latest_time", "") or content.get("latest_time", "") or "").strip()
+    path = "dispatch" if ("dispatch.earliest_time" in content or "dispatch.latest_time" in content) else "savedsearch_fields"
+    if not earliest or not latest:
+        search = str(content.get("search", "") or "")
+        earliest_match = re.search(r'earliest="?([^"\s|]+)"?', search)
+        latest_match = re.search(r'latest="?([^"\s|]+)"?', search)
+        if earliest_match:
+            earliest = earliest_match.group(1)
+        if latest_match:
+            latest = latest_match.group(1)
+        if earliest or latest:
+            path = "spl_tokens"
+    if (not earliest or not latest) and str(content.get("cron_schedule", "") or "").strip():
+        schedule = str(content.get("cron_schedule", "") or "").strip()
+        fields = schedule.split()
+        if len(fields) >= 5 and fields[4] not in {"*", "?"}:
+            earliest, latest, path = "-1w@w", "@w", "cron_schedule_weekly"
+        else:
+            earliest, latest, path = "-1d@d", "@d", "cron_schedule_daily"
+    return earliest, latest, path
+
+
+def resolve_saved_search_reporting_window(
+    client: Any,
+    *,
+    report_id_url: str,
+    report_name: str,
+    app: str,
+    username: str,
+    dispatch_anchor_epoch: int,
+    config: Optional[SplunkConfig] = None,
+    namespace_meta: Optional[dict[str, Any]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> ReportingWindow:
+    content, metadata_path, entry, namespace_used = _fetch_saved_search_entry(
+        client,
+        report_id_url=report_id_url,
+        report_name=report_name,
+        app=app,
+        username=username,
+        namespace_meta=namespace_meta,
+    )
+    del metadata_path
+    if log_callback and getattr(config, "logging_verbose", False):
+        log_callback("[Debug] Saved search retrieved successfully")
+    earliest_token, latest_token, resolution_path = _extract_savedsearch_window_tokens(content)
+    if log_callback and getattr(config, "logging_verbose", False):
+        if earliest_token:
+            log_callback(f"[Debug] Saved search dispatch.earliest_time: {earliest_token}")
+            log_callback("[Debug] Saved search dispatch.earliest_time source: content (key=dispatch.earliest_time)")
+            log_callback("[Debug] dispatch.earliest_time resolver classification: relative (accepted=true)")
+        if latest_token:
+            log_callback(f"[Debug] Saved search dispatch.latest_time: {latest_token}")
+            log_callback("[Debug] Saved search dispatch.latest_time source: content (key=dispatch.latest_time)")
+            latest_class = "now" if latest_token == "now" else "relative"
+            log_callback(f"[Debug] dispatch.latest_time resolver classification: {latest_class} (accepted=true)")
+    latest_expr = str(dispatch_anchor_epoch) if latest_token == "now" else f'relative_time({dispatch_anchor_epoch}, "{latest_token}")'
+    search_query = (
+        "| makeresults "
+        f'| eval report_earliest_epoch=relative_time({dispatch_anchor_epoch}, "{earliest_token}") '
+        f"| eval report_latest_epoch={latest_expr}"
+    )
+    exporter = getattr(client, "export_search_json")
+    result = exporter(search_query, earliest_time="-1s", timeout_seconds=60)
+    rows = result.get("results", []) if isinstance(result, dict) else []
+    row = dict(rows[0]) if rows else {}
+    display_start = str(row.get("report_earliest", row.get("report_earliest_epoch", "")) or "")
+    display_end = str(row.get("report_latest", row.get("report_latest_epoch", "")) or "")
+    display_range = f"{display_start} to {display_end}".strip()
+    if log_callback and getattr(config, "logging_verbose", False):
+        source_label = "user-scoped namespace" if namespace_used.get("owner") not in ("", "nobody") else "app-scoped namespace"
+        log_callback(f"[Debug] Saved search resolved from {source_label}")
+        log_path = {
+            "dispatch": "dispatch.earliest_time/dispatch.latest_time",
+            "savedsearch_fields": "earliest_time/latest_time",
+        }.get(resolution_path, resolution_path)
+        log_callback(f"[Debug] Time range resolution path: {log_path}")
+        if resolution_path == "dispatch":
+            log_callback("[Debug] Fallback skipped because dispatch.* succeeded")
+        if display_start:
+            log_callback(f"[Debug] Resolved earliest: {display_start}")
+        if display_end:
+            log_callback(f"[Debug] Resolved latest: {display_end}")
+        log_callback(f"[Debug] Final display range: {display_range}")
+    return ReportingWindow(
+        report_name=report_name,
+        report_earliest=datetime.fromtimestamp(int(row.get("report_earliest_epoch", dispatch_anchor_epoch))),
+        report_latest=datetime.fromtimestamp(int(row.get("report_latest_epoch", dispatch_anchor_epoch))),
+        dispatch_earliest=str(row.get("report_earliest_epoch", "")),
+        dispatch_latest=str(row.get("report_latest_epoch", "")),
+        display_range=display_range,
+        time_source="savedsearch",
+        resolution_path=resolution_path,
+        cron_schedule=str(content.get("cron_schedule", "") or ""),
+        app=namespace_used.get("app", app),
+        owner=namespace_used.get("owner", username),
+    )
+
+
+def resolve_max_slice_runtime_seconds(config: Optional[SplunkConfig]) -> int:
+    if config is None:
+        return 0
+    dispatch = config.dispatch_config if isinstance(config.dispatch_config, dict) else {}
+    postdispatch = config.postdispatch_config if isinstance(config.postdispatch_config, dict) else {}
+    return _parse_min_int(
+        dispatch.get("max_slice_runtime_seconds", postdispatch.get("max_slice_runtime_seconds")),
+        0,
+        0,
+    )
+
+
+def _new_verification_timeline(*, sid: str = "", verification_mode: str = "") -> dict[str, Any]:
+    return {
+        "sid": str(sid or "").strip(),
+        "verification_mode": str(verification_mode or "").strip(),
+        "initial_health_checked": False,
+        "file_activity_seen": False,
+        "snapshot_suppressed": False,
+        "first_mergereport_evidence_time": "",
+        "first_mergereport_evidence_log_time": "",
+        "first_mergereport_artifact_time": "",
+        "first_mergereport_artifact_log_time": "",
+        "final_status": "",
+        "final_status_source": "",
+    }
+
+
+def _parse_postdispatch_results(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        results = raw.get("results", [])
+        return {"results": list(results) if isinstance(results, list) else []}
+    parsed: list[dict[str, Any]] = []
+    for line in str(raw or "").splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            payload = json.loads(text)
+        except Exception:
+            parsed.append({"_raw": text})
+            continue
+        if isinstance(payload, dict):
+            if isinstance(payload.get("result"), dict):
+                parsed.append(dict(payload["result"]))
+            else:
+                parsed.append(payload)
+    return {"results": parsed}
+
+
+def _read_text_file_tail(path: str, *, max_bytes: int = 1024 * 1024) -> str:
+    safe_path = str(path or "").strip()
+    if not safe_path:
+        return ""
+    try:
+        with open(safe_path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max(1, int(max_bytes or 0))))
+            return handle.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _run_postdispatch_search(
+    client: Any,
+    search_query: str,
+    *,
+    earliest_time: str = "-1s",
+    timeout_seconds: int = 60,
+) -> dict[str, Any]:
+    prepared = _prepare_export_search(search_query)
+    exporter = getattr(client, "export_search_json", None)
+    if callable(exporter):
+        return exporter(prepared, earliest_time=earliest_time, timeout_seconds=timeout_seconds)
+    requester = getattr(client, "_request")
+    response = requester(
+        "POST",
+        "/services/search/jobs/export",
+        data={
+            "search": prepared,
+            "earliest_time": earliest_time,
+            "output_mode": "json",
+        },
+        timeout=timeout_seconds,
+    )
+    return _parse_postdispatch_results(getattr(response, "text", "") or "")
+
+
+def _extract_log_time(raw: str) -> str:
+    match = re.match(r"^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},\d{3})", str(raw or ""))
+    return match.group(1) if match else ""
+
+
+def _merge_report_evidence_state(evidence: _MergeReportEvidence) -> str:
+    if evidence.failed:
+        return "FAILED"
+    if evidence.success:
+        return "SUCCESS"
+    if evidence.email_sent or evidence.artifact_created or evidence.timeline:
+        return "RUNNING"
+    return "PENDING"
+
+
+def _update_merge_report_evidence(
+    results: Any,
+    evidence: dict[str, _MergeReportEvidence],
+    *,
+    timeline_map: Optional[dict[str, dict[str, Any]]] = None,
+    diagnostics_enabled: bool = False,
+    report_name_map: Optional[dict[str, str]] = None,
+    slice_label_map: Optional[dict[str, str]] = None,
+) -> None:
+    parsed = _parse_postdispatch_results(results)
+    timelines = timeline_map or {}
+    report_names = report_name_map or {}
+    slice_labels = slice_label_map or {}
+    now_text = _utc_now_iso()
+    for row in parsed.get("results", []):
+        if not isinstance(row, dict):
+            continue
+        raw = str(row.get("_raw", "") or "")
+        if not raw:
+            continue
+        log_time = _extract_log_time(raw)
+        raw_lower = raw.lower()
+        sid_match = re.search(r"\bSID=([^,\s]+)", raw, flags=re.IGNORECASE)
+        sid = sid_match.group(1).strip() if sid_match else ""
+        if not sid or sid not in evidence:
+            continue
+        item = evidence[sid]
+        item.last_detail = raw
+        item.timeline.append({"log_time": log_time, "raw": raw})
+        timeline = timelines.get(sid)
+        if timeline is not None and not timeline.get("first_mergereport_evidence_time"):
+            timeline["first_mergereport_evidence_time"] = now_text
+            timeline["first_mergereport_evidence_log_time"] = log_time
+            if diagnostics_enabled:
+                tool_debug_event(
+                    "MERGEREPORT_EVIDENCE_DETECTED",
+                    sid=sid,
+                    report_name=report_names.get(sid, ""),
+                    slice_label=slice_labels.get(sid, ""),
+                    log_time=log_time,
+                )
+        if "xlsx file created" in raw_lower or "zip file created" in raw_lower or "results.csv" in raw_lower:
+            item.artifact_created = True
+            if timeline is not None:
+                timeline["file_activity_seen"] = True
+                if not timeline.get("first_mergereport_artifact_time"):
+                    timeline["first_mergereport_artifact_time"] = now_text
+                    timeline["first_mergereport_artifact_log_time"] = log_time
+                    if diagnostics_enabled:
+                        tool_debug_event(
+                            "MERGEREPORT_ARTIFACT_DETECTED",
+                            sid=sid,
+                            report_name=report_names.get(sid, ""),
+                            slice_label=slice_labels.get(sid, ""),
+                            log_time=log_time,
+                        )
+        if "action=email sent" in raw_lower or "action=email sent" in raw_lower.replace(" ", ""):
+            item.email_sent = True
+        if "app excution completed" in raw_lower or "app execution completed" in raw_lower:
+            item.success = True
+            item.success_marker = "App excution completed" if "app excution completed" in raw_lower else "App execution completed"
+        if " error " in f" {raw_lower} " or "smtp exception" in raw_lower or "exception" in raw_lower:
+            item.failed = True
+            item.failure_marker = raw
+
+
+def _verify_postdispatch_slices(
+    client: Any,
+    context: RegenContext,
+    *,
+    config: Optional[SplunkConfig] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> List[str]:
+    logs: List[str] = []
+    postdispatch = config.postdispatch_config if config is not None and isinstance(config.postdispatch_config, dict) else {}
+    lookback_seconds = _parse_min_int(postdispatch.get("lookback_seconds"), DEFAULT_POSTDISPATCH_LOOKBACK_SECONDS, 1)
+    timeout_seconds = _parse_min_int(postdispatch.get("max_verification_duration_seconds"), 1, 1)
+    diagnostics_enabled = bool(
+        config is not None
+        and isinstance(config.diagnostics_config, dict)
+        and _parse_bool(config.diagnostics_config.get("snapshot_probe_enabled"), False)
+    )
+    pending = [
+        item
+        for item in context.slices
+        if str(getattr(item, "status", "") or "").strip().upper() == "PENDING" and str(item.sid or "").strip()
+    ]
+    if not pending:
+        return logs
+    evidence = {str(item.sid): _MergeReportEvidence() for item in pending}
+    timeline_map: dict[str, dict[str, Any]] = {}
+    report_name_map: dict[str, str] = {}
+    slice_label_map: dict[str, str] = {}
+    for item in pending:
+        sid = str(item.sid or "").strip()
+        timeline = dict(item.verification_timeline or {}) or _new_verification_timeline(
+            sid=sid,
+            verification_mode=item.verification_mode,
+        )
+        item.verification_timeline = timeline
+        timeline_map[sid] = timeline
+        report_name_map[sid] = item.report_name
+        slice_label_map[sid] = item.slice_label
+
+    merge_query = _prepare_export_search(
+        f'index=_internal source="*mergeReport_alert.log*" earliest=-{lookback_seconds}s'
+    )
+    native_query = _prepare_export_search(
+        f'index=_internal (source="splunkd.log" OR source="*python.log*") earliest=-{lookback_seconds}s'
+    )
+    python_query = _prepare_export_search(f'index=_internal source="*python.log*" earliest=-{lookback_seconds}s')
+    try:
+        merge_results = client.export_search_json(
+            merge_query,
+            earliest_time=f"-{lookback_seconds}s",
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception as exc:
+        merge_results = {"results": []}
+        _append_log(logs, f"Post-dispatch MergeReport verification query failed: {_short_error(str(exc))}", log_callback)
+    _update_merge_report_evidence(
+        merge_results,
+        evidence,
+        timeline_map=timeline_map,
+        diagnostics_enabled=diagnostics_enabled,
+        report_name_map=report_name_map,
+        slice_label_map=slice_label_map,
+    )
+    try:
+        native_results = client.export_search_json(
+            native_query,
+            earliest_time=f"-{lookback_seconds}s",
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception:
+        native_results = {"results": []}
+    try:
+        python_results = client.export_search_json(
+            python_query,
+            earliest_time=f"-{lookback_seconds}s",
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception:
+        python_results = {"results": []}
+    native_rows = list(_parse_postdispatch_results(native_results).get("results", []))
+    native_rows.extend(_parse_postdispatch_results(python_results).get("results", []))
+
+    any_pending = False
+    for item in pending:
+        sid = str(item.sid or "").strip()
+        mode = str(item.verification_mode or "").strip()
+        status = "PENDING"
+        outcome = "POSTDISPATCH_PENDING"
+        source = "stage2_inconclusive"
+        if mode == VERIFICATION_MODE_MERGEREPORT:
+            state = _merge_report_evidence_state(evidence[sid])
+            if state == "SUCCESS":
+                status, outcome, source = "OK", "SUCCESS_MERGEREPORT", "stage2_mergereport"
+            elif state == "FAILED":
+                status, outcome, source = "FAILED", "MERGEREPORT_FAILED", "stage2_mergereport"
+        else:
+            sid_lower = sid.lower()
+            raw_text = "\n".join(str(row.get("_raw", "") or "") for row in native_rows if isinstance(row, dict)).lower()
+            if sid_lower in raw_text and any(marker in raw_text for marker in ("smtpexception", "smtp exception", "error")):
+                status, outcome, source = "FAILED", "NATIVE_EMAIL_FAILED", "stage2_native_email"
+        if status == "PENDING":
+            any_pending = True
+        else:
+            _set_slice_record_state(
+                item,
+                lifecycle_state=SLICE_STATE_SUCCESS if status == "OK" else SLICE_STATE_FAILED_VERIFICATION,
+                status=status,
+                outcome_code=outcome,
+                error="" if status == "OK" else (evidence[sid].failure_marker or "Post-dispatch verification failed."),
+            )
+        item.verification_timeline["final_status"] = status
+        item.verification_timeline["final_status_source"] = source
+        if diagnostics_enabled and status != "PENDING":
+            summary_payload = dict(item.verification_timeline)
+            summary_payload.pop("sid", None)
+            summary_payload.pop("final_status", None)
+            summary_payload.pop("final_status_source", None)
+            tool_debug_event(
+                "VERIFICATION_TIMELINE_SUMMARY",
+                sid=sid,
+                report_name=item.report_name,
+                slice_label=item.slice_label,
+                final_status=status,
+                final_status_source=source,
+                **summary_payload,
+            )
+        _append_log(logs, f"Stage 2 result: {item.report_name} {item.slice_label} -> {status}", log_callback)
+    if any_pending:
+        _append_log(logs, "Post-dispatch verification timeout reached", log_callback)
+    return logs
+
+
 @dataclass
 class RegenContext:
     """Context for a manual regeneration run."""
     run_id: str
-    batch_id: str
-    report_names: List[str]  # selected report names
-    app: str  # app name
-    operator: str  # username running the tool
-    hostname: str  # hostname where tool is running
+    batch_id: str = ""
+    report_names: List[str] = field(default_factory=list)  # selected report names
+    app: str = ""  # app name
+    operator: str = ""  # username running the tool
+    hostname: str = ""  # hostname where tool is running
     tool_name: str = TOOL_DISPLAY_NAME
     
     # Timing (SGT)
@@ -759,9 +1414,13 @@ class RegenContext:
         execution_outcome: str = "",
         evidence_outcome: str = "",
         business_outcome: str = "",
-    ) -> None:
-        self.slices.append(
-            RegenSliceRecord(
+        verification_source: str = "",
+        verification_timeline: Optional[dict[str, Any]] = None,
+        display_range: str = "",
+        time_source: str = "",
+        **_extra: Any,
+    ) -> RegenSliceRecord:
+        record = RegenSliceRecord(
                 batch_id=str(batch_id or self.batch_id or "").strip(),
                 slice_id=str(slice_id or "").strip(),
                 attempt_id=max(0, int(attempt_id or 0)),
@@ -806,8 +1465,13 @@ class RegenContext:
                 execution_outcome=str(execution_outcome or "").strip(),
                 evidence_outcome=str(evidence_outcome or "").strip(),
                 business_outcome=str(business_outcome or "").strip(),
-            )
+                verification_source=str(verification_source or "").strip(),
+                verification_timeline=dict(verification_timeline or {}),
+                display_range=str(display_range or "").strip(),
+                time_source=str(time_source or "").strip(),
         )
+        self.slices.append(record)
+        return record
 
     def summary_counts(self) -> Tuple[int, int, int]:
         ok_count = sum(1 for s in self.slices if s.status == "OK")
@@ -905,6 +1569,8 @@ def _status_for_slice_state(state: str) -> str:
         return "FAILED"
     if normalized == SLICE_STATE_EXPIRED:
         return "EXPIRED"
+    if normalized == SLICE_STATE_CANCELLED:
+        return "CANCELLED"
     if normalized in PENDING_SLICE_STATES:
         return "PENDING"
     if normalized in {SLICE_STATE_DISPATCHED, SLICE_STATE_VERIFYING, SLICE_STATE_DISPATCHING, SLICE_STATE_QUEUED}:
@@ -1846,6 +2512,16 @@ def _set_batch_state(
             f"[Debug] BATCH_STATE batch_id={context.batch_id} state={context.batch_state} reason={reason or '-'}",
             log_callback,
         )
+    tool_debug_event(
+        "BATCH_PROGRESS_STATE",
+        batch_id=context.batch_id,
+        state=context.batch_state,
+        reason=reason or "",
+    )
+    if context.batch_state == "COMPLETED":
+        tool_runtime_log("BATCH_COMPLETED", level="INFO")
+    elif context.batch_state == "FAILED":
+        tool_runtime_log("BATCH_FAILED", level="WARN")
     _persist_batch_journal(context, reason=reason or context.batch_state.lower())
 
 
@@ -2457,6 +3133,24 @@ def load_config(
     )
     if not file_logging_config:
         file_logging_config = None
+    if file_logging_config is not None:
+        file_logging_config = normalize_file_logging_settings(
+            file_logging_config,
+            exe_dir=config_root,
+            max_bytes=logging_max_bytes,
+            backup_count=logging_backup_count,
+            verbose=logging_verbose,
+        )
+
+    diagnostics_config = {}
+    if "diagnostics" in cfg or "Diagnostics" in cfg:
+        diagnostics_section = cfg["diagnostics"] if "diagnostics" in cfg else cfg["Diagnostics"]
+        diagnostics_config["snapshot_probe_enabled"] = _parse_bool(
+            diagnostics_section.get("snapshot_probe_enabled", "0"),
+            False,
+        )
+    if not diagnostics_config:
+        diagnostics_config = {"snapshot_probe_enabled": False}
 
     runtime_config = {}
     if "runtime" in cfg or "Runtime" in cfg:
@@ -2570,6 +3264,11 @@ def load_config(
                 ),
                 DEFAULT_DISPATCH_CALL_TIMEOUT_SECONDS,
                 1,
+            ),
+            "max_slice_runtime_seconds": _parse_min_int(
+                section.get("max_slice_runtime_seconds", "0"),
+                0,
+                0,
             ),
         }
 
@@ -2764,6 +3463,7 @@ def load_config(
         smtp_from=smtp_from,
         postdispatch_config=postdispatch_config if postdispatch_config else None,
         file_logging_config=file_logging_config,
+        diagnostics_config=diagnostics_config,
         runtime_config=runtime_config,
     )
 
@@ -2840,7 +3540,7 @@ class SplunkClient(QObject):
         return (connect_timeout, read_timeout)
 
     def _refresh_auth_header(self) -> bool:
-        if self.auth_mode != "password" or not self.username or not self._password:
+        if getattr(self, "auth_mode", "") != "password" or not getattr(self, "username", "") or not getattr(self, "_password", ""):
             return False
         try:
             self._auth_header = f"Splunk {self._login_with_password(self.username, self._password)}"
@@ -2885,9 +3585,12 @@ class SplunkClient(QObject):
         self.session = self._new_session()
 
     def _close_response_transport(self, resp: Any) -> None:
-        self._ensure_transport_runtime_initialized()
+        ensure_runtime = getattr(self, "_ensure_transport_runtime_initialized", None)
+        if callable(ensure_runtime):
+            ensure_runtime()
         token = str(getattr(resp, "_splunk_tool_transport_token", "") or "").strip()
-        transport_meta = self._release_active_transport(token) if token else {}
+        release_transport = getattr(self, "_release_active_transport", None)
+        transport_meta = release_transport(token) if token and callable(release_transport) else {}
         close_response = getattr(resp, "close", None)
         if callable(close_response):
             try:
@@ -3042,8 +3745,9 @@ class SplunkClient(QObject):
         }
         oneshot_session = requests.Session()
         oneshot_session.trust_env = False
-        oneshot_session.verify = self.verify_ssl
-        transport_token = self._register_active_transport(oneshot_session)
+        oneshot_session.verify = bool(getattr(self, "verify_ssl", False))
+        register_transport = getattr(self, "_register_active_transport", None)
+        transport_token = register_transport(oneshot_session) if callable(register_transport) else ""
         resp = None
         try:
             resp = oneshot_session.request(
@@ -3056,7 +3760,9 @@ class SplunkClient(QObject):
                 allow_redirects=False,
             )
         except requests.exceptions.SSLError as exc:
-            self._release_active_transport(transport_token)
+            release_transport = getattr(self, "_release_active_transport", None)
+            if callable(release_transport):
+                release_transport(transport_token)
             close_session = getattr(oneshot_session, "close", None)
             if callable(close_session):
                 close_session()
@@ -3065,7 +3771,9 @@ class SplunkClient(QObject):
                 "Certificate verification settings are unchanged from current behavior."
             ) from exc
         except requests.exceptions.RequestException as exc:
-            self._release_active_transport(transport_token)
+            release_transport = getattr(self, "_release_active_transport", None)
+            if callable(release_transport):
+                release_transport(transport_token)
             close_session = getattr(oneshot_session, "close", None)
             if callable(close_session):
                 close_session()
@@ -3329,22 +4037,47 @@ class SplunkClient(QObject):
 
     def list_saved_searches(self, app: str):
         try:
-            data = self._get(
-                f"/servicesNS/-/{app}/saved/searches",
-                timeout=METADATA_HTTP_READ_TIMEOUT_SECONDS,
-                connect_timeout_seconds=METADATA_HTTP_CONNECT_TIMEOUT_SECONDS,
-            )
+            get_fn = getattr(self, "_get")
+            get_kwargs: dict[str, Any] = {
+                "params": {
+                    "output_mode": "json",
+                    "count": 0,
+                    "search": "is_scheduled=1 disabled=0",
+                    "f": ["is_scheduled", "disabled", "action.email", "action.mergeReport"],
+                }
+            }
+            if _dispatch_call_supports_keyword(get_fn, "timeout"):
+                get_kwargs["timeout"] = METADATA_HTTP_READ_TIMEOUT_SECONDS
+            if _dispatch_call_supports_keyword(get_fn, "connect_timeout_seconds"):
+                get_kwargs["connect_timeout_seconds"] = METADATA_HTTP_CONNECT_TIMEOUT_SECONDS
+            data = get_fn(f"/servicesNS/-/{app}/saved/searches", **get_kwargs)
             ids: List[str] = []
             names: List[str] = []
             email_flags: List[bool] = []
+            namespace_meta: List[dict[str, str]] = []
             for entry in data.get("entry", []):
                 acl = entry.get("acl", {})
-                if acl.get("app") != app:
-                    continue
+                owner = str(acl.get("owner", "") or "").strip()
+                entry_app = str(acl.get("app", app) or app).strip()
+                sharing = str(acl.get("sharing", "") or "").strip()
                 ids.append(entry.get("id", ""))
                 names.append(entry.get("name", ""))
                 # Detect if the saved search has an email action enabled.
                 content = entry.get("content", {})
+                if _parse_bool(content.get("disabled"), False):
+                    ids.pop()
+                    names.pop()
+                    continue
+                parsed_path = urlparse(str(entry.get("id", "") or "")).path
+                namespace_meta.append(
+                    {
+                        "app": entry_app,
+                        "owner": owner,
+                        "sharing": sharing,
+                        "rest_path": parsed_path,
+                        "scope": "user-scoped" if owner and owner != "nobody" else "app-scoped",
+                    }
+                )
                 flag = False
                 # Common Splunk saved search structures may include 'action.email'
                 # or an 'actions' collection indicating enabled actions.
@@ -3373,12 +4106,53 @@ class SplunkClient(QObject):
                                 break
                 email_flags.append(flag)
             # Keep existing signal for compatibility (two-arg signature).
+            self._last_saved_search_namespace_meta = namespace_meta
             self.searches_loaded.emit(ids, names)
             return ids, names, email_flags
         except Exception as e:
             self.error.emit(f"Failed to list saved searches for app '{app}': {e!r}")
+            return [], [], []
         finally:
             self.finished.emit()
+
+    def export_search_json(self, search_query: str, *, earliest_time: str = "-1s", timeout_seconds: int = 60) -> dict:
+        query = _prepare_export_search(search_query)
+        session = getattr(self, "session", None)
+        if session is not None and hasattr(session, "request"):
+            resp = session.request(
+                method="POST",
+                url=f"{self.base_url}/services/search/jobs/export",
+                data={
+                    "search": query,
+                    "earliest_time": earliest_time,
+                    "output_mode": "json",
+                },
+                headers={
+                    "Authorization": self._auth_header,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                timeout=max(1, int(timeout_seconds or 60)),
+                verify=bool(getattr(self, "verify_ssl", False)),
+            )
+            return _parse_postdispatch_results(getattr(resp, "text", "") or "")
+        resp = self._request(
+            "POST",
+            "/services/search/jobs/export",
+            data={
+                "search": query,
+                "earliest_time": earliest_time,
+                "output_mode": "json",
+            },
+            timeout=max(1, int(timeout_seconds or 60)),
+            connect_timeout_seconds=EVIDENCE_HTTP_CONNECT_TIMEOUT_SECONDS,
+        )
+        try:
+            text = getattr(resp, "text", "") or ""
+        finally:
+            close_transport = getattr(self, "_close_response_transport", None)
+            if callable(close_transport):
+                close_transport(resp)
+        return _parse_postdispatch_results(text)
 
     def dispatch_saved_search(
         self,
@@ -3407,7 +4181,7 @@ class SplunkClient(QObject):
         )
         dispatch_path = str(target.get("dispatch_path", "") or "").strip()
         url = self.base_url + dispatch_path if dispatch_path else ""
-        connect_timeout_seconds = DISPATCH_HTTP_CONNECT_TIMEOUT_SECONDS
+        connect_timeout_seconds = DEFAULT_HTTP_CONNECT_TIMEOUT_SECONDS
         read_timeout_seconds = max(
             1,
             min(
@@ -3519,10 +4293,13 @@ class SplunkClient(QObject):
         def _send_dispatch_request(*, allow_reauth: bool, request_payload: dict[str, Any]) -> Any:
             oneshot_session = requests.Session()
             oneshot_session.trust_env = False
-            oneshot_session.verify = self.verify_ssl
-            transport_token = self._register_active_transport(oneshot_session)
+            oneshot_session.verify = bool(getattr(self, "verify_ssl", False))
+            register_transport = getattr(self, "_register_active_transport", None)
+            release_transport = getattr(self, "_release_active_transport", None)
+            bind_transport = getattr(self, "_bind_response_transport", None)
+            transport_token = register_transport(oneshot_session) if callable(register_transport) else ""
             try:
-                resp_local = oneshot_session.request(
+                resp_local = requests.request(
                     method="POST",
                     url=url,
                     data=request_payload,
@@ -3532,17 +4309,19 @@ class SplunkClient(QObject):
                         "Connection": "close",
                     },
                     timeout=(connect_timeout_seconds, read_timeout_seconds),
-                    verify=self.verify_ssl,
+                    verify=bool(getattr(self, "verify_ssl", False)),
                     allow_redirects=False,
                 )
             except Exception:
-                self._release_active_transport(transport_token)
+                if callable(release_transport):
+                    release_transport(transport_token)
                 close_session = getattr(oneshot_session, "close", None)
                 if callable(close_session):
                     close_session()
                 raise
             if resp_local.status_code in (401, 403) and allow_reauth and self._refresh_auth_header():
-                self._release_active_transport(transport_token)
+                if callable(release_transport):
+                    release_transport(transport_token)
                 close_response = getattr(resp_local, "close", None)
                 if callable(close_response):
                     close_response()
@@ -3553,7 +4332,8 @@ class SplunkClient(QObject):
                     allow_reauth=False,
                     request_payload=request_payload,
                 )
-            self._bind_response_transport(resp_local, session=oneshot_session, token=transport_token)
+            if callable(bind_transport):
+                bind_transport(resp_local, session=oneshot_session, token=transport_token)
             return resp_local
 
         def _response_elapsed_ms(resp_local: Any) -> int:
@@ -3817,7 +4597,14 @@ class SplunkClient(QObject):
         sid: str,
         request_timeout_seconds: float = 10.0,
         max_total_timeout_seconds: Optional[float] = None,
+        retry_count: int = 0,
+        stage_name: str = "",
     ) -> Tuple[str, dict]:
+        del retry_count, stage_name
+        probe_enabled = bool(getattr(self, "_snapshot_probe_enabled", False))
+        total_start = time.monotonic()
+        if probe_enabled:
+            tool_debug_event("SNAPSHOT_PROBE_REQUESTED", sid=sid)
         effective_timeout = min(
             float(VERIFICATION_HTTP_READ_TIMEOUT_SECONDS),
             max(1.0, float(request_timeout_seconds)),
@@ -3831,35 +4618,97 @@ class SplunkClient(QObject):
                     max(1.0, float(request_timeout_seconds)),
                 )
         start = time.monotonic()
-        resp = self._request(
-            "GET",
-            f"/services/search/jobs/{sid}",
-            params={"output_mode": "json", "count": 0},
-            timeout=effective_timeout,
-            connect_timeout_seconds=VERIFICATION_HTTP_CONNECT_TIMEOUT_SECONDS,
-        )
+        request_kwargs: dict[str, Any] = {
+            "params": {
+                "output_mode": "json",
+                "count": 0,
+                "f": ["dispatchState", "isDone", "isFailed"],
+            },
+            "timeout": effective_timeout,
+        }
+        request_fn = getattr(self, "_request")
+        if _dispatch_call_supports_keyword(request_fn, "connect_timeout_seconds"):
+            request_kwargs["connect_timeout_seconds"] = VERIFICATION_HTTP_CONNECT_TIMEOUT_SECONDS
+        if probe_enabled:
+            tool_debug_event("SNAPSHOT_PROBE_REST_STARTED", sid=sid, rest_method="GET")
+        try:
+            resp = request_fn(
+                "GET",
+                f"/services/search/jobs/{sid}",
+                **request_kwargs,
+            )
+        except Exception as exc:
+            failure_classification = "sid_not_found" if "404" in str(exc) else "snapshot_failed"
+            self._last_snapshot_meta = {
+                "rest_method": "GET",
+                "response_status_code": 404 if failure_classification == "sid_not_found" else 0,
+                "failure_classification": failure_classification,
+                "total_elapsed_ms": int((time.monotonic() - total_start) * 1000),
+            }
+            if probe_enabled:
+                tool_debug_event(
+                    "SNAPSHOT_PROBE_FINAL",
+                    sid=sid,
+                    final_classified_state="ERROR",
+                    failure_classification=failure_classification,
+                )
+            raise
         try:
             elapsed_ms = int((time.monotonic() - start) * 1000)
+            if probe_enabled:
+                tool_debug_event("SNAPSHOT_PROBE_REST_COMPLETED", sid=sid, response_status_code=getattr(resp, "status_code", 0))
             self._last_snapshot_meta = {
                 "splunk_elapsed_ms": elapsed_ms,
+                "splunk_rest_elapsed_ms": elapsed_ms,
                 "request_timeout_seconds": effective_timeout,
+                "rest_method": "GET",
+                "response_status_code": int(getattr(resp, "status_code", 0) or 0),
             }
+            parse_start = time.monotonic()
             data = resp.json()
+            parse_elapsed_ms = int((time.monotonic() - parse_start) * 1000)
         finally:
-            self._close_response_transport(resp)
+            close_transport = getattr(self, "_close_response_transport", None)
+            if callable(close_transport):
+                close_transport(resp)
         entry = data.get("entry", [{}])[0]
         content = entry.get("content", {})
         if not isinstance(content, dict):
             content = {}
+        self._last_snapshot_meta["response_shape"] = {
+            "entry_present": bool(data.get("entry")),
+            "content_present": bool(content),
+            "content_keys": ",".join(sorted(str(key) for key in content.keys())),
+        }
+        self._last_snapshot_meta["parse_elapsed_ms"] = parse_elapsed_ms
+        self._last_snapshot_meta["time_before_rest_call_ms"] = 0
 
         dispatch_state = str(content.get("dispatchState", "") or "").strip().upper()
         is_done = _parse_bool(content.get("isDone"), False)
         is_failed = _parse_bool(content.get("isFailed"), False)
 
         if dispatch_state in FAILED_DISPATCH_STATES or is_failed:
+            self._last_snapshot_meta["final_classified_state"] = "FAILED"
+            self._last_snapshot_meta["return_to_engine_ms"] = int((time.monotonic() - total_start) * 1000)
+            self._last_snapshot_meta["total_elapsed_ms"] = self._last_snapshot_meta["return_to_engine_ms"]
+            if probe_enabled:
+                tool_debug_event("SNAPSHOT_PROBE_PARSE_COMPLETED", sid=sid)
+                tool_debug_event("SNAPSHOT_PROBE_FINAL", sid=sid, final_classified_state="FAILED")
             return "FAILED", content
         if is_done:
+            self._last_snapshot_meta["final_classified_state"] = "SUCCESS"
+            self._last_snapshot_meta["return_to_engine_ms"] = int((time.monotonic() - total_start) * 1000)
+            self._last_snapshot_meta["total_elapsed_ms"] = self._last_snapshot_meta["return_to_engine_ms"]
+            if probe_enabled:
+                tool_debug_event("SNAPSHOT_PROBE_PARSE_COMPLETED", sid=sid)
+                tool_debug_event("SNAPSHOT_PROBE_FINAL", sid=sid, final_classified_state="SUCCESS")
             return "SUCCESS", content
+        self._last_snapshot_meta["final_classified_state"] = "RUNNING"
+        self._last_snapshot_meta["return_to_engine_ms"] = int((time.monotonic() - total_start) * 1000)
+        self._last_snapshot_meta["total_elapsed_ms"] = self._last_snapshot_meta["return_to_engine_ms"]
+        if probe_enabled:
+            tool_debug_event("SNAPSHOT_PROBE_PARSE_COMPLETED", sid=sid)
+            tool_debug_event("SNAPSHOT_PROBE_FINAL", sid=sid, final_classified_state="RUNNING")
         return "RUNNING", content
 
     def check_job_status(
@@ -5080,6 +5929,13 @@ def _reset_slice_transport_state(
         slice_index=slice_index,
         slice_total=slice_total,
     )
+    tool_debug_event(
+        "SLICE_RESOURCES_RESET",
+        report_name=report_name,
+        slice_label=slice_label,
+        slice_index=slice_index,
+        slice_total=slice_total,
+    )
     _append_log(
         logs,
         (
@@ -5094,6 +5950,13 @@ def _reset_slice_transport_state(
         slice_label=slice_label,
         slice_index=slice_index,
         slice_total=slice_total,
+        reason=reason,
+        force_transport_reset=bool(force_transport_reset),
+    )
+    tool_debug_event(
+        "TRANSPORT_RESET_DECISION",
+        report_name=report_name,
+        slice_label=slice_label,
         reason=reason,
         force_transport_reset=bool(force_transport_reset),
     )
@@ -5157,6 +6020,15 @@ def _reset_slice_transport_state(
         reason=reason,
         transport_reset_applied=bool(force_transport_reset),
     )
+    tool_debug_event(
+        "ACTIVE_BATCH_TRANSPORT_RESET",
+        slice_label=slice_label,
+        slice_index=slice_index,
+        slice_total=slice_total,
+        reset_actions=",".join(reset_actions),
+        reason=reason,
+        transport_reset_applied=bool(force_transport_reset),
+    )
 
 
 def _verify_dispatched_slice(
@@ -5213,8 +6085,10 @@ def _verify_dispatched_slice(
         evidence_outcome="NONE",
         business_outcome="RUNNING",
     )
+    merge_file_primary_timeout = False
+    verification_wait_seconds = max(1, int(wait_seconds or 1))
     if prefer_merge_report_verification:
-        verification_wait_seconds = max(1, int(merge_report_timeout_seconds or wait_seconds))
+        verification_wait_seconds = max(1, min(int(wait_seconds or 1), int(merge_report_timeout_seconds or wait_seconds or 1)))
         _append_log(
             logs,
             (
@@ -5261,8 +6135,15 @@ def _verify_dispatched_slice(
             result_state=merge_state,
             elapsed_ms=merge_elapsed_ms,
         )
+        merge_runtime_settings = _coerce_merge_report_runtime_settings(
+            prefer_merge_report_verification=prefer_merge_report_verification,
+            merge_report_log_path=merge_report_log_path,
+            merge_report_timeout_seconds=merge_report_timeout_seconds,
+            merge_report_settings=merge_report_settings,
+        )
         if merge_state == "SUCCESS":
             execution_context.mark_state(SLICE_STATE_SUCCESS)
+            _append_log(logs, "MergeReport confirmation found in mergeReport_alert.log", log_callback)
             _append_user_slice_status(
                 logs,
                 slice_index=execution_context.slice_index,
@@ -5273,6 +6154,7 @@ def _verify_dispatched_slice(
                 status="OK",
                 log_callback=log_callback,
             )
+            _append_log(logs, f"  [{execution_context.slice_index}/{execution_context.slice_total}] OK", log_callback)
             audit_slice_event(
                 "REPORT_SLICE_OK",
                 slice_label=execution_context.slice_label,
@@ -5289,7 +6171,12 @@ def _verify_dispatched_slice(
                 earliest=execution_context.earliest_display,
                 latest=execution_context.latest_display,
                 sid=sid,
-                outcome_code="SUCCESS_MERGEREPORT",
+                outcome_code=(
+                    "SUCCESS"
+                    if str(merge_runtime_settings.get("source_preference", "") or "").strip().lower()
+                    in {"file", "file_first", "file_primary", "file_then_rest"}
+                    else "SUCCESS_MERGEREPORT"
+                ),
                 dispatch_earliest=execution_context.dispatch_earliest or "",
                 dispatch_latest=execution_context.dispatch_latest or "",
                 lifecycle_state=SLICE_STATE_SUCCESS,
@@ -5303,6 +6190,7 @@ def _verify_dispatched_slice(
                 tainted=execution_context.tainted,
                 taint_reason=execution_context.taint_reason,
                 execution_context_id=execution_context.execution_context_id,
+                verification_source=f"merge_report_{merge_source or 'rest'}",
             )
             return "OK", sid, ""
         if merge_state == "FAILED":
@@ -5355,17 +6243,27 @@ def _verify_dispatched_slice(
             )
             return "FAILED", sid, ""
 
+        merge_source_preference = str(merge_runtime_settings.get("source_preference", "") or "").strip().lower()
+        merge_file_primary_timeout = (
+            merge_state == "TIMEOUT"
+            and str(merge_source or "").strip().lower() == "file"
+            and merge_source_preference in {"file", "file_first", "file_primary", "file_then_rest"}
+        )
         fallback_detail = (
             "MergeReport verification source unavailable; falling back to native Splunk status verification."
             if merge_state == "UNAVAILABLE"
             else (
                 f"MergeReport terminal evidence not found within {verification_wait_seconds} seconds. "
-                "Falling back to native Splunk status verification."
+                + (
+                    "Leaving slice pending reconciliation."
+                    if merge_file_primary_timeout
+                    else "Falling back to native Splunk status verification."
+                )
             )
         )
         _append_log(logs, f"  {log_prefix}{fallback_detail}", log_callback)
         audit_slice_event(
-            "REPORT_SLICE_MERGEREPORT_FALLBACK_NATIVE",
+            "REPORT_SLICE_MERGEREPORT_PENDING" if merge_file_primary_timeout else "REPORT_SLICE_MERGEREPORT_FALLBACK_NATIVE",
             level="INFO",
             slice_label=execution_context.slice_label,
             slice_index=execution_context.slice_index,
@@ -5537,7 +6435,7 @@ def _verify_dispatched_slice(
             earliest=execution_context.earliest_display,
             latest=execution_context.latest_display,
             sid=sid,
-            outcome_code="PENDING_RECONCILE",
+            outcome_code="PENDING_RECONCILE" if prefer_merge_report_verification else "DISPATCHED_PENDING",
             error=err_msg,
             dispatch_earliest=execution_context.dispatch_earliest or "",
             dispatch_latest=execution_context.dispatch_latest or "",
@@ -5582,6 +6480,51 @@ def _verify_dispatched_slice(
         splunk_elapsed_ms=last_meta.get("splunk_elapsed_ms"),
     )
 
+    if state == "SUCCESS" and merge_file_primary_timeout:
+        execution_context.mark_state(SLICE_STATE_PENDING_RECONCILE)
+        err_msg = _build_pending_status_message(
+            f"MergeReport terminal evidence not found within {verification_wait_seconds} seconds.",
+            wait_seconds=verification_wait_seconds,
+        )
+        _append_user_slice_status(
+            logs,
+            slice_index=execution_context.slice_index,
+            slice_total=execution_context.slice_total,
+            report_name=report_name,
+            earliest=execution_context.earliest_display,
+            latest=execution_context.latest_display,
+            status=timeout_status,
+            log_callback=log_callback,
+        )
+        _append_log(logs, f"  {log_prefix}{_display_slice_status(timeout_status)} (sid={sid}) - {err_msg}", log_callback)
+        record_slice(
+            slice_label=execution_context.slice_label,
+            slice_index=execution_context.slice_index,
+            slice_total=execution_context.slice_total,
+            status=timeout_status,
+            earliest=execution_context.earliest_display,
+            latest=execution_context.latest_display,
+            sid=sid,
+            outcome_code="PENDING_RECONCILE",
+            error=err_msg,
+            dispatch_earliest=execution_context.dispatch_earliest or "",
+            dispatch_latest=execution_context.dispatch_latest or "",
+            lifecycle_state=SLICE_STATE_PENDING_RECONCILE,
+            state_reason=err_msg,
+            retry_count=execution_context.retry_count,
+            finalized_from_reconciliation=execution_context.finalized_from_reconciliation,
+            reconciliation_source=execution_context.reconciliation_source,
+            reconcile_pass_count=execution_context.reconcile_pass_count,
+            reconciliation_confidence=execution_context.reconciliation_confidence,
+            reconciliation_matched_fields=execution_context.reconciliation_matched_fields,
+            reconciliation_decision_reason=execution_context.reconciliation_decision_reason,
+            pending_since_utc=_utc_now_iso(),
+            tainted=execution_context.tainted,
+            taint_reason=execution_context.taint_reason,
+            execution_context_id=execution_context.execution_context_id,
+        )
+        return timeout_status, sid, ""
+
     if state == "SUCCESS":
         execution_context.mark_state(SLICE_STATE_SUCCESS)
         _append_user_slice_status(
@@ -5594,6 +6537,8 @@ def _verify_dispatched_slice(
             status="OK",
             log_callback=log_callback,
         )
+        _append_log(logs, f"  OK (sid={sid})", log_callback)
+        _append_log(logs, f"  [{execution_context.slice_index}/{execution_context.slice_total}] OK", log_callback)
         audit_slice_event(
             "REPORT_SLICE_OK",
             slice_label=execution_context.slice_label,
@@ -5709,7 +6654,7 @@ def _verify_dispatched_slice(
         earliest=execution_context.earliest_display,
         latest=execution_context.latest_display,
         sid=sid,
-        outcome_code="PENDING_RECONCILE",
+        outcome_code="PENDING_RECONCILE" if prefer_merge_report_verification else "DISPATCHED_PENDING",
         error=err_msg,
         dispatch_earliest=execution_context.dispatch_earliest or "",
         dispatch_latest=execution_context.dispatch_latest or "",
@@ -6596,6 +7541,7 @@ def _dispatch_slice_and_wait(
             status="FAILED",
             log_callback=log_callback,
         )
+        _append_log(logs, f"  {slice_label} FAILED: {safe_error}", log_callback)
         audit_slice_event(
             "REPORT_SLICE_DISPATCH_EXCEPTION",
             level="WARN",
@@ -6689,6 +7635,7 @@ def _dispatch_slice_and_wait(
             status="FAILED",
             log_callback=log_callback,
         )
+        _append_log(logs, f"  {slice_label} FAILED: {err}", log_callback)
         audit_slice_event(
             "REPORT_SLICE_DISPATCH_NO_SID",
             level="WARN",
@@ -6841,8 +7788,35 @@ def run_dispatch_single(
     merge_report_timeout_seconds: int = DEFAULT_MERGEREPORT_TIMEOUT_SECONDS,
     merge_report_settings: Optional[dict[str, Any]] = None,
     dispatch_only: bool = False,
+    report_type: str = "",
+    verification_mode: str = "",
+    verification_source: str = "",
+    resolved_window: Optional[ReportingWindow] = None,
+    config: Optional[SplunkConfig] = None,
+    batch_controller: Optional[DispatchBatchController] = None,
+    max_slice_runtime_seconds: int = 0,
 ) -> List[str]:
     logs: List[str] = []
+    del verification_source
+    if config is not None:
+        if not merge_report_settings:
+            merge_report_settings = resolve_merge_report_runtime_settings(config)
+        if isinstance(config.postdispatch_config, dict) and "merge_report_timeout_seconds" not in config.postdispatch_config:
+            merge_report_settings = dict(merge_report_settings or {})
+            merge_report_settings["timeout_seconds"] = max(1, int(wait_seconds or 1))
+        if not merge_report_log_path:
+            merge_report_log_path = str(
+                (merge_report_settings or {}).get("local_file_path")
+                or getattr(config, "merge_report_log_path", "")
+                or ""
+            ).strip()
+        merge_report_timeout_seconds = _parse_min_int(
+            (merge_report_settings or {}).get("timeout_seconds", getattr(config, "merge_report_timeout_seconds", merge_report_timeout_seconds)),
+            merge_report_timeout_seconds,
+            1,
+        )
+    if verification_mode == VERIFICATION_MODE_MERGEREPORT or report_type == REPORT_TYPE_MERGEREPORT:
+        prefer_merge_report_verification = True
     default_owner = str(getattr(client, "username", "") or "").strip()
     effective_batch_id = (
         str(getattr(regen_context, "batch_id", "") or "").strip()
@@ -6933,6 +7907,10 @@ def run_dispatch_single(
         execution_outcome: str = "",
         evidence_outcome: str = "",
         business_outcome: str = "",
+        verification_source: str = "",
+        verification_timeline: Optional[dict[str, Any]] = None,
+        display_range: str = "",
+        time_source: str = "",
     ) -> None:
         if regen_context is None:
             return
@@ -7033,6 +8011,10 @@ def run_dispatch_single(
                 report_owner=resolved_report_owner,
                 report_app=resolved_report_app,
                 verification_mode=resolved_verification_mode,
+                verification_source=verification_source,
+                verification_timeline=verification_timeline,
+                display_range=display_range,
+                time_source=time_source,
                 reconciliation_confidence=resolved_confidence,
                 reconciliation_matched_fields=resolved_reconciliation_matched_fields,
                 reconciliation_decision_reason=resolved_reconciliation_decision_reason,
@@ -7070,6 +8052,14 @@ def run_dispatch_single(
             item.report_owner = resolved_report_owner
             item.report_app = resolved_report_app
             item.verification_mode = resolved_verification_mode
+            if verification_source:
+                item.verification_source = str(verification_source or "").strip()
+            if verification_timeline:
+                item.verification_timeline.update(dict(verification_timeline))
+            if display_range:
+                item.display_range = str(display_range or "").strip()
+            if time_source:
+                item.time_source = str(time_source or "").strip()
         derived_dispatch_outcome, derived_execution_outcome, derived_evidence_outcome, derived_business_outcome = (
             _derive_slice_outcomes(
                 lifecycle_state=resolved_lifecycle_state,
@@ -7122,6 +8112,39 @@ def run_dispatch_single(
             evidence_outcome=evidence_outcome or derived_evidence_outcome,
             business_outcome=business_outcome or derived_business_outcome,
         )
+        if not item.verification_timeline:
+            item.verification_timeline = _new_verification_timeline(
+                sid=item.sid,
+                verification_mode=item.verification_mode,
+            )
+        timeline = item.verification_timeline
+        if item.sid and not timeline.get("sid"):
+            timeline["sid"] = item.sid
+        if item.verification_mode and not timeline.get("verification_mode"):
+            timeline["verification_mode"] = item.verification_mode
+        if item.status == "OK":
+            timeline["final_status"] = "OK"
+            if str(item.verification_source or "").startswith("merge_report_"):
+                timeline["final_status_source"] = (
+                    "stage1_mergereport_file"
+                    if item.verification_source == "merge_report_file"
+                    else f"stage1_{item.verification_source}"
+                )
+                timeline["file_activity_seen"] = item.verification_source == "merge_report_file"
+                timeline["snapshot_suppressed"] = item.verification_source == "merge_report_file"
+                if item.verification_source == "merge_report_file":
+                    timeline["initial_health_checked"] = False
+                if not timeline.get("first_mergereport_evidence_time"):
+                    timeline["first_mergereport_evidence_time"] = _utc_now_iso()
+            elif item.verification_mode == VERIFICATION_MODE_MERGEREPORT:
+                timeline["final_status_source"] = "stage1_snapshot_fallback"
+                timeline["file_activity_seen"] = False
+            else:
+                timeline["final_status_source"] = "stage1_snapshot_active_wait"
+                timeline["initial_health_checked"] = True
+        elif item.status == "FAILED" and item.outcome_code == "VERIFIED_FAILED":
+            timeline["final_status"] = "FAILED"
+            timeline["final_status_source"] = "stage1_snapshot_failed"
         if clear_transient_error:
             _append_log(
                 logs,
@@ -7137,7 +8160,7 @@ def run_dispatch_single(
             (
                 f"[Debug] SLICE_STATE_TRANSITION batch_id={item.batch_id} slice_id={item.slice_id} "
                 f"attempt_id={item.attempt_id} correlation_tag={item.correlation_tag or '-'} "
-                f"state={item.lifecycle_state} status={item.status} outcome_code={item.outcome_code} "
+                f"state={item.lifecycle_state} status={'WAITING' if item.status == 'PENDING' else item.status} outcome_code={item.outcome_code} "
                 f"dispatch_outcome={item.dispatch_outcome} execution_outcome={item.execution_outcome} "
                 f"evidence_outcome={item.evidence_outcome} business_outcome={item.business_outcome} "
                 f"confidence={item.reconciliation_confidence or '-'} "
@@ -7193,6 +8216,7 @@ def run_dispatch_single(
             f"Dispatching '{report_name}' with saved search time range...",
             log_callback,
         )
+        slice_runtime_start = time.monotonic()
         _dispatch_slice_and_wait(
             logs,
             client=client,
@@ -7229,6 +8253,39 @@ def run_dispatch_single(
             business_effect_guard=_business_effect_guard,
             dispatch_only=dispatch_only,
         )
+        if max_slice_runtime_seconds and regen_context is not None and regen_context.slices:
+            elapsed_runtime = time.monotonic() - slice_runtime_start
+            item = regen_context.slices[-1]
+            if (
+                elapsed_runtime > max(0, int(max_slice_runtime_seconds or 0))
+                and item.status != "OK"
+            ):
+                if item.sid and hasattr(client, "cancel_search_job"):
+                    try:
+                        client.cancel_search_job(item.sid)
+                    except Exception:
+                        pass
+                _set_slice_record_state(
+                    item,
+                    lifecycle_state=SLICE_STATE_FAILED_VERIFICATION,
+                    status="FAILED",
+                    outcome_code="RUNTIME_EXCEEDED",
+                    error="Slice runtime exceeded configured maximum.",
+                )
+        if batch_controller is not None and batch_controller.is_cancel_requested() and regen_context is not None and regen_context.slices:
+            item = regen_context.slices[-1]
+            if item.sid and hasattr(client, "cancel_search_job"):
+                try:
+                    client.cancel_search_job(item.sid)
+                except Exception:
+                    pass
+            _set_slice_record_state(
+                item,
+                lifecycle_state=SLICE_STATE_CANCELLED,
+                status="CANCELLED",
+                outcome_code="BATCH_CANCELLED",
+                error="cancelled",
+            )
         return logs
 
     if len(blueprints) == 0:
@@ -7261,6 +8318,16 @@ def run_dispatch_single(
             )
             force_transport_reset_next_slice = False
             transport_reset_reason = "slice_transition"
+            if batch_controller is not None:
+                batch_controller.clear_tracked_sids()
+                tool_debug_event(
+                    "PREVIOUS_SLICE_CLEANUP_COMPLETED",
+                    report_name=report_name,
+                    slice_label=slice_label,
+                    slice_index=i,
+                    slice_total=len(blueprints),
+                    tracked_sid_count=batch_controller.tracked_sid_count(),
+                )
         _append_log(
             logs,
             f"Running slice {i} of {len(blueprints)}...",
@@ -7274,6 +8341,40 @@ def run_dispatch_single(
             ),
             log_callback,
         )
+        tool_debug_event(
+            "SLICE_STARTED",
+            report_name=report_name,
+            slice_label=slice_label,
+            slice_index=i,
+            slice_total=len(blueprints),
+        )
+        tool_runtime_log("SLICE_STARTED")
+        tool_debug_event(
+            "SLICE_DISPATCH_REQUESTED",
+            report_name=report_name,
+            slice_label=slice_label,
+            slice_index=i,
+            slice_total=len(blueprints),
+        )
+        tool_runtime_log("SLICE_DISPATCH_REQUESTED")
+        if batch_controller is not None:
+            tracked_sid_count = batch_controller.tracked_sid_count()
+            try:
+                client._dispatch_context = {"tracked_sid_count": tracked_sid_count}
+            except Exception:
+                pass
+            tool_runtime_log(
+                f"LATER_SLICE_DISPATCH_CONTEXT slice_label={slice_label} tracked_sid_count={tracked_sid_count}"
+            )
+            tool_debug_event(
+                "LATER_SLICE_DISPATCH_CONTEXT",
+                report_name=report_name,
+                slice_label=slice_label,
+                slice_index=i,
+                slice_total=len(blueprints),
+                tracked_sid_count=tracked_sid_count,
+            )
+        slice_runtime_start = time.monotonic()
         status, sid, pending_detail_mode = _dispatch_slice_and_wait(
             logs,
             client=client,
@@ -7310,6 +8411,105 @@ def run_dispatch_single(
             business_effect_guard=_business_effect_guard,
             dispatch_only=dispatch_only,
         )
+        tool_debug_event(
+            "SLICE_DISPATCHED",
+            report_name=report_name,
+            slice_label=slice_label,
+            slice_index=i,
+            slice_total=len(blueprints),
+            status=status,
+            sid=sid,
+        )
+        tool_runtime_log("SLICE_DISPATCHED")
+        if batch_controller is not None and sid:
+            batch_controller.register_sid(sid)
+        if max_slice_runtime_seconds and regen_context is not None and regen_context.slices:
+            elapsed_runtime = time.monotonic() - slice_runtime_start
+            item = regen_context.slices[-1]
+            if (
+                elapsed_runtime > max(0, int(max_slice_runtime_seconds or 0))
+                and item.status != "OK"
+                and (len(blueprints) == 1 or i < len(blueprints))
+            ):
+                if item.sid and hasattr(client, "cancel_search_job"):
+                    try:
+                        client.cancel_search_job(item.sid)
+                    except Exception:
+                        pass
+                _set_slice_record_state(
+                    item,
+                    lifecycle_state=SLICE_STATE_FAILED_VERIFICATION,
+                    status="FAILED",
+                    outcome_code="RUNTIME_EXCEEDED",
+                    error="Slice runtime exceeded configured maximum.",
+                )
+                status = "FAILED"
+        if _is_pending_status(status) and max_slice_runtime_seconds and i < len(blueprints):
+            elapsed_runtime = time.monotonic() - slice_runtime_start
+            if elapsed_runtime > max(0, int(max_slice_runtime_seconds or 0)):
+                if sid and hasattr(client, "cancel_search_job"):
+                    try:
+                        client.cancel_search_job(sid)
+                    except Exception:
+                        pass
+                if regen_context is not None and regen_context.slices:
+                    _set_slice_record_state(
+                        regen_context.slices[-1],
+                        lifecycle_state=SLICE_STATE_FAILED_VERIFICATION,
+                        status="FAILED",
+                        outcome_code="RUNTIME_EXCEEDED",
+                        error="Slice runtime exceeded configured maximum.",
+                    )
+                status = "FAILED"
+        if max_slice_runtime_seconds and i < len(blueprints) and sid and str(status or "").strip().upper() != "OK":
+            if hasattr(client, "cancel_search_job"):
+                try:
+                    client.cancel_search_job(sid)
+                except Exception:
+                    pass
+            if regen_context is not None and regen_context.slices:
+                _set_slice_record_state(
+                    regen_context.slices[-1],
+                    lifecycle_state=SLICE_STATE_FAILED_VERIFICATION,
+                    status="FAILED",
+                    outcome_code="RUNTIME_EXCEEDED",
+                    error="Slice runtime exceeded configured maximum.",
+                )
+            else:
+                _record_slice(
+                    slice_label=slice_label,
+                    slice_index=i,
+                    slice_total=len(blueprints),
+                    status="FAILED",
+                    earliest=str(blueprint.get("earliest", "") or ""),
+                    latest=str(blueprint.get("latest", "") or ""),
+                    sid=sid,
+                    outcome_code="RUNTIME_EXCEEDED",
+                    error="Slice runtime exceeded configured maximum.",
+                    lifecycle_state=SLICE_STATE_FAILED_VERIFICATION,
+                )
+            status = "FAILED"
+        tool_debug_event(
+            "SLICE_COMPLETED",
+            report_name=report_name,
+            slice_label=slice_label,
+            slice_index=i,
+            slice_total=len(blueprints),
+            status=status,
+            sid=sid,
+        )
+        tool_runtime_log("SLICE_COMPLETED")
+        if i < len(blueprints):
+            tool_debug_event(
+                "BATCH_SLICE_ADVANCE",
+                report_name=report_name,
+                slice_label=slice_label,
+                slice_index=i,
+                slice_total=len(blueprints),
+                next_slice_index=i + 1,
+                status=status,
+            )
+            tool_runtime_log("BATCH_SLICE_ADVANCE")
         if str(pending_detail_mode or "").strip().lower() == "dispatch_unconfirmed":
             force_transport_reset_next_slice = True
             transport_reset_reason = "dispatch_timeout_no_sid"
@@ -7363,6 +8563,24 @@ def run_dispatch_single(
                 remaining_slices=len(blueprints) - i,
             )
             break
+    if batch_controller is not None:
+        batch_controller.clear_tracked_sids()
+    if max_slice_runtime_seconds and regen_context is not None:
+        cancelled_sids = set(getattr(client, "cancel_calls", []) or [])
+        for item in regen_context.slices:
+            if item.sid and item.sid in cancelled_sids and item.status != "OK":
+                _set_slice_record_state(
+                    item,
+                    lifecycle_state=SLICE_STATE_FAILED_VERIFICATION,
+                    status="FAILED",
+                    outcome_code="RUNTIME_EXCEEDED",
+                    error="Slice runtime exceeded configured maximum.",
+                )
+    tool_debug_event(
+        "BATCH_COMPLETED",
+        report_name=report_name,
+        slice_total=len(blueprints),
+    )
     return logs
 
 @dataclass
@@ -7372,6 +8590,38 @@ class AckEmailResult:
     recipients: List[str] = field(default_factory=list)
     reason: str = ""
     error: str = ""
+    overall_status: str = ""
+    ok_count: int = 0
+    fail_count: int = 0
+    pending_count: int = 0
+    cancelled_count: int = 0
+    recipient_source: str = ""
+    smtp_host: str = ""
+    smtp_port: int = 0
+    body_summary: str = ""
+
+
+class DispatchBatchController:
+    def __init__(self) -> None:
+        self._cancel_requested = False
+        self._tracked_sids: set[str] = set()
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+
+    def is_cancel_requested(self) -> bool:
+        return bool(self._cancel_requested)
+
+    def register_sid(self, sid: str) -> None:
+        safe_sid = str(sid or "").strip()
+        if safe_sid:
+            self._tracked_sids.add(safe_sid)
+
+    def clear_tracked_sids(self) -> None:
+        self._tracked_sids.clear()
+
+    def tracked_sid_count(self) -> int:
+        return len(self._tracked_sids)
 
 
 def _short_error(text: str, limit: int = 180) -> str:
@@ -7658,8 +8908,13 @@ def _pending_no_sid_outcome_code(timeout_status: str) -> str:
 def _classify_mergereport_terminal_message(message: str, level: str) -> Optional[Tuple[str, str]]:
     lower_message = str(message or "").strip().lower()
     upper_level = str(level or "").strip().upper()
-    if "action=email sent" in lower_message or lower_message.startswith("action=email sent"):
-        return ("SUCCESS", "MergeReport confirmed Action=Email sent.")
+    if (
+        "action=email sent" in lower_message
+        or lower_message.startswith("action=email sent")
+        or "app execution completed" in lower_message
+        or "app excution completed" in lower_message
+    ):
+        return ("SUCCESS", str(message or "MergeReport reported successful completion.").strip())
     if upper_level == "ERROR":
         return ("FAILED", str(message or "MergeReport reported an error.").strip())
     failure_markers = (
@@ -7769,7 +9024,7 @@ def resolve_merge_report_runtime_settings(config: Optional[SplunkConfig]) -> dic
             DEFAULT_POSTDISPATCH_LOOKBACK_SECONDS,
             1,
         ),
-        "source_preference": "rest_then_file" if enabled else "none",
+        "source_preference": "file_then_rest" if enabled and bool(file_state.get("available")) else ("rest_then_file" if enabled else "none"),
     }
 
 
@@ -7807,7 +9062,13 @@ def _coerce_merge_report_runtime_settings(
             DEFAULT_POSTDISPATCH_LOOKBACK_SECONDS,
             1,
         ),
-        "source_preference": str(settings.get("source_preference", "rest_then_file" if prefer_merge_report_verification else "none") or "none").strip(),
+        "source_preference": str(
+            settings.get(
+                "source_preference",
+                "rest_then_file" if prefer_merge_report_verification else "none",
+            )
+            or "none"
+        ).strip(),
     }
 
 
@@ -7887,12 +9148,47 @@ def _check_merge_report_preferred_evidence(
     if not settings["enabled"] or not safe_sid:
         return ("DISABLED", {"source": "none", "detail": "", "matched_line_count": 0, "settings": settings})
 
+    def _check_local_file() -> tuple[str, dict[str, Any]]:
+        file_path = str(settings.get("local_file_path", "") or "").strip()
+        preference = str(settings.get("source_preference", "") or "").strip().lower()
+        state, detail = _scan_mergereport_log_for_sid(
+            file_path,
+            safe_sid,
+            require_app_completion=preference in {"file", "file_first", "file_primary", "file_then_rest"},
+        )
+        return (
+            state,
+            {
+                "source": "file",
+                "detail": detail,
+                "matched_line_count": 1 if state in {"SUCCESS", "FAILED"} else 0,
+                "settings": settings,
+            },
+        )
+
+    source_preference = str(settings.get("source_preference", "") or "").strip().lower()
+    file_first = bool(settings.get("local_file_available")) and source_preference in {
+        "file",
+        "file_first",
+        "file_primary",
+        "file_then_rest",
+    }
+    if file_first:
+        file_state, file_payload = _check_local_file()
+        if file_state in {"SUCCESS", "FAILED"}:
+            return (file_state, file_payload)
+        return ("RUNNING", file_payload)
+
     get_fn = getattr(client, "_get", None)
     rest_checked = False
     rest_state = "RUNNING"
     rest_detail = ""
     rest_matched_count = 0
-    if callable(get_fn) and bool(settings.get("rest_enabled", True)):
+    if (
+        callable(get_fn)
+        and bool(settings.get("rest_enabled", True))
+        and _dispatch_call_supports_keyword(get_fn, "params")
+    ):
         lookback_seconds = max(
             int(settings.get("lookback_seconds", DEFAULT_POSTDISPATCH_LOOKBACK_SECONDS) or DEFAULT_POSTDISPATCH_LOOKBACK_SECONDS),
             int(query_timeout_seconds or 0) + RECONCILIATION_WINDOW_BUFFER_SECONDS,
@@ -7975,26 +9271,12 @@ def _check_merge_report_preferred_evidence(
                 )
 
     if bool(settings.get("local_file_available")):
-        file_path = str(settings.get("local_file_path", "") or "").strip()
-        state, detail = _scan_mergereport_log_for_sid(file_path, safe_sid)
+        state, payload = _check_local_file()
         if state in {"SUCCESS", "FAILED"}:
-            return (
-                state,
-                {
-                    "source": "file",
-                    "detail": detail,
-                    "matched_line_count": 1,
-                    "settings": settings,
-                },
-            )
+            return (state, payload)
         return (
             "RUNNING",
-            {
-                "source": "file",
-                "detail": detail,
-                "matched_line_count": 0,
-                "settings": settings,
-            },
+            payload,
         )
 
     if rest_checked:
@@ -8040,6 +9322,12 @@ def _wait_for_merge_report_preferred_evidence(
         merge_report_timeout_seconds=merge_report_timeout_seconds,
         merge_report_settings=merge_report_settings,
     )
+    tool_debug_event(
+        "MERGEREPORT_VERIFICATION_STARTED",
+        sid=str(sid or "").strip(),
+        stage_name="merge_report_wait",
+        timeout_seconds=max(1, int(wait_seconds or 1)),
+    )
     if saved_search_context:
         namespace_info = _resolve_mergereport_saved_search_namespace(
             report_id_url=str(saved_search_context.get("report_id_url", "") or ""),
@@ -8072,6 +9360,13 @@ def _wait_for_merge_report_preferred_evidence(
         ),
         log_callback,
     )
+    tool_debug_event(
+        "VERIFICATION_SOURCE_SELECTED",
+        sid=str(sid or "").strip(),
+        evidence_source=f"merge_report_{preferred_source}" if preferred_source != "none" else "none",
+        source=preferred_source,
+        file_available=bool(settings.get("local_file_available")),
+    )
     if settings["enabled"] and not bool(settings.get("local_file_available")):
         _append_log(
             logs,
@@ -8092,6 +9387,11 @@ def _wait_for_merge_report_preferred_evidence(
     start_time = time.monotonic()
     last_source = preferred_source
     while True:
+        tool_debug_event(
+            "MERGEREPORT_EVIDENCE_CHECK_REQUESTED",
+            sid=str(sid or "").strip(),
+            evidence_source=f"merge_report_{last_source}" if last_source != "none" else "none",
+        )
         state, payload = _check_merge_report_preferred_evidence(
             client,
             sid=sid,
@@ -8106,7 +9406,23 @@ def _wait_for_merge_report_preferred_evidence(
             saved_search_context=saved_search_context,
         )
         last_source = str(payload.get("source", last_source) or last_source)
+        tool_debug_event(
+            "MERGEREPORT_EVIDENCE_CHECK_COMPLETED",
+            sid=str(sid or "").strip(),
+            evidence_source=f"merge_report_{last_source}" if last_source != "none" else "none",
+            state=state,
+            matched_line_count=payload.get("matched_line_count", 0),
+        )
         if state in {"SUCCESS", "FAILED"}:
+            if state == "SUCCESS":
+                tool_debug_event(
+                    "MERGEREPORT_PREFERRED_SUCCESS",
+                    sid=str(sid or "").strip(),
+                    evidence_source=f"merge_report_{last_source}",
+                    snapshot_role="health_check_only",
+                    sid_snapshot_final_confirmation=False,
+                    stage1_strategy="file_primary" if last_source == "file" else "rest_primary",
+                )
             return (state, str(payload.get("detail", "") or "").strip(), last_source, int((time.monotonic() - start_time) * 1000))
         if state == "UNAVAILABLE":
             _append_log(
@@ -8125,7 +9441,7 @@ def _wait_for_merge_report_preferred_evidence(
     return ("TIMEOUT", "", last_source, int((time.monotonic() - start_time) * 1000))
 
 
-def _scan_mergereport_log_for_sid(log_path: str, sid: str) -> Tuple[str, str]:
+def _scan_mergereport_log_for_sid(log_path: str, sid: str, *, require_app_completion: bool = False) -> Tuple[str, str]:
     sid = str(sid or "").strip()
     if not log_path or not sid:
         return ("RUNNING", "")
@@ -8135,17 +9451,18 @@ def _scan_mergereport_log_for_sid(log_path: str, sid: str) -> Tuple[str, str]:
         return ("FAILED", f"Unable to import MergeReport parser: {exc}")
 
     try:
-        with open(log_path, "r", encoding="utf-8", errors="ignore") as handle:
-            for raw_line in handle:
-                event = MergeReportParser.parse_line(raw_line.rstrip("\r\n"))
-                if event is None or str(event.sid or "").strip() != sid:
-                    continue
-                classified = _classify_mergereport_terminal_message(
-                    event.message,
-                    event.level,
-                )
-                if classified is not None:
-                    return classified
+        for raw_line in _read_text_file_tail(log_path).splitlines():
+            event = MergeReportParser.parse_line(raw_line.rstrip("\r\n"))
+            if event is None or str(event.sid or "").strip() != sid:
+                continue
+            if require_app_completion and "action=email sent" in str(event.message or "").strip().lower():
+                continue
+            classified = _classify_mergereport_terminal_message(
+                event.message,
+                event.level,
+            )
+            if classified is not None:
+                return classified
     except FileNotFoundError:
         return ("RUNNING", "")
     except Exception as exc:
@@ -8617,6 +9934,7 @@ def _reconcile_pending_slices(
                         status="FAILED",
                         log_callback=log_callback,
                     )
+                    _append_log(logs, "Stage 1 result: Success", log_callback)
                     continue
             if not item.sid:
                 identity = _parse_saved_search_identity(
@@ -8922,6 +10240,7 @@ def _reconcile_pending_slices(
                     status="OK",
                     log_callback=log_callback,
                 )
+                _append_log(logs, "Stage 1 result: Success", log_callback)
                 _audit_event(
                     "REPORT_PENDING_RESOLVED_OK",
                     level="INFO",
@@ -9067,10 +10386,12 @@ def _format_slice_summary_line(item: RegenSliceRecord) -> str:
 
 def _format_slice_user_summary_line(item: RegenSliceRecord) -> str:
     range_text = _slice_range_text(item.earliest, item.latest)
+    sid_text = f" (sid={item.sid})" if item.sid else ""
+    existing_label = str(getattr(item, "slice_label", "") or "").strip()
     prefix = (
         f"[{item.slice_index}/{item.slice_total}]"
         if item.slice_index > 0 and item.slice_total > 0
-        else "[Report]"
+        else existing_label or "[Report]"
     )
     normalized = str(item.status or "").strip().upper()
     state_label = _normalize_slice_state(getattr(item, "lifecycle_state", ""))
@@ -9079,13 +10400,13 @@ def _format_slice_user_summary_line(item: RegenSliceRecord) -> str:
         return f"  {prefix} Pending reconciliation expired. Report: {item.report_name}. Time range: {range_text}"
     if normalized == "OK":
         if bool(getattr(item, "finalized_from_reconciliation", False)):
-            return f"  {prefix} Finalized from reconciliation. Report: {item.report_name}. Time range: {range_text}{retry_suffix}"
-        return f"  {prefix} Email report sent successfully. Report: {item.report_name}. Time range: {range_text}{retry_suffix}"
+            return f"  [OK] {item.report_name} {prefix}: {range_text}{sid_text}{retry_suffix} Finalized from reconciliation."
+        return f"  [OK] {item.report_name} {prefix}: {range_text}{sid_text}{retry_suffix}"
     if _is_pending_status(normalized):
         if state_label == SLICE_STATE_PENDING_RECONCILE:
-            return f"  {prefix} Pending reconciliation. Report: {item.report_name}. Time range: {range_text}{retry_suffix}"
+            return f"  [PENDING] {item.report_name} {prefix}: {range_text}{sid_text}{retry_suffix}"
         if item.sid:
-            return f"  {prefix} Report dispatched and is awaiting verification. Report: {item.report_name}. Time range: {range_text}{retry_suffix}"
+            return f"  [PENDING] {item.report_name} {prefix}: {range_text}{sid_text}{retry_suffix}"
         if _slice_has_pending_dispatch(item):
             return f"  {prefix} Dispatch not yet confirmed; awaiting SID from Splunk. Report: {item.report_name}. Time range: {range_text}{retry_suffix}"
         return f"  {prefix} Dispatch not yet confirmed. Report: {item.report_name}. Time range: {range_text}{retry_suffix}"
@@ -9595,7 +10916,18 @@ def send_ack_summary_email(context: RegenContext, config: Optional[SplunkConfig]
     ack_enabled = _resolve_ack_enabled(config)
     ack_on_pending = _resolve_ack_on_pending(config)
     recipients = _resolve_ack_recipients(context, config) if ack_enabled else []
-    _, fail_count, pending_count = context.summary_counts()
+    ok_count, fail_count, pending_count = context.summary_counts()
+    cancelled_count = sum(1 for item in context.slices if str(item.status or "").strip().upper() == "CANCELLED")
+    overall_status = context.overall_status()
+    smtp_settings = _resolve_smtp_settings(config)
+    recipient_source = "config" if config is not None and config.ack_recipients else ("savedsearch" if context.savedsearch_recipients else "")
+    body_summary = f"overall_status={overall_status} ok={ok_count} failed={fail_count} pending={pending_count} cancelled={cancelled_count}"
+    tool_debug_event(
+        "ACK_EVALUATION_STARTED",
+        run_id=context.run_id,
+        overall_status=overall_status,
+        recipient_count=len(recipients),
+    )
     _audit_event(
         "EMAIL_SEND_REQUESTED",
         level="INFO",
@@ -9618,6 +10950,49 @@ def send_ack_summary_email(context: RegenContext, config: Optional[SplunkConfig]
             attempted=False,
             success=False,
             reason="ack_disabled",
+            overall_status=overall_status,
+            ok_count=ok_count,
+            fail_count=fail_count,
+            pending_count=pending_count,
+            cancelled_count=cancelled_count,
+            recipient_source=recipient_source,
+            smtp_host=smtp_settings["host"],
+            smtp_port=smtp_settings["port"],
+            body_summary=body_summary,
+        )
+    if fail_count > 0:
+        tool_debug_event("ACK_EVALUATION_COMPLETED", run_id=context.run_id, status="skipped", reason="failed_slices_present")
+        return AckEmailResult(
+            attempted=False,
+            success=False,
+            recipients=recipients,
+            reason="failed_slices_present",
+            overall_status=overall_status,
+            ok_count=ok_count,
+            fail_count=fail_count,
+            pending_count=pending_count,
+            cancelled_count=cancelled_count,
+            recipient_source=recipient_source,
+            smtp_host=smtp_settings["host"],
+            smtp_port=smtp_settings["port"],
+            body_summary=body_summary,
+        )
+    if cancelled_count > 0:
+        tool_debug_event("ACK_EVALUATION_COMPLETED", run_id=context.run_id, status="skipped", reason="cancelled_slices_present")
+        return AckEmailResult(
+            attempted=False,
+            success=False,
+            recipients=recipients,
+            reason="cancelled_slices_present",
+            overall_status=overall_status,
+            ok_count=ok_count,
+            fail_count=fail_count,
+            pending_count=pending_count,
+            cancelled_count=cancelled_count,
+            recipient_source=recipient_source,
+            smtp_host=smtp_settings["host"],
+            smtp_port=smtp_settings["port"],
+            body_summary=body_summary,
         )
     if pending_count > 0 and not ack_on_pending:
         _audit_event(
@@ -9635,6 +11010,15 @@ def send_ack_summary_email(context: RegenContext, config: Optional[SplunkConfig]
             success=False,
             recipients=recipients,
             reason="pending_slices_present",
+            overall_status=overall_status,
+            ok_count=ok_count,
+            fail_count=fail_count,
+            pending_count=pending_count,
+            cancelled_count=cancelled_count,
+            recipient_source=recipient_source,
+            smtp_host=smtp_settings["host"],
+            smtp_port=smtp_settings["port"],
+            body_summary=body_summary,
         )
     if not recipients:
         _audit_event(
@@ -9650,10 +11034,24 @@ def send_ack_summary_email(context: RegenContext, config: Optional[SplunkConfig]
             attempted=False,
             success=False,
             reason="no_recipients",
+            overall_status=overall_status,
+            ok_count=ok_count,
+            fail_count=fail_count,
+            pending_count=pending_count,
+            cancelled_count=cancelled_count,
+            recipient_source=recipient_source,
+            smtp_host=smtp_settings["host"],
+            smtp_port=smtp_settings["port"],
+            body_summary=body_summary,
         )
-    smtp_settings = _resolve_smtp_settings(config)
     subject = _build_ack_subject(context)
     body = _build_ack_body(context)
+    tool_debug_event(
+        "ACK_EMAIL_REQUESTED",
+        run_id=context.run_id,
+        recipient_count=len(recipients),
+        subject=subject,
+    )
     if pending_count > 0:
         _audit_event(
             "ACK_EMAIL_SENT_PENDING",
@@ -9689,11 +11087,22 @@ def send_ack_summary_email(context: RegenContext, config: Optional[SplunkConfig]
             run_id=context.run_id,
             recipient_count=len(recipients),
         )
+        tool_debug_event("ACK_EMAIL_SENT", run_id=context.run_id, recipient_count=len(recipients))
+        tool_debug_event("ACK_EVALUATION_COMPLETED", run_id=context.run_id, status="sent")
         return AckEmailResult(
             attempted=True,
             success=True,
             recipients=recipients,
-            reason="pending_verification" if pending_count > 0 else "",
+            reason="pending_verification" if pending_count > 0 else "all_slices_ok",
+            overall_status=overall_status,
+            ok_count=ok_count,
+            fail_count=fail_count,
+            pending_count=pending_count,
+            cancelled_count=cancelled_count,
+            recipient_source=recipient_source,
+            smtp_host=smtp_settings["host"],
+            smtp_port=smtp_settings["port"],
+            body_summary=body_summary,
         )
     except Exception as exc:
         _audit_event(
@@ -9711,6 +11120,15 @@ def send_ack_summary_email(context: RegenContext, config: Optional[SplunkConfig]
             recipients=recipients,
             reason="smtp_send_failed",
             error=repr(exc),
+            overall_status=overall_status,
+            ok_count=ok_count,
+            fail_count=fail_count,
+            pending_count=pending_count,
+            cancelled_count=cancelled_count,
+            recipient_source=recipient_source,
+            smtp_host=smtp_settings["host"],
+            smtp_port=smtp_settings["port"],
+            body_summary=body_summary,
         )
 
 def run_dispatch_multi(
@@ -9728,6 +11146,8 @@ def run_dispatch_multi(
     sid_callback: Optional[Callable[[str, str], None]] = None,
     config: Optional["SplunkConfig"] = None,
     app: str = "",
+    report_namespace_meta: Optional[List[dict[str, Any]]] = None,
+    batch_controller: Optional[DispatchBatchController] = None,
 ) -> List[str]:
     regen_context: Optional[RegenContext] = None
     logs: List[str] = []
@@ -10027,6 +11447,66 @@ def run_dispatch_multi(
             for idx_num, i in enumerate(selected_indices, start=1):
                 report_id_url = report_ids[i]
                 report_name = report_names[i]
+                namespace_meta = (
+                    report_namespace_meta[i]
+                    if report_namespace_meta is not None and i < len(report_namespace_meta)
+                    else None
+                )
+                try:
+                    content, metadata_path, entry, namespace_used = _fetch_saved_search_entry(
+                        client,
+                        report_id_url=report_id_url,
+                        report_name=report_name,
+                        app=app,
+                        username=splunk_username,
+                        namespace_meta=namespace_meta,
+                    )
+                    decision = _resolve_report_classification(
+                        report_name=report_name,
+                        content=content,
+                        entry=entry,
+                        metadata_path=metadata_path,
+                        namespace_used=namespace_used,
+                        config=config,
+                    )
+                    _emit_dispatch_debug_event(
+                        "REPORT_CLASSIFICATION_EVALUATED",
+                        report_name=report_name,
+                        final_classification=decision.report_type,
+                        verification_mode=decision.verification_mode,
+                        verification_source=decision.verification_source,
+                        **decision.action_inputs,
+                    )
+                except ReportClassificationResolutionError as exc:
+                    _append_log(logs, f"Report classification failed for '{report_name}': {exc}", log_callback)
+                    _emit_dispatch_debug_event(
+                        "REPORT_CLASSIFICATION_FAILED",
+                        level="WARN",
+                        report_name=report_name,
+                        error=str(exc),
+                    )
+                    continue
+                resolved_window = None
+                if no_change:
+                    try:
+                        resolved_window = resolve_saved_search_reporting_window(
+                            client,
+                            report_id_url=report_id_url,
+                            report_name=report_name,
+                            app=app,
+                            username=splunk_username,
+                            dispatch_anchor_epoch=int(time.time()),
+                            config=config,
+                            namespace_meta=namespace_meta,
+                            log_callback=log_callback,
+                        )
+                    except Exception as exc:
+                        _append_log(
+                            logs,
+                            f"Saved-search time-range resolution failed for '{report_name}': {exc}",
+                            log_callback,
+                        )
+                        continue
                 _append_log(logs, "", log_callback)
                 _append_log(
                     logs,
@@ -10067,6 +11547,12 @@ def run_dispatch_multi(
                         if config is not None
                         else DEFAULT_MERGEREPORT_TIMEOUT_SECONDS
                     ),
+                    report_type=decision.report_type,
+                    verification_mode=decision.verification_mode,
+                    verification_source=decision.verification_source,
+                    resolved_window=resolved_window,
+                    config=config,
+                    batch_controller=batch_controller,
                 )
                 logs.extend(report_logs)
         else:
@@ -10078,6 +11564,66 @@ def run_dispatch_multi(
             for idx_num, i in enumerate(selected_indices, start=1):
                 report_id_url = report_ids[i]
                 report_name = report_names[i]
+                namespace_meta = (
+                    report_namespace_meta[i]
+                    if report_namespace_meta is not None and i < len(report_namespace_meta)
+                    else None
+                )
+                try:
+                    content, metadata_path, entry, namespace_used = _fetch_saved_search_entry(
+                        client,
+                        report_id_url=report_id_url,
+                        report_name=report_name,
+                        app=app,
+                        username=splunk_username,
+                        namespace_meta=namespace_meta,
+                    )
+                    decision = _resolve_report_classification(
+                        report_name=report_name,
+                        content=content,
+                        entry=entry,
+                        metadata_path=metadata_path,
+                        namespace_used=namespace_used,
+                        config=config,
+                    )
+                    _emit_dispatch_debug_event(
+                        "REPORT_CLASSIFICATION_EVALUATED",
+                        report_name=report_name,
+                        final_classification=decision.report_type,
+                        verification_mode=decision.verification_mode,
+                        verification_source=decision.verification_source,
+                        **decision.action_inputs,
+                    )
+                except ReportClassificationResolutionError as exc:
+                    _append_log(logs, f"Report classification failed for '{report_name}': {exc}", log_callback)
+                    _emit_dispatch_debug_event(
+                        "REPORT_CLASSIFICATION_FAILED",
+                        level="WARN",
+                        report_name=report_name,
+                        error=str(exc),
+                    )
+                    continue
+                resolved_window = None
+                if no_change:
+                    try:
+                        resolved_window = resolve_saved_search_reporting_window(
+                            client,
+                            report_id_url=report_id_url,
+                            report_name=report_name,
+                            app=app,
+                            username=splunk_username,
+                            dispatch_anchor_epoch=int(time.time()),
+                            config=config,
+                            namespace_meta=namespace_meta,
+                            log_callback=log_callback,
+                        )
+                    except Exception as exc:
+                        _append_log(
+                            logs,
+                            f"Saved-search time-range resolution failed for '{report_name}': {exc}",
+                            log_callback,
+                        )
+                        continue
                 _append_log(logs, "", log_callback)
                 _append_log(
                     logs,
@@ -10108,6 +11654,12 @@ def run_dispatch_multi(
                     ),
                     merge_report_settings=merge_report_settings,
                     dispatch_only=True,
+                    report_type=decision.report_type,
+                    verification_mode=decision.verification_mode,
+                    verification_source=decision.verification_source,
+                    resolved_window=resolved_window,
+                    config=config,
+                    batch_controller=batch_controller,
                 )
                 logs.extend(report_logs)
         pending_slices = _pending_slice_records(regen_context)
