@@ -30,12 +30,17 @@ for dll_name in (
 
 # Bundle Tcl/Tk so Tkinter does not rely on system installs.
 datas = []
+top_level_datas = []
 tcl_root = os.path.join(sys.base_prefix, "tcl")
 if os.path.isdir(tcl_root):
     datas.append((tcl_root, "tcl"))
 app_icon = os.path.join(PROJECT_ROOT, "assets", "app_icon.ico")
 if os.path.isfile(app_icon):
     datas.append((app_icon, "assets"))
+for config_template in ("config.ini.example", "config.example.ini"):
+    template_path = os.path.join(PROJECT_ROOT, config_template)
+    if os.path.isfile(template_path):
+        top_level_datas.append((config_template, template_path, "PKG"))
 
 a = Analysis(
     ['main.py'],
@@ -76,6 +81,7 @@ exe = EXE(
 )
 coll = COLLECT(
     exe,
+    top_level_datas,
     a.binaries,
     a.zipfiles,
     a.datas,
