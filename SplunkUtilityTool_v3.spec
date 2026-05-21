@@ -70,11 +70,11 @@ def _find_vc_runtime_bins():
 
 
 datas = []
-app_icon = _repo_root() / "assets" / "app.ico"
+app_icon = _repo_root() / "assets" / "app_icon.ico"
 if app_icon.exists():
     datas.append((str(app_icon), "assets"))
 else:
-    print("Warning: assets/app.ico not found; build will use default icon.")
+    print("Warning: assets/app_icon.ico not found; build will use default icon.")
 
 binaries = _find_vc_runtime_bins()
 if binaries:

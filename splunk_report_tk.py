@@ -11,6 +11,8 @@ from typing import Callable, Optional
 import tkinter as tk
 from tkinter import ttk
 
+from app_icon import apply_window_icon, set_windows_app_user_model_id
+
 try:
     # Optional calendar widget for nicer date selection
     from tkcalendar import DateEntry
@@ -166,26 +168,6 @@ def _operator_display_line(raw_text: str) -> str:
     if text.startswith("Recovery reconcile requires an active Splunk connection."):
         return text
     return ""
-
-
-def _resolve_app_icon_path() -> str | None:
-    """Resolve app icon path for source and bundled executions."""
-    candidates: list[str] = []
-
-    if getattr(sys, "frozen", False):
-        exe_dir = os.path.dirname(sys.executable)
-        candidates.append(os.path.join(exe_dir, "assets", "app.ico"))
-        meipass = getattr(sys, "_MEIPASS", "")
-        if meipass:
-            candidates.append(os.path.join(meipass, "assets", "app.ico"))
-
-    module_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates.append(os.path.join(module_dir, "assets", "app.ico"))
-
-    for path in candidates:
-        if path and os.path.isfile(path):
-            return path
-    return None
 
 
 def _resolve_runtime_exe_dir() -> str:
@@ -1367,7 +1349,9 @@ class ReportsApp(ttk.Frame):
 
 
 def main() -> None:
+    set_windows_app_user_model_id()
     root = tk.Tk()
+    apply_window_icon(root)
     apply_splunk_light_theme(root)
     style_window(root, surface=WINDOW_BG)
     exe_dir = _resolve_runtime_exe_dir()
@@ -1437,13 +1421,6 @@ def main() -> None:
             break_glass_token_sha256=policy.break_glass_token_sha256,
         )
 
-    icon_path = _resolve_app_icon_path()
-    if icon_path:
-        try:
-            root.iconbitmap(icon_path)
-        except tk.TclError:
-            # Continue even if Tk cannot load the icon in this environment.
-            pass
     root.withdraw()  # hide until config is loaded
 
     log_broker_url, log_broker_token = broker_handle.child_auth_config()
