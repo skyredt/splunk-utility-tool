@@ -6,24 +6,24 @@ from tkinter import ttk
 
 FONT_FAMILY = "Segoe UI"
 FONT_FAMILY_BOLD = "Segoe UI Semibold"
-WINDOW_BG = "#F3F7FB"
+WINDOW_BG = "#EDF4FC"
 SURFACE_BG = "#FFFFFF"
-SURFACE_ALT_BG = "#F8FAFC"
-BORDER = "#B8C7DA"
-TEXT = "#102033"
-TEXT_MUTED = "#5F6F84"
-ACCENT = "#0B63CE"
-ACCENT_HOVER = "#084A9A"
-ACCENT_SOFT = "#E6F0FF"
-DISABLED_BG = "#E8EEF5"
-DISABLED_TEXT = "#8FA0B3"
-FOCUS = "#2F80ED"
+SURFACE_ALT_BG = "#F3F8FE"
+BORDER = "#7FA6D6"
+TEXT = "#0B1F33"
+TEXT_MUTED = "#4F6278"
+ACCENT = "#0057B8"
+ACCENT_HOVER = "#003F87"
+ACCENT_SOFT = "#DCEBFF"
+DISABLED_BG = "#D8E3EF"
+DISABLED_TEXT = "#71869C"
+FOCUS = "#006FE6"
 LIST_BG = "#FFFFFF"
-LOG_BG = "#F8FAFC"
+LOG_BG = "#F6FAFF"
 SUCCESS = "#2E7D32"
 WARNING = "#B7791F"
 ERROR = "#C62828"
-OVERLAY_BG = "#102033"
+OVERLAY_BG = "#0B1F33"
 OVERLAY_ALPHA = 0.16
 
 
@@ -73,7 +73,7 @@ def apply_splunk_light_theme(root: tk.Misc) -> ttk.Style:
     )
     style.map(
         "TButton",
-        background=[("active", "#EDF4FB"), ("pressed", "#DDE8F4"), ("disabled", DISABLED_BG)],
+        background=[("active", "#E7F1FC"), ("pressed", ACCENT_SOFT), ("disabled", DISABLED_BG)],
         foreground=[("disabled", DISABLED_TEXT)],
         bordercolor=[("focus", FOCUS)],
     )
@@ -89,7 +89,7 @@ def apply_splunk_light_theme(root: tk.Misc) -> ttk.Style:
     )
     style.map(
         "Primary.TButton",
-        background=[("active", ACCENT_HOVER), ("pressed", "#06366F"), ("disabled", "#A8B8CA")],
+        background=[("active", ACCENT_HOVER), ("pressed", "#002F66"), ("disabled", "#9DB2C8")],
         foreground=[("disabled", "#F5F8FC")],
         bordercolor=[("focus", FOCUS)],
     )
@@ -157,12 +157,12 @@ def apply_splunk_light_theme(root: tk.Misc) -> ttk.Style:
     )
     style.map(
         "TScrollbar",
-        background=[("active", "#DFE9F5"), ("pressed", "#D2DEEC")],
+        background=[("active", "#DCEBFA"), ("pressed", "#C8DBF0")],
     )
 
     style.configure(
         "TProgressbar",
-        troughcolor="#DDE8F4",
+        troughcolor=ACCENT_SOFT,
         background=ACCENT,
         bordercolor=BORDER,
         lightcolor=ACCENT,
