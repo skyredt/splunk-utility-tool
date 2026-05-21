@@ -26,7 +26,6 @@ from splunk_engine import (
     build_run_plan,
     combine_date_time,
     filter_report_indices,
-    selected_handling_mode,
     get_effective_username,
     inspect_unfinished_batch_journals,
     recover_unfinished_batch_journal,
@@ -361,8 +360,11 @@ class ReportsApp(ttk.Frame):
 
         selection_row = ttk.Frame(left, style="Card.TFrame")
         selection_row.pack(fill="x", pady=(0, 6))
+        selection_row.columnconfigure(0, weight=1)
+        selection_row.columnconfigure(1, weight=0)
+        selection_row.columnconfigure(2, weight=0)
         self.selected_count_var = tk.StringVar(value="Selected: 0 reports")
-        ttk.Label(selection_row, textvariable=self.selected_count_var, style="Card.TLabel").pack(side="left")
+        ttk.Label(selection_row, textvariable=self.selected_count_var, style="Card.TLabel").grid(row=0, column=0, sticky="w")
         self.show_selected_only_var = tk.BooleanVar(value=False)
         self.show_selected_only_chk = ttk.Checkbutton(
             selection_row,
@@ -371,11 +373,13 @@ class ReportsApp(ttk.Frame):
             command=self.on_show_selected_only_toggled,
             style="TCheckbutton",
         )
-        self.show_selected_only_chk.pack(side="left", padx=(12, 0))
-        self.review_selected_button = ttk.Button(selection_row, text="Review selected", command=self.on_review_selected)
-        self.review_selected_button.pack(side="left", padx=(8, 0))
-        self.clear_selected_button = ttk.Button(selection_row, text="Clear selected", command=self.on_clear_selected)
-        self.clear_selected_button.pack(side="left", padx=(8, 0))
+        self.show_selected_only_chk.grid(row=0, column=1, sticky="e", padx=(12, 10))
+        selection_actions = ttk.Frame(selection_row, style="Card.TFrame")
+        selection_actions.grid(row=0, column=2, sticky="e")
+        self.review_selected_button = ttk.Button(selection_actions, text="Review selected", command=self.on_review_selected, width=15)
+        self.review_selected_button.pack(side="left", padx=(0, 6))
+        self.clear_selected_button = ttk.Button(selection_actions, text="Clear selected", command=self.on_clear_selected, width=12)
+        self.clear_selected_button.pack(side="left")
 
         self.reports_list = tk.Listbox(
             left,
@@ -439,7 +443,7 @@ class ReportsApp(ttk.Frame):
         )
         self.no_change_chk.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 4))
 
-        self.run_plan_preview_var = tk.StringVar(value="Selected reports: 0\nPlanned executions: 0\nHandling mode: Premium Handling")
+        self.run_plan_preview_var = tk.StringVar(value="Selected reports: 0\nPlanned executions: 0\nDate mode: Daily")
         self.run_plan_preview_label = ttk.Label(
             right,
             textvariable=self.run_plan_preview_var,
@@ -695,7 +699,6 @@ class ReportsApp(ttk.Frame):
     def _update_run_plan_preview(self) -> None:
         selected_indices = self._selected_indices_from_state()
         selected_count = len(selected_indices)
-        handling_mode = selected_handling_mode(selected_count)
         frequency = self.frequency_var.get()
         planned = 0
         range_line = ""
@@ -718,12 +721,13 @@ class ReportsApp(ttk.Frame):
                     planned = plan.planned_execution_count
                     if frequency == DATE_MODE_CUSTOM_RANGE:
                         range_line = f"\nRange: {start.strftime('%Y-%m-%d %H:%M')} to {end.strftime('%Y-%m-%d %H:%M')}"
+                    else:
+                        range_line = f"\nRange: {start.date().isoformat()} to {end.date().isoformat()}"
             except Exception:
                 planned = 0
         self.run_plan_preview_var.set(
             f"Selected reports: {selected_count}\n"
             f"Planned executions: {planned}\n"
-            f"Handling mode: {handling_mode}\n"
             f"Date mode: {frequency}{range_line}"
         )
 
@@ -1201,8 +1205,7 @@ class ReportsApp(ttk.Frame):
     def _manual_regen_prompt_text(
         self,
         selected_report_names: list[str],
-        range_text: str,
-        mode_text: str,
+        summary_text: str,
     ) -> str:
         if len(selected_report_names) <= 5:
             report_label = ", ".join(selected_report_names)
@@ -1215,8 +1218,7 @@ class ReportsApp(ttk.Frame):
             "(different from scheduled automation).\n"
             "An acknowledgement email will be sent only when final status is known, or when pending verification emails are explicitly enabled.\n\n"
             f"Report(s): {report_label}\n"
-            f"Date range: {range_text}\n"
-            f"Slice mode: {mode_text}\n"
+            f"{summary_text}\n"
         )
 
     def on_send_clicked(self) -> None:
@@ -1270,15 +1272,8 @@ class ReportsApp(ttk.Frame):
                 return
             if frequency == DATE_MODE_CUSTOM_RANGE:
                 range_text = f"{start.strftime('%Y-%m-%d %H:%M')} to {end.strftime('%Y-%m-%d %H:%M')} (local/Splunk convention)"
-                mode_text = f"custom range ({run_plan.planned_execution_count} total)"
             else:
                 range_text = f"{start.date().isoformat()} to {end.date().isoformat()}"
-                per_report = run_plan.planned_execution_count // max(1, run_plan.selected_report_count)
-                mode_text = (
-                    f"{frequency.lower()} slices: {per_report} per report "
-                    f"({run_plan.planned_execution_count} total)"
-                )
-            handling_mode = run_plan.handling_mode
             planned_execution_count = run_plan.planned_execution_count
         else:
             start_d = self._get_date_from_widget(self.start_date_widget)
@@ -1302,20 +1297,18 @@ class ReportsApp(ttk.Frame):
                 no_change=True,
                 app=self.app_var.get().strip(),
             )
-            mode_text = f"single run per report ({run_plan.planned_execution_count} total)"
-            handling_mode = run_plan.handling_mode
             planned_execution_count = run_plan.planned_execution_count
 
+        summary_lines = [
+            f"Selected reports: {len(selected_indices)}",
+            f"Planned executions: {planned_execution_count}",
+            f"Date mode: {frequency}",
+        ]
+        if not no_change:
+            summary_lines.append(f"Range: {range_text}")
         prompt_text = self._manual_regen_prompt_text(
             selected_report_names=selected_report_names,
-            range_text=range_text,
-            mode_text=(
-                f"{mode_text}\n"
-                f"Selected reports: {len(selected_indices)}\n"
-                f"Planned executions: {planned_execution_count}\n"
-                f"Handling mode: {handling_mode}\n"
-                f"Date mode: {frequency}"
-            ),
+            summary_text="\n".join(summary_lines),
         )
         proceed = self._show_prompt(
             "Confirm Manual Regeneration",
@@ -1342,7 +1335,7 @@ class ReportsApp(ttk.Frame):
         self._append_log("")
         self._append_log(
             f"Sending {len(selected_indices)} report(s) - planned_executions={planned_execution_count}, "
-            f"handling_mode={handling_mode}, frequency={frequency}, range={start} -> {end}, no_change={no_change}"
+            f"frequency={frequency}, range={start} -> {end}, no_change={no_change}"
         )
         self._last_display_line = ""
         self._current_reference_id = ""

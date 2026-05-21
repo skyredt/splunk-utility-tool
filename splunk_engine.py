@@ -11197,7 +11197,7 @@ def run_dispatch_multi(
             frequency=frequency,
             earliest_configured=start.strftime("%Y-%m-%d %H:%M:%S"),
             latest_configured=end.strftime("%Y-%m-%d %H:%M:%S"),
-            mode_description=f"{mode_description}; {run_plan.handling_mode}",
+            mode_description=mode_description,
             ack_attach_manifest=(config.ack_attach_manifest if config else False),
             correlation_mode=CORRELATION_MODE_SPLUNK_UI_CONTEXT_BEST_EFFORT,
         )
@@ -11430,8 +11430,7 @@ def run_dispatch_multi(
             logs,
             (
                 f"Run plan: {run_plan.selected_report_count} selected report(s), "
-                f"{run_plan.planned_execution_count} planned execution(s), "
-                f"handling mode={run_plan.handling_mode}."
+                f"{run_plan.planned_execution_count} planned execution(s)."
             ),
             log_callback,
         )
