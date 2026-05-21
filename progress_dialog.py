@@ -8,6 +8,7 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable, Optional
 
+from app_icon import apply_window_icon
 from gab_loader import GABLoader
 from overlay import create_overlay, remove_overlay
 from ui_prompt import show_modal_prompt
@@ -44,6 +45,7 @@ def run_with_progress(
 ) -> None:
     overlay = create_overlay(parent)
     dialog = tk.Toplevel(parent)
+    apply_window_icon(dialog)
     dialog.title(title)
     dialog.transient(parent)
     dialog.resizable(False, False)

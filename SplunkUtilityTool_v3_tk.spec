@@ -33,7 +33,7 @@ datas = []
 tcl_root = os.path.join(sys.base_prefix, "tcl")
 if os.path.isdir(tcl_root):
     datas.append((tcl_root, "tcl"))
-app_icon = os.path.join(PROJECT_ROOT, "assets", "app.ico")
+app_icon = os.path.join(PROJECT_ROOT, "assets", "app_icon.ico")
 if os.path.isfile(app_icon):
     datas.append((app_icon, "assets"))
 
