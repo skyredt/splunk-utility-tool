@@ -355,31 +355,17 @@ class ReportsApp(ttk.Frame):
         self.search_var.trace_add("write", self.on_search_changed)
         self.search_entry = ttk.Entry(search_row, textvariable=self.search_var)
         self.search_entry.pack(side="left", fill="x", expand=True, padx=(4, 4))
-        self.clear_search_button = ttk.Button(search_row, text="Clear", command=self.on_clear_search)
+        self.clear_search_button = ttk.Button(search_row, text="Clear search", command=self.on_clear_search)
         self.clear_search_button.pack(side="left")
 
         selection_row = ttk.Frame(left, style="Card.TFrame")
         selection_row.pack(fill="x", pady=(0, 6))
         selection_row.columnconfigure(0, weight=1)
         selection_row.columnconfigure(1, weight=0)
-        selection_row.columnconfigure(2, weight=0)
         self.selected_count_var = tk.StringVar(value="Selected: 0 reports")
         ttk.Label(selection_row, textvariable=self.selected_count_var, style="Card.TLabel").grid(row=0, column=0, sticky="w")
-        self.show_selected_only_var = tk.BooleanVar(value=False)
-        self.show_selected_only_chk = ttk.Checkbutton(
-            selection_row,
-            text="Show selected only",
-            variable=self.show_selected_only_var,
-            command=self.on_show_selected_only_toggled,
-            style="TCheckbutton",
-        )
-        self.show_selected_only_chk.grid(row=0, column=1, sticky="e", padx=(12, 10))
-        selection_actions = ttk.Frame(selection_row, style="Card.TFrame")
-        selection_actions.grid(row=0, column=2, sticky="e")
-        self.review_selected_button = ttk.Button(selection_actions, text="Review selected", command=self.on_review_selected, width=15)
-        self.review_selected_button.pack(side="left", padx=(0, 6))
-        self.clear_selected_button = ttk.Button(selection_actions, text="Clear selected", command=self.on_clear_selected, width=12)
-        self.clear_selected_button.pack(side="left")
+        self.clear_selected_button = ttk.Button(selection_row, text="Clear selected", command=self.on_clear_selected, width=14)
+        self.clear_selected_button.grid(row=0, column=1, sticky="e")
 
         self.reports_list = tk.Listbox(
             left,
@@ -558,7 +544,6 @@ class ReportsApp(ttk.Frame):
             self.report_email_flags = []
             self.filtered_indices = []
             self.selected_report_ids.clear()
-            self.show_selected_only_var.set(False)
             self.search_var.set("")
             self._update_selection_controls()
 
@@ -629,14 +614,10 @@ class ReportsApp(ttk.Frame):
             self.end_date_widget.configure(state="disabled")
             self.start_time_entry.configure(state="disabled")
             self.end_time_entry.configure(state="disabled")
-            self.show_selected_only_chk.configure(state="disabled")
-            self.review_selected_button.configure(state="disabled")
             self.clear_selected_button.configure(state="disabled")
         else:
             self._set_connected_state(self.client is not None)
             self.no_change_chk.configure(state="normal")
-            self.show_selected_only_chk.configure(state="normal")
-            self.review_selected_button.configure(state="normal")
             self.clear_selected_button.configure(state="normal")
             self.on_no_change_toggled()
 
@@ -685,14 +666,10 @@ class ReportsApp(ttk.Frame):
                 indices.append(idx)
         return indices
 
-    def _selected_report_names_from_state(self) -> list[str]:
-        return [self.report_names[i] for i in self._selected_indices_from_state()]
-
     def _update_selection_controls(self) -> None:
         count = len(self.selected_report_ids)
         noun = "report" if count == 1 else "reports"
         self.selected_count_var.set(f"Selected: {count} {noun}")
-        self.review_selected_button.configure(state="normal" if count and not self._dispatch_in_progress else "disabled")
         self.clear_selected_button.configure(state="normal" if count and not self._dispatch_in_progress else "disabled")
         self._update_run_plan_preview()
 
@@ -739,7 +716,7 @@ class ReportsApp(ttk.Frame):
             self.report_ids,
             search_term=self.search_var.get(),
             selected_report_ids=self.selected_report_ids,
-            show_selected_only=self.show_selected_only_var.get(),
+            show_selected_only=False,
             app=self.app_var.get().strip(),
         )
         for display_idx, idx in enumerate(self.filtered_indices):
@@ -990,7 +967,6 @@ class ReportsApp(ttk.Frame):
             self.report_names = names
             self.report_email_flags = email_flags
             self.selected_report_ids.clear()
-            self.show_selected_only_var.set(False)
             self._apply_search_filter()
             self._append_log(f"Loaded {len(names)} report(s).")
 
@@ -1007,7 +983,6 @@ class ReportsApp(ttk.Frame):
             self.reports_list.delete(0, "end")
             self.filtered_indices = []
             self.selected_report_ids.clear()
-            self.show_selected_only_var.set(False)
             self._update_selection_controls()
 
         run_with_progress(
@@ -1040,23 +1015,7 @@ class ReportsApp(ttk.Frame):
                 self.selected_report_ids.add(report_key)
             else:
                 self.selected_report_ids.discard(report_key)
-        if self.show_selected_only_var.get():
-            self._apply_search_filter()
-        else:
-            self._update_selection_controls()
-
-    def on_show_selected_only_toggled(self) -> None:
-        self._apply_search_filter()
-
-    def on_review_selected(self) -> None:
-        selected_names = self._selected_report_names_from_state()
-        if not selected_names:
-            self._show_prompt("Selected reports", "No reports selected.", "info")
-            return
-        shown = "\n".join(f"- {name}" for name in selected_names[:25])
-        if len(selected_names) > 25:
-            shown += f"\n... and {len(selected_names) - 25} more"
-        self._show_prompt("Selected reports", shown, "info")
+        self._update_selection_controls()
 
     def on_clear_selected(self) -> None:
         self.selected_report_ids.clear()
