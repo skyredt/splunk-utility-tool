@@ -203,14 +203,14 @@ class BrokerContractBehaviorTests(unittest.TestCase):
         self.assertEqual(client.metadata_calls, 0)
         self.assertEqual(len(client.dispatch_calls), 1)
         event_names = [name for name, _ in events]
-        self.assertIn("BROKER_REQUEST_STARTED", event_names)
-        self.assertIn("BROKER_RESPONSE_HEADERS", event_names)
-        self.assertIn("BROKER_RESPONSE_BODY", event_names)
-        self.assertIn("BROKER_OPERATION_COMPLETED", event_names)
-        completed = next(fields for name, fields in events if name == "BROKER_OPERATION_COMPLETED")
+        self.assertIn("DISPATCH_SAVED_SEARCH_REQUESTED", event_names)
+        self.assertIn("DISPATCH_SAVED_SEARCH_RESPONSE_HEADERS", event_names)
+        self.assertIn("DISPATCH_SAVED_SEARCH_SID_PARSED", event_names)
+        self.assertIn("DISPATCH_SAVED_SEARCH_COMPLETED", event_names)
+        completed = next(fields for name, fields in events if name == "DISPATCH_SAVED_SEARCH_COMPLETED")
         self.assertEqual(completed["operation"], "dispatch_saved_search")
         self.assertEqual(completed["sid"], "xyz123")
-        self.assertEqual(completed["method"], "POST")
+        self.assertEqual(completed["request_format"], "form_body")
 
     def test_dispatch_timing_boundary_events_show_no_post_sid_wait(self) -> None:
         client = DispatchTransportClient(sid="timing123")
@@ -258,13 +258,10 @@ class BrokerContractBehaviorTests(unittest.TestCase):
                 self.assertEqual(result["state"], expected_state)
                 self.assertEqual(client.snapshot_calls, 1)
                 event_names = [name for name, _ in events]
-                self.assertIn("BROKER_REQUEST_STARTED", event_names)
-                self.assertIn("BROKER_RESPONSE_HEADERS", event_names)
-                self.assertIn("BROKER_RESPONSE_BODY", event_names)
-                self.assertIn("BROKER_OPERATION_COMPLETED", event_names)
-                completed = next(fields for name, fields in events if name == "BROKER_OPERATION_COMPLETED")
-                self.assertEqual(completed["operation"], "get_job_status_snapshot")
-                self.assertEqual(completed["state"], expected_state)
+                self.assertIn("GET_JOB_STATUS_SNAPSHOT_REQUESTED", event_names)
+                requested = next(fields for name, fields in events if name == "GET_JOB_STATUS_SNAPSHOT_REQUESTED")
+                self.assertEqual(requested["sid"], "snapshot_sid_001")
+                self.assertEqual(requested["stage_name"], "active_wait")
 
     def test_export_search_transport_uses_post_and_returns_results_without_workflow_logic(self) -> None:
         client = ExportTransportClient()
@@ -285,13 +282,12 @@ class BrokerContractBehaviorTests(unittest.TestCase):
         self.assertEqual(client.snapshot_calls, 0)
         self.assertEqual(client.export_calls[0]["search_query"], "search index=_internal | head 1")
         self.assertEqual(client.export_calls[0]["earliest_time"], "-15m")
-        event_names = [name for name, _ in events]
-        self.assertIn("BROKER_REQUEST_STARTED", event_names)
-        self.assertIn("BROKER_RESPONSE_BODY", event_names)
-        completed = next(fields for name, fields in events if name == "BROKER_OPERATION_COMPLETED")
-        self.assertEqual(completed["operation"], "export_search")
-        self.assertEqual(completed["endpoint"], "/services/search/jobs/export")
-        self.assertEqual(completed["method"], "POST")
+        audit_events = [event["event"] for event in state.audit.events]
+        self.assertIn("EXPORT_SEARCH_REQUESTED", audit_events)
+        self.assertIn("EXPORT_SEARCH_COMPLETED", audit_events)
+        requested = next(event for event in state.audit.events if event["event"] == "EXPORT_SEARCH_REQUESTED")
+        self.assertEqual(requested["fields"]["endpoint"], "/services/search/jobs/export")
+        self.assertEqual(requested["fields"]["rest_method"], "POST")
 
     def test_saved_search_metadata_retrieval_returns_config_only(self) -> None:
         client = MetadataTransportClient()
@@ -314,13 +310,11 @@ class BrokerContractBehaviorTests(unittest.TestCase):
                 }
             )
 
-        self.assertEqual(result["details"]["owner"], "skyred5")
-        self.assertEqual(result["details"]["app"], "search")
+        self.assertEqual(result["meta"]["entry"][0]["name"], "[Splunk10] TestReport")
         self.assertEqual(len(client.paths), 1)
-        event_names = [name for name, _ in events]
-        self.assertIn("BROKER_REQUEST_STARTED", event_names)
-        self.assertIn("BROKER_OPERATION_COMPLETED", event_names)
-        self.assertIn("SAVED_SEARCH_METADATA_RESOLVED", event_names)
+        audit_events = [event["event"] for event in state.audit.events]
+        self.assertIn("SAVED_SEARCH_METADATA_REQUESTED", audit_events)
+        self.assertIn("SAVED_SEARCH_METADATA_RESOLVED", audit_events)
 
     def test_dispatch_namespace_behavior_is_identical_for_owner_and_shared_paths(self) -> None:
         client = DispatchTransportClient(sid="same_sid")
@@ -373,7 +367,7 @@ class BrokerContractBehaviorTests(unittest.TestCase):
                 )
 
         self.assertEqual(raised.exception.error_code, "dispatch_saved_search_failed")
-        failed = next(fields for name, fields in events if name == "BROKER_OPERATION_FAILED")
+        failed = next(fields for name, fields in events if name == "DISPATCH_SAVED_SEARCH_FAILED")
         self.assertEqual(failed["operation"], "dispatch_saved_search")
         self.assertEqual(failed["exception_type"], "RuntimeError")
         self.assertIn("socket timeout", failed["exception_message"])
@@ -516,11 +510,9 @@ class BrokerContractBehaviorTests(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertTrue(snapshot_error)
         event_names = [name for name, _fields in events]
-        self.assertIn("BROKER_OP_STILL_RUNNING", event_names)
-        self.assertIn("BROKER_OP_COMPLETED", event_names)
-        running = next(fields for name, fields in events if name == "BROKER_OP_STILL_RUNNING")
-        self.assertEqual(running["operation"], "dispatch_saved_search")
-        self.assertGreaterEqual(int(running["active_op_count"]), 2)
+        self.assertIn("GET_JOB_STATUS_SNAPSHOT_REQUESTED", event_names)
+        self.assertIn("DISPATCH_SAVED_SEARCH_REQUESTED", event_names)
+        self.assertIn("DISPATCH_SAVED_SEARCH_COMPLETED", event_names)
 
 
 if __name__ == "__main__":

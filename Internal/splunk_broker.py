@@ -2269,6 +2269,10 @@ class _SplunkBrokerState:
         watchdog_thread.start()
         previous_trace_context = getattr(dispatch_client, "_dispatch_trace_context", None)
         setattr(dispatch_client, "_dispatch_trace_context", trace_context)
+        dispatch_exc: Optional[Exception] = None
+        ok = False
+        sid: Optional[str] = ""
+        err = ""
         try:
             ok, sid, err = dispatch_client.dispatch_saved_search(
                 report_id_url=report_id_url,
@@ -2277,6 +2281,9 @@ class _SplunkBrokerState:
                 trigger_actions=trigger_actions,
                 request_timeout_seconds=int(_BROKER_LANE_SPECS[BROKER_REQUEST_CLASS_DISPATCH].read_timeout_seconds),
             )
+        except Exception as exc:
+            dispatch_exc = exc
+            err = _safe_error_text(exc)
         finally:
             if previous_trace_context is None:
                 try:
@@ -2294,6 +2301,39 @@ class _SplunkBrokerState:
                         pass
             watchdog_done.set()
         elapsed_ms = int((time.monotonic() - op_start) * 1000)
+        if dispatch_exc is not None:
+            self.audit.log_event(
+                "BROKER_DISPATCH_BACKEND_EXCEPTION",
+                level="ERROR",
+                **trace_fields,
+                elapsed_ms=elapsed_ms,
+                exception_type=type(dispatch_exc).__name__,
+                exception_message=_sanitize_text(err),
+            )
+            _emit_broker_dispatch_runtime_trace(
+                "BROKER_DISPATCH_BACKEND_EXCEPTION",
+                level="ERROR",
+                **trace_fields,
+                elapsed_ms=elapsed_ms,
+                exception_type=type(dispatch_exc).__name__,
+                exception_message=_sanitize_text(err),
+            )
+            _emit_broker_debug_event(
+                "DISPATCH_SAVED_SEARCH_FAILED",
+                level="WARN",
+                operation="dispatch_saved_search",
+                request_format="form_body",
+                earliest_time=earliest,
+                latest_time=latest,
+                trigger_actions=trigger_actions,
+                error_detail=err,
+                failure_classification="dispatch_backend_exception",
+                exception_type=type(dispatch_exc).__name__,
+                exception_message=_sanitize_text(err),
+                elapsed_ms=elapsed_ms,
+                **request_context,
+            )
+            raise _BrokerError(502, "dispatch_saved_search_failed", _sanitize_text(err))
         if (not ok) and _looks_like_auth_failure(str(err or "")):
             raise _BrokerError(401, "splunk_auth_failed", _sanitize_text(str(err or "")))
         self.audit.log_event(
