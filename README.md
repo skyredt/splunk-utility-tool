@@ -19,6 +19,10 @@ It supports:
 
 The tool is designed to improve operational safety without treating slow or uncertain Splunk responses as immediate hard failures.
 
+## Documentation
+
+- [Technical implementation notes](docs/technical-implementation.md) - architecture, dispatch workflow, slicing, verification, reconciliation, and public-safe documentation boundaries.
+
 ## Key Features
 
 - Tkinter-based desktop UI
