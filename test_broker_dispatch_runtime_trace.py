@@ -59,7 +59,7 @@ class SlowDispatchClient(DispatchClient):
 class MetadataClient:
     def _get(self, path: str):
         del path
-        time.sleep(0.03)
+        time.sleep(0.08)
         return {
             "entry": [
                 {
@@ -134,7 +134,7 @@ class BrokerDispatchRuntimeTraceTests(unittest.TestCase):
         with patch.object(
             splunk_broker_module,
             "_BROKER_METADATA_WATCHDOG_SECONDS",
-            (0.01, 0.02),
+            (0.005, 0.01),
         ), patch.object(
             splunk_broker_module,
             "runtime_log",

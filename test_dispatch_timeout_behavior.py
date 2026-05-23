@@ -3625,11 +3625,20 @@ class MergeReportParsingTests(unittest.TestCase):
             def close(self) -> None:
                 self.closed = True
 
-        request_calls: list[dict[str, object]] = []
+        class OneShotSession:
+            def __init__(self) -> None:
+                self.trust_env = True
+                self.calls: list[dict[str, object]] = []
+                self.closed = False
 
-        def _request(**kwargs):
-            request_calls.append(dict(kwargs))
-            return Response()
+            def request(self, **kwargs):
+                self.calls.append(dict(kwargs))
+                return Response()
+
+            def close(self) -> None:
+                self.closed = True
+
+        oneshot_session = OneShotSession()
 
         client = splunk_engine.SplunkClient.__new__(splunk_engine.SplunkClient)
         client.base_url = "https://127.0.0.1:8089"
@@ -3638,7 +3647,7 @@ class MergeReportParsingTests(unittest.TestCase):
         client.session = SharedSession()
         client._last_dispatch_meta = {}
 
-        with patch.object(splunk_engine.requests, "request", _request):
+        with patch.object(splunk_engine.requests, "Session", return_value=oneshot_session):
             ok, sid, error = splunk_engine.SplunkClient.dispatch_saved_search(
                 client,
                 "https://127.0.0.1:8089/servicesNS/skyred5/search/saved/searches/%5BSplunk10%5D%20TestReport",
@@ -3651,8 +3660,10 @@ class MergeReportParsingTests(unittest.TestCase):
         self.assertEqual(sid, "1700000_dispatch_sid")
         self.assertEqual(error, "")
         self.assertEqual(client.session.calls, [])
-        self.assertEqual(len(request_calls), 1)
-        call = request_calls[0]
+        self.assertFalse(oneshot_session.trust_env)
+        self.assertTrue(oneshot_session.closed)
+        self.assertEqual(len(oneshot_session.calls), 1)
+        call = oneshot_session.calls[0]
         self.assertEqual(call["method"], "POST")
         self.assertEqual(call["timeout"], (10, 30))
         self.assertEqual(call["headers"]["Authorization"], "Splunk test-session")
@@ -3680,9 +3691,19 @@ class MergeReportParsingTests(unittest.TestCase):
             def close(self) -> None:
                 self.closed = True
 
-        def _request(**kwargs):
-            del kwargs
-            return Response()
+        class OneShotSession:
+            def __init__(self) -> None:
+                self.trust_env = True
+                self.closed = False
+
+            def request(self, **kwargs):
+                del kwargs
+                return Response()
+
+            def close(self) -> None:
+                self.closed = True
+
+        oneshot_session = OneShotSession()
 
         client = splunk_engine.SplunkClient.__new__(splunk_engine.SplunkClient)
         client.base_url = "https://127.0.0.1:8089"
@@ -3691,7 +3712,7 @@ class MergeReportParsingTests(unittest.TestCase):
         client.session = object()
         client._last_dispatch_meta = {}
 
-        with patch.object(splunk_engine.requests, "request", _request):
+        with patch.object(splunk_engine.requests, "Session", return_value=oneshot_session):
             ok, sid, error = splunk_engine.SplunkClient.dispatch_saved_search(
                 client,
                 "https://127.0.0.1:8089/servicesNS/skyred5/search/saved/searches/%5BSplunk10%5D%20TestReport",
@@ -3703,6 +3724,8 @@ class MergeReportParsingTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(sid, "1700000_dispatch_sid_json")
         self.assertEqual(error, "")
+        self.assertFalse(oneshot_session.trust_env)
+        self.assertTrue(oneshot_session.closed)
         self.assertEqual(client._last_dispatch_meta["sid_source"], "json_body")
 
     def test_broker_dispatch_saved_search_writes_debug_log(self) -> None:
