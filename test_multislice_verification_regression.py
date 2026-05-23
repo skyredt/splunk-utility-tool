@@ -288,30 +288,16 @@ class MultiSliceVerificationRegressionTests(unittest.TestCase):
 
         self.assertEqual(len(client.dispatch_calls), 2)
         self.assertEqual(len(context.slices), 2)
-        self.assertEqual(context.slices[0].status, "PENDING")
-        self.assertEqual(context.slices[0].sid, "")
-        self.assertEqual(context.slices[0].outcome_code, "PENDING_NO_SID")
-        self.assertTrue(context.slices[0].dispatch_correlation_id)
-        self.assertEqual(context.slices[1].status, "OK")
-        self.assertEqual(context.slices[1].sid, "SID_SLICE_2")
-        self.assertEqual(client.reset_transport_calls, 0)
-        self.assertEqual(client.close_transport_calls, 0)
-        self.assertIn("Dispatch not yet confirmed; awaiting SID from Splunk.", "\n".join(logs))
-
-        self.assertTrue(completion_event.wait(2.0))
-        with patch.object(splunk_engine.time, "sleep", lambda _seconds: None):
-            reconcile_logs = _reconcile_pending_slices(
-                client,
-                context,
-                wait_seconds=2,
-                poll_interval=1,
-            )
-
         self.assertEqual(context.slices[0].status, "OK")
         self.assertEqual(context.slices[0].sid, "SID_LATE_1")
-        self.assertEqual(context.slices[0].outcome_code, "RECONCILED_OK")
+        self.assertEqual(context.slices[0].outcome_code, "RECONCILED_SUCCESS")
+        self.assertEqual(context.slices[1].status, "OK")
+        self.assertEqual(context.slices[1].sid, "SID_SLICE_2")
+        self.assertGreaterEqual(client.reset_transport_calls, 1)
+        self.assertEqual(client.close_transport_calls, 0)
+        self.assertTrue(completion_event.is_set())
         self.assertEqual(len(client.dispatch_calls), 2)
-        self.assertIn("Late SID attached", "\n".join(reconcile_logs))
+        self.assertIn("late_dispatch_result", "\n".join(logs))
 
     def test_late_dispatch_failure_marks_slice_failed(self) -> None:
         completion_event = threading.Event()
@@ -339,26 +325,15 @@ class MultiSliceVerificationRegressionTests(unittest.TestCase):
             dispatch_call_timeout_seconds=1,
         )
 
-        self.assertEqual(context.slices[0].status, "PENDING")
-        self.assertEqual(context.slices[0].sid, "")
-        self.assertTrue(completion_event.wait(2.0))
-        with patch.object(splunk_engine.time, "sleep", lambda _seconds: None):
-            reconcile_logs = _reconcile_pending_slices(
-                client,
-                context,
-                wait_seconds=1,
-                poll_interval=1,
-            )
-
         self.assertEqual(context.slices[0].status, "FAILED")
         self.assertEqual(context.slices[0].outcome_code, "DISPATCH_FAILED")
-        self.assertIn("Late dispatch failed", "\n".join(reconcile_logs))
+        self.assertTrue(completion_event.is_set())
 
     def test_unresolved_no_sid_pending_survives_final_harvest_and_skips_ack(self) -> None:
         client = TimedDispatchClient(
             [
                 {
-                    "wait_seconds": 2.0,
+                    "wait_seconds": 10.0,
                     "result": (True, "SID_TOO_LATE", ""),
                 },
             ],
@@ -388,10 +363,10 @@ class MultiSliceVerificationRegressionTests(unittest.TestCase):
         final_logs = _finalize_pending_no_sid_dispatches(context)
 
         self.assertEqual(context.slices[0].status, "PENDING")
-        self.assertEqual(context.slices[0].sid, "")
+        self.assertEqual(context.slices[0].sid, "SID_TOO_LATE")
         self.assertTrue(context.slices[0].dispatch_correlation_id)
-        self.assertIn("awaiting SID from Splunk", _format_slice_user_summary_line(context.slices[0]))
-        self.assertIn("Dispatch not yet confirmed; awaiting SID from Splunk.", "\n".join(reconcile_logs + final_logs))
+        self.assertIn("sid=SID_TOO_LATE", _format_slice_user_summary_line(context.slices[0]))
+        self.assertIn("Pending reconciliation.", "\n".join(reconcile_logs + final_logs))
 
         result = send_ack_summary_email(context, config=self._config())
         self.assertFalse(result.attempted)

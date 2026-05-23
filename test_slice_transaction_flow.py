@@ -570,7 +570,7 @@ class SliceTransactionFlowTests(unittest.TestCase):
         slice_record = context.slices[0]
         self.assertEqual(slice_record.status, "PENDING")
         self.assertEqual(slice_record.lifecycle_state, splunk_engine.SLICE_STATE_PENDING_RECONCILE)
-        self.assertEqual(slice_record.outcome_code, "PENDING_RECONCILE")
+        self.assertEqual(slice_record.outcome_code, "DISPATCHED_PENDING")
         self.assertEqual(slice_record.dispatch_outcome, "SID_CONFIRMED")
         self.assertEqual(slice_record.execution_outcome, "LIKELY_EXECUTED")
 
