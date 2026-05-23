@@ -4299,7 +4299,7 @@ class SplunkClient(QObject):
             bind_transport = getattr(self, "_bind_response_transport", None)
             transport_token = register_transport(oneshot_session) if callable(register_transport) else ""
             try:
-                resp_local = requests.request(
+                resp_local = oneshot_session.request(
                     method="POST",
                     url=url,
                     data=request_payload,

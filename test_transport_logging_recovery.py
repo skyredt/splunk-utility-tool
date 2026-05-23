@@ -78,7 +78,7 @@ class TransportLoggingRecoveryTests(unittest.TestCase):
         self.assertEqual(len(oneshot_session.calls), 1)
         call = oneshot_session.calls[0]
         self.assertEqual(call["method"], "POST")
-        self.assertEqual(call["timeout"], (3, 30))
+        self.assertEqual(call["timeout"], (splunk_engine.DEFAULT_HTTP_CONNECT_TIMEOUT_SECONDS, 30))
         self.assertFalse(call["verify"])
         self.assertFalse(call["allow_redirects"])
         self.assertEqual(call["headers"]["Authorization"], "Splunk test-session")
