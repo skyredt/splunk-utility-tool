@@ -1,24 +1,32 @@
-#!/usr/bin/env python3
-"""Test SMTP host extraction from Splunk server URL."""
+from __future__ import annotations
 
-from splunk_engine import load_config, SplunkClient
+import unittest
 from urllib.parse import urlparse
 
-cfg = load_config()
-server = cfg.servers[0] if cfg.servers else "https://127.0.0.1:8089"
-base_url = server if server.startswith("http") else f"https://{server}:8089"
-client = SplunkClient(base_url, cfg.username, cfg.password)
+import splunk_engine
 
-print("Testing SMTP host extraction...\n")
-print(f"Client base_url: {client.base_url}")
 
-# Extract hostname
-parsed = urlparse(client.base_url)
-smtp_host = parsed.hostname or "127.0.0.1"
-smtp_port = 25
+class SmtpHostUnitTests(unittest.TestCase):
+    def test_smtp_settings_use_fake_config_without_real_client_login(self) -> None:
+        cfg = splunk_engine.SplunkConfig(
+            servers=["https://splunk-example.invalid:8089"],
+            username="unit_user",
+            password="unit_password",
+            smtp_host="smtp-example.invalid",
+            smtp_port=2525,
+        )
 
-print(f"Extracted SMTP host: {smtp_host}")
-print(f"SMTP port: {smtp_port}")
-print(f"\nFor jump host scenario:")
-print(f"  - Tool on jump host will connect to: {smtp_host}:{smtp_port}")
-print(f"  - Splunk server {client.base_url} will relay email")
+        settings = splunk_engine._resolve_smtp_settings(cfg)
+
+        self.assertEqual(settings["host"], "smtp-example.invalid")
+        self.assertEqual(settings["port"], 2525)
+
+    def test_hostname_can_be_derived_from_fake_splunk_management_url(self) -> None:
+        parsed = urlparse("https://splunk-example.invalid:8089")
+
+        self.assertEqual(parsed.hostname, "splunk-example.invalid")
+        self.assertEqual(parsed.port, 8089)
+
+
+if __name__ == "__main__":
+    unittest.main()
