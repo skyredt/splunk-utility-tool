@@ -42,7 +42,15 @@ class BrokerIsolatedOperationTests(unittest.TestCase):
                 self.closed = False
                 self.snapshot_calls: list[tuple[str, int]] = []
 
-            def get_job_status_snapshot(self, *, sid: str, request_timeout_seconds: int):
+            def get_job_status_snapshot(
+                self,
+                *,
+                sid: str,
+                request_timeout_seconds: int,
+                retry_count: int = 0,
+                stage_name: str = "",
+            ):
+                del retry_count, stage_name
                 self.snapshot_calls.append((sid, request_timeout_seconds))
                 return "SUCCESS", {"dispatchState": "DONE"}
 

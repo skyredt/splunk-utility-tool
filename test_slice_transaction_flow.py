@@ -127,9 +127,28 @@ class TransactionFlowClient:
     def close_transport(self) -> None:
         self.reset_calls += 1
 
-    def _get(self, path: str):
+    def _get(self, path: str, **kwargs):
+        del kwargs
+        parsed_name = str(path).rstrip("/").rsplit("/", 1)[-1] if path else "TestReport"
         del path
-        return {"entry": []}
+        return {
+            "entry": [
+                {
+                    "name": parsed_name,
+                    "acl": {
+                        "owner": self.username,
+                        "app": "search",
+                        "sharing": "user",
+                    },
+                    "content": {
+                        "dispatch.earliest_time": "-1d@d",
+                        "dispatch.latest_time": "@d",
+                        "action.email": "1",
+                        "action.email.to": "ops@example.com",
+                    },
+                }
+            ]
+        }
 
 
 def _make_context(run_id: str) -> splunk_engine.RegenContext:
