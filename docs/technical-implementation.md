@@ -219,7 +219,18 @@ Repository security rules:
 | Operator UX | Multi-app selection, confirmation workflow, progress tracking, acknowledgment summary |
 | API integration | Controlled Splunk Management API calls and request isolation |
 
-## 18. Boundaries and non-goals
+## 18. Validation status
+
+Current repository validation includes:
+
+```bash
+python -m py_compile main.py splunk_report_tk.py splunk_engine.py
+python -m unittest discover -v
+```
+
+The current unit test suite runs without requiring real `config.ini`, `secret.dpapi`, Splunk credentials, or live Splunk connectivity. Recent validation completed with 218 tests run, 0 failures, and 0 errors.
+
+## 19. Boundaries and non-goals
 
 - The tool does not replace Splunk's scheduler.
 - The tool does not guarantee report delivery.
