@@ -20,6 +20,7 @@ except ImportError:  # fall back to simple Entry if tkcalendar is not installed
 
 from splunk_engine import (
     TOOL_DISPLAY_NAME,
+    MAX_SLICES_PER_REPORT,
     SplunkConfig,
     build_slices,
     get_effective_username,
@@ -1063,10 +1064,10 @@ class ReportsApp(ttk.Frame):
             if len(starts) == 0:
                 self._show_prompt("Invalid range", "Selected date range generates 0 slices.", "warning")
                 return
-            if len(starts) > 12:
+            if len(starts) > MAX_SLICES_PER_REPORT:
                 self._show_prompt(
                     "Invalid range",
-                    "Selected date range generates more than 12 slices.",
+                    f"Selected date range generates more than {MAX_SLICES_PER_REPORT} slices.",
                     "warning",
                 )
                 return

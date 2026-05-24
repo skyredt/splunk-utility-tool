@@ -93,6 +93,11 @@ DEFAULT_BROKER_REQUEST_TIMEOUT_SECONDS = 300
 DEFAULT_RECONCILE_PENDING_ENABLED = True
 DEFAULT_RECONCILE_WAIT_SECONDS = 60
 DEFAULT_STATUS_SNAPSHOT_TIMEOUT_RETRIES = 1
+PLANE_MAX_EXECUTION_UNITS = 7
+BUS_MIN_EXECUTION_UNITS = 8
+MAX_SLICES_PER_REPORT = 366
+EXECUTION_MODEL_PLANE = "plane"
+EXECUTION_MODEL_BUS = "bus"
 FAILED_DISPATCH_STATES = {"FAILED", "ERROR", "CANCELED", "CANCELLED"}
 CORRELATION_MODE_TOOL_LOCAL_ONLY = "tool_local_only"
 CORRELATION_MODE_SPLUNK_UI_CONTEXT_BEST_EFFORT = "splunk_ui_context_best_effort"
@@ -137,6 +142,18 @@ _INTERNAL_RUNTIME_EXCEPTION_TYPES = (
 
 _SECURITY_AUDIT_LOGGER = None
 _SECURITY_POLICY: Optional[SecurityPolicy] = None
+
+
+def choose_dispatch_execution_model(execution_unit_count: int) -> str:
+    # The threshold applies to post-slicing execution units, not raw report count.
+    count = max(0, int(execution_unit_count or 0))
+    if count <= PLANE_MAX_EXECUTION_UNITS:
+        return EXECUTION_MODEL_PLANE
+    return EXECUTION_MODEL_BUS
+
+
+def calculate_execution_unit_count(selected_report_count: int, slices_per_report: int) -> int:
+    return max(0, int(selected_report_count or 0)) * max(0, int(slices_per_report or 0))
 
 
 def set_security_audit_logger(audit_logger) -> None:
@@ -470,6 +487,7 @@ class RegenContext:
     earliest_configured: str = ""  # earliest date configured
     latest_configured: str = ""  # latest date configured
     mode_description: str = "single run"
+    execution_model: str = EXECUTION_MODEL_PLANE
 
     # Recipients and outcome
     savedsearch_recipients: List[str] = field(default_factory=list)
@@ -1115,6 +1133,157 @@ def _find_slice_record(
     return None
 
 
+def _record_context_slice(
+    context: Optional[RegenContext],
+    *,
+    report_name: str = "",
+    **fields: Any,
+) -> None:
+    if context is None:
+        return
+    slice_label = str(fields.get("slice_label", "") or "").strip()
+    item = _find_slice_record(
+        context,
+        slice_id=str(fields.get("slice_id", "") or "").strip(),
+        report_name=report_name,
+        slice_label=slice_label,
+        earliest=str(fields.get("earliest", "") or "").strip(),
+        latest=str(fields.get("latest", "") or "").strip(),
+    )
+    if item is None:
+        context.add_slice(report_name=report_name, **fields)
+        item = context.slices[-1]
+
+    direct_fields = {
+        "batch_id",
+        "slice_id",
+        "report_name",
+        "slice_label",
+        "earliest",
+        "latest",
+        "dispatch_correlation_id",
+        "dispatch_started_utc",
+        "dispatch_report_id_url",
+        "dispatch_earliest",
+        "dispatch_latest",
+        "pending_since_utc",
+        "last_state_change_utc",
+        "expired_utc",
+        "correlation_tag",
+        "correlation_mode",
+        "report_owner",
+        "report_app",
+        "verification_mode",
+        "reconciliation_confidence",
+        "reconciliation_matched_fields",
+        "reconciliation_decision_reason",
+    }
+    for key in direct_fields:
+        if key in fields:
+            setattr(item, key, str(fields.get(key) or "").strip())
+    if report_name:
+        item.report_name = str(report_name or "").strip()
+    for key in ("slice_index", "slice_total", "attempt_id", "dispatch_timeout_seconds", "retry_count", "reconcile_pass_count"):
+        if key in fields:
+            setattr(item, key, max(0, int(fields.get(key) or 0)))
+    for key in ("retry_exhausted", "finalized_from_reconciliation", "tainted"):
+        if key in fields:
+            setattr(item, key, bool(fields.get(key)))
+
+    _set_slice_record_state(
+        item,
+        lifecycle_state=str(fields.get("lifecycle_state", item.lifecycle_state) or item.lifecycle_state),
+        status=str(fields.get("status", item.status) or item.status),
+        attempt_id=(max(0, int(fields.get("attempt_id") or 0)) if "attempt_id" in fields else None),
+        sid=(str(fields.get("sid") or "").strip() if "sid" in fields else None),
+        outcome_code=(str(fields.get("outcome_code") or "").strip() if "outcome_code" in fields else None),
+        error=(str(fields.get("error") or "").strip() if "error" in fields else None),
+        state_reason=(str(fields.get("state_reason") or "").strip() if "state_reason" in fields else None),
+        retry_count=(max(0, int(fields.get("retry_count") or 0)) if "retry_count" in fields else None),
+        retry_exhausted=(bool(fields.get("retry_exhausted")) if "retry_exhausted" in fields else None),
+        finalized_from_reconciliation=(
+            bool(fields.get("finalized_from_reconciliation")) if "finalized_from_reconciliation" in fields else None
+        ),
+        reconciliation_source=(
+            str(fields.get("reconciliation_source") or "").strip() if "reconciliation_source" in fields else None
+        ),
+        reconcile_pass_count=(
+            max(0, int(fields.get("reconcile_pass_count") or 0)) if "reconcile_pass_count" in fields else None
+        ),
+        tainted=(bool(fields.get("tainted")) if "tainted" in fields else None),
+        taint_reason=(str(fields.get("taint_reason") or "").strip() if "taint_reason" in fields else None),
+        execution_context_id=(
+            str(fields.get("execution_context_id") or "").strip() if "execution_context_id" in fields else None
+        ),
+        correlation_tag=(str(fields.get("correlation_tag") or "").strip() if "correlation_tag" in fields else None),
+        reconciliation_confidence=(
+            str(fields.get("reconciliation_confidence") or "").strip() if "reconciliation_confidence" in fields else None
+        ),
+        reconciliation_matched_fields=(
+            str(fields.get("reconciliation_matched_fields") or "").strip()
+            if "reconciliation_matched_fields" in fields
+            else None
+        ),
+        reconciliation_decision_reason=(
+            str(fields.get("reconciliation_decision_reason") or "").strip()
+            if "reconciliation_decision_reason" in fields
+            else None
+        ),
+        dispatch_outcome=(
+            str(fields.get("dispatch_outcome") or "").strip() if "dispatch_outcome" in fields else None
+        ),
+        execution_outcome=(
+            str(fields.get("execution_outcome") or "").strip() if "execution_outcome" in fields else None
+        ),
+        evidence_outcome=(
+            str(fields.get("evidence_outcome") or "").strip() if "evidence_outcome" in fields else None
+        ),
+        business_outcome=(
+            str(fields.get("business_outcome") or "").strip() if "business_outcome" in fields else None
+        ),
+    )
+
+
+def _execution_context_from_record(client: SplunkClient, context: RegenContext, item: RegenSliceRecord) -> SliceExecutionContext:
+    execution_context = SliceExecutionContext(
+        client=client,
+        run_id=context.run_id,
+        batch_id=item.batch_id or context.batch_id,
+        slice_id=item.slice_id,
+        attempt_id=max(1, int(item.attempt_id or 1)),
+        report_id_url=item.dispatch_report_id_url,
+        report_name=item.report_name,
+        slice_label=item.slice_label,
+        slice_index=item.slice_index,
+        slice_total=item.slice_total,
+        earliest_display=item.earliest,
+        latest_display=item.latest,
+        dispatch_earliest=item.dispatch_earliest or None,
+        dispatch_latest=item.dispatch_latest or None,
+        dispatch_timeout_seconds=max(1, int(item.dispatch_timeout_seconds or DEFAULT_DISPATCH_CALL_TIMEOUT_SECONDS)),
+        snapshot_timeout_seconds=SNAPSHOT_TIMEOUT_SECONDS,
+        retry_count=max(0, int(item.retry_count or 0)),
+        sid=item.sid,
+        dispatch_correlation_id=item.dispatch_correlation_id,
+        tainted=item.tainted,
+        taint_reason=item.taint_reason,
+        finalized_from_reconciliation=item.finalized_from_reconciliation,
+        reconciliation_source=item.reconciliation_source,
+        reconcile_pass_count=item.reconcile_pass_count,
+        execution_context_id=item.execution_context_id or uuid.uuid4().hex[:12],
+        correlation_tag=item.correlation_tag,
+        correlation_mode=item.correlation_mode,
+        report_owner=item.report_owner,
+        report_app=item.report_app,
+        verification_mode=item.verification_mode,
+        reconciliation_confidence=item.reconciliation_confidence,
+        reconciliation_matched_fields=item.reconciliation_matched_fields,
+        reconciliation_decision_reason=item.reconciliation_decision_reason,
+    )
+    execution_context.mark_state(item.lifecycle_state or SLICE_STATE_DISPATCHED)
+    return execution_context
+
+
 def _context_has_active_slices(context: RegenContext) -> bool:
     active_states = {
         SLICE_STATE_QUEUED,
@@ -1224,6 +1393,7 @@ def _persist_batch_journal(context: Optional[RegenContext], *, reason: str) -> N
         "lock_key": context.lock_key,
         "lock_path": context.lock_path,
         "correlation_mode": context.correlation_mode,
+        "execution_model": context.execution_model,
         "report_names": list(context.report_names),
         "app": context.app,
         "operator": context.operator,
@@ -1333,6 +1503,7 @@ def _journal_payload_to_context(payload: dict[str, Any]) -> RegenContext:
     context.lock_key = str(payload.get("lock_key", "") or "").strip()
     context.lock_path = str(payload.get("lock_path", "") or "").strip()
     context.correlation_mode = str(payload.get("correlation_mode", "tool_local_only") or "tool_local_only").strip() or "tool_local_only"
+    context.execution_model = str(payload.get("execution_model", EXECUTION_MODEL_PLANE) or EXECUTION_MODEL_PLANE).strip() or EXECUTION_MODEL_PLANE
     context.savedsearch_recipients = [
         str(value)
         for value in payload.get("savedsearch_recipients", [])
@@ -5974,6 +6145,7 @@ def _dispatch_slice_and_wait(
     report_app: str = "",
     verification_mode: str = "",
     business_effect_guard: Optional[Callable[[SliceExecutionContext], bool]] = None,
+    verify_after_dispatch: bool = True,
 ) -> Tuple[str, str, str]:
     slice_index = max(0, int(slice_index or 0))
     slice_total = max(0, int(slice_total or 0))
@@ -6301,6 +6473,51 @@ def _dispatch_slice_and_wait(
             earliest=earliest_display,
             latest=latest_display,
         )
+        if not verify_after_dispatch:
+            pending_detail_mode = "dispatch_unconfirmed"
+            record_slice(
+                slice_label=slice_label,
+                slice_index=slice_index,
+                slice_total=slice_total,
+                status=timeout_status,
+                earliest=earliest_display,
+                latest=latest_display,
+                sid="",
+                outcome_code=_pending_no_sid_outcome_code(timeout_status),
+                error=err_msg,
+                dispatch_correlation_id=dispatch_call_id,
+                dispatch_started_utc=dispatch_call_started_utc,
+                dispatch_timeout_seconds=execution_context.dispatch_timeout_seconds,
+                dispatch_report_id_url=execution_context.report_id_url,
+                dispatch_earliest=execution_context.dispatch_earliest or "",
+                dispatch_latest=execution_context.dispatch_latest or "",
+                lifecycle_state=SLICE_STATE_PENDING_RECONCILE,
+                state_reason=err_msg,
+                retry_count=execution_context.retry_count,
+                pending_since_utc=_utc_now_iso(),
+                execution_context_id=execution_context.execution_context_id,
+                correlation_tag=execution_context.correlation_tag,
+                correlation_mode=execution_context.correlation_mode,
+                report_owner=execution_context.report_owner,
+                report_app=execution_context.report_app,
+                verification_mode=execution_context.verification_mode,
+                dispatch_outcome="TIMEOUT_UNCERTAIN",
+                execution_outcome="UNKNOWN",
+                evidence_outcome="NONE",
+                business_outcome="PENDING_RECONCILE",
+            )
+            _append_user_slice_status(
+                logs,
+                slice_index=slice_index,
+                slice_total=slice_total,
+                report_name=report_name,
+                earliest=earliest_display,
+                latest=latest_display,
+                status=timeout_status,
+                pending_detail_mode=pending_detail_mode,
+                log_callback=log_callback,
+            )
+            return timeout_status, "", pending_detail_mode
         return _resolve_uncertain_dispatch_timeout(
             logs,
             client=client,
@@ -6489,6 +6706,44 @@ def _dispatch_slice_and_wait(
     )
     if sid_callback:
         sid_callback(sid, report_name)
+    if not verify_after_dispatch:
+        record_slice(
+            batch_id=execution_context.batch_id,
+            slice_id=execution_context.slice_id,
+            attempt_id=execution_context.attempt_id,
+            slice_label=execution_context.slice_label,
+            slice_index=execution_context.slice_index,
+            slice_total=execution_context.slice_total,
+            status="PENDING",
+            earliest=execution_context.earliest_display,
+            latest=execution_context.latest_display,
+            sid=sid,
+            outcome_code="DISPATCHED",
+            dispatch_correlation_id=execution_context.dispatch_correlation_id,
+            dispatch_timeout_seconds=execution_context.dispatch_timeout_seconds,
+            dispatch_report_id_url=execution_context.report_id_url,
+            dispatch_earliest=execution_context.dispatch_earliest or "",
+            dispatch_latest=execution_context.dispatch_latest or "",
+            lifecycle_state=SLICE_STATE_DISPATCHED,
+            state_reason="SID received; queued for batch verification.",
+            retry_count=execution_context.retry_count,
+            execution_context_id=execution_context.execution_context_id,
+            correlation_tag=execution_context.correlation_tag,
+            correlation_mode=execution_context.correlation_mode,
+            report_owner=execution_context.report_owner,
+            report_app=execution_context.report_app,
+            verification_mode=execution_context.verification_mode,
+            dispatch_outcome="SID_CONFIRMED",
+            execution_outcome="RUNNING",
+            evidence_outcome="NONE",
+            business_outcome="RUNNING",
+        )
+        _append_log(
+            logs,
+            f"  {log_prefix}DISPATCHED (sid={sid}) - queued for batch verification.",
+            log_callback,
+        )
+        return "DISPATCHED", sid, ""
     return _verify_dispatched_slice(
         logs,
         client=client,
@@ -6529,6 +6784,7 @@ def run_dispatch_single(
     merge_report_log_path: str = "",
     merge_report_timeout_seconds: int = DEFAULT_MERGEREPORT_TIMEOUT_SECONDS,
     merge_report_settings: Optional[dict[str, Any]] = None,
+    verify_after_dispatch: bool = True,
 ) -> List[str]:
     logs: List[str] = []
     default_owner = str(getattr(client, "username", "") or "").strip()
@@ -6915,13 +7171,14 @@ def run_dispatch_single(
             report_app=str(blueprint.get("report_app", "") or "").strip(),
             verification_mode=str(blueprint.get("verification_mode", "") or "").strip(),
             business_effect_guard=_business_effect_guard,
+            verify_after_dispatch=verify_after_dispatch,
         )
         return logs
 
     if len(blueprints) == 0:
         raise ValueError("Selected date range generates 0 slices/emails.")
-    if len(blueprints) > 12:
-        raise ValueError("Selected date range generates more than 12 slices/emails.")
+    if len(blueprints) > MAX_SLICES_PER_REPORT:
+        raise ValueError(f"Selected date range generates more than {MAX_SLICES_PER_REPORT} slices/emails.")
     _append_log(
         logs,
         f"Dispatching '{report_name}' with {len(blueprints)} slice(s) ({frequency}) from {start} to {end}.",
@@ -6995,6 +7252,7 @@ def run_dispatch_single(
             report_app=str(blueprint.get("report_app", "") or "").strip(),
             verification_mode=str(blueprint.get("verification_mode", "") or "").strip(),
             business_effect_guard=_business_effect_guard,
+            verify_after_dispatch=verify_after_dispatch,
         )
         if str(pending_detail_mode or "").strip().lower() == "dispatch_unconfirmed":
             force_transport_reset_next_slice = True
@@ -7050,6 +7308,61 @@ def run_dispatch_single(
             )
             break
     return logs
+
+
+def _verify_recorded_batch_slice(
+    logs: List[str],
+    *,
+    client: SplunkClient,
+    regen_context: RegenContext,
+    item: RegenSliceRecord,
+    wait_seconds: int,
+    poll_interval: int,
+    timeout_status: str,
+    prefer_merge_report_verification: bool,
+    merge_report_log_path: str,
+    merge_report_timeout_seconds: int,
+    merge_report_settings: Optional[dict[str, Any]],
+    log_callback: Optional[Callable[[str], None]],
+) -> Tuple[str, str, str]:
+    execution_context = _execution_context_from_record(client, regen_context, item)
+
+    def record_slice(**fields: Any) -> None:
+        _record_context_slice(regen_context, report_name=item.report_name, **fields)
+
+    def audit_slice_event(event: str, *, level: str = "INFO", **fields: Any) -> None:
+        fields.setdefault("batch_id", regen_context.batch_id)
+        fields.setdefault("batch_state", regen_context.batch_state)
+        fields.setdefault("slice_id", item.slice_id)
+        fields.setdefault("attempt_id", int(item.attempt_id or 0))
+        fields.setdefault("correlation_tag", item.correlation_tag)
+        _audit_event(
+            event,
+            level=level,
+            run_id=regen_context.run_id,
+            report_name=item.report_name,
+            **fields,
+        )
+
+    return _verify_dispatched_slice(
+        logs,
+        client=client,
+        execution_context=execution_context,
+        report_name=item.report_name,
+        sid=item.sid,
+        wait_seconds=wait_seconds,
+        poll_interval=poll_interval,
+        timeout_status=timeout_status,
+        prefer_merge_report_verification=prefer_merge_report_verification,
+        merge_report_log_path=merge_report_log_path,
+        merge_report_timeout_seconds=merge_report_timeout_seconds,
+        merge_report_settings=merge_report_settings,
+        log_prefix=f"[{item.slice_index}/{item.slice_total}] " if item.slice_index and item.slice_total else "",
+        log_callback=log_callback,
+        record_slice=record_slice,
+        audit_slice_event=audit_slice_event,
+    )
+
 
 @dataclass
 class AckEmailResult:
@@ -9443,7 +9756,7 @@ def run_dispatch_multi(
             start_time_sgt=start_time_sgt,
             end_time_sgt=None,
             slicing_enabled=not no_change,
-            slice_count=max(0, slices_per_report * len(selected_indices)),
+            slice_count=calculate_execution_unit_count(len(selected_indices), slices_per_report),
             frequency=frequency,
             earliest_configured=start.strftime("%Y-%m-%d %H:%M:%S"),
             latest_configured=end.strftime("%Y-%m-%d %H:%M:%S"),
@@ -9572,6 +9885,24 @@ def run_dispatch_multi(
                 else ""
             ),
         )
+        execution_unit_count = len(regen_context.slices)
+        execution_model = choose_dispatch_execution_model(execution_unit_count)
+        regen_context.execution_model = execution_model
+        if isinstance(regen_context.frozen_definition, dict):
+            regen_context.frozen_definition["execution_model"] = execution_model
+            regen_context.frozen_definition["execution_unit_count"] = execution_unit_count
+            regen_context.frozen_definition["execution_model_threshold"] = {
+                "plane_max_execution_units": PLANE_MAX_EXECUTION_UNITS,
+                "bus_min_execution_units": BUS_MIN_EXECUTION_UNITS,
+            }
+        _append_log(
+            logs,
+            (
+                f"Execution model: {execution_model} "
+                f"({execution_unit_count} post-slicing execution unit(s))."
+            ),
+            log_callback,
+        )
         _audit_event(
             "REPORT_DISPATCH_REQUESTED",
             level="INFO",
@@ -9583,6 +9914,8 @@ def run_dispatch_multi(
             earliest=regen_context.earliest_configured,
             latest=regen_context.latest_configured,
             report_count=len(selected_indices),
+            execution_model=execution_model,
+            execution_unit_count=execution_unit_count,
         )
         _set_batch_state(
             regen_context,
@@ -9714,8 +10047,57 @@ def run_dispatch_multi(
                     or DEFAULT_MERGEREPORT_TIMEOUT_SECONDS
                 ),
                 merge_report_settings=merge_report_settings,
+                verify_after_dispatch=(execution_model == EXECUTION_MODEL_PLANE),
             )
             logs.extend(report_logs)
+        if execution_model == EXECUTION_MODEL_BUS:
+            dispatched_items = [
+                item
+                for item in list(regen_context.slices)
+                if item.sid and _normalize_slice_state(item.lifecycle_state) == SLICE_STATE_DISPATCHED
+            ]
+            _append_log(
+                logs,
+                (
+                    f"Bus verification phase: checking {len(dispatched_items)} dispatched "
+                    "execution unit(s)."
+                ),
+                log_callback,
+            )
+            _audit_event(
+                "REPORT_BUS_VERIFICATION_STARTED",
+                level="INFO",
+                run_id=regen_context.run_id,
+                batch_id=regen_context.batch_id,
+                execution_unit_count=execution_unit_count,
+                dispatched_unit_count=len(dispatched_items),
+            )
+            for item in dispatched_items:
+                _verify_recorded_batch_slice(
+                    logs,
+                    client=client,
+                    regen_context=regen_context,
+                    item=item,
+                    wait_seconds=wait_seconds,
+                    poll_interval=poll_interval,
+                    timeout_status=resolve_timeout_result(config),
+                    prefer_merge_report_verification=bool(merge_report_settings.get("enabled")),
+                    merge_report_log_path=str(merge_report_settings.get("local_file_path", "") or ""),
+                    merge_report_timeout_seconds=int(
+                        merge_report_settings.get("timeout_seconds", DEFAULT_MERGEREPORT_TIMEOUT_SECONDS)
+                        or DEFAULT_MERGEREPORT_TIMEOUT_SECONDS
+                    ),
+                    merge_report_settings=merge_report_settings,
+                    log_callback=log_callback,
+                )
+            _audit_event(
+                "REPORT_BUS_VERIFICATION_COMPLETED",
+                level="INFO",
+                run_id=regen_context.run_id,
+                batch_id=regen_context.batch_id,
+                execution_unit_count=execution_unit_count,
+                dispatched_unit_count=len(dispatched_items),
+            )
         pending_slices = _pending_slice_records(regen_context)
         if pending_slices:
             if not resolve_postdispatch_enabled(config):

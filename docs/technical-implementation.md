@@ -4,7 +4,7 @@
 
 Splunk Utility Tool 4.0 is a Python/Tkinter desktop operations utility for controlled Splunk saved-report regeneration. It is designed around practical Splunk administration workflows involving saved-search discovery, report selection, time slicing, dispatch, verification, reconciliation, batch tracking, and optional acknowledgment summaries.
 
-Project status: working tool used/tested in realistic Splunk operations workflow.
+Project status: Functional operational utility.
 
 The tool runs as a desktop client outside Splunk. It does not replace Splunk's scheduler, does not run inside Splunk Web, and acts as a client-side orchestration layer over Splunk saved-search dispatch workflows. The public repository is sanitized and does not include real production configuration or runtime artifacts.
 
@@ -55,6 +55,8 @@ The core execution idea is:
 Dispatch -> wait -> verify -> reconcile -> finalize
 ```
 
+This core lifecycle applies to an individual report or dispatch slice. The Bus vs Plane model determines whether those units are processed one-by-one or batched.
+
 At a high level, the workflow is:
 
 1. Connect to a configured Splunk Management API endpoint.
@@ -85,13 +87,13 @@ In the current engine, the run plan is built before dispatch. Non-custom date mo
 
 ## 7. Bus vs Plane execution model
 
-The Bus vs Plane model is a shorthand for choosing the right level of review for a dispatch set.
+The Bus vs Plane model controls the order of dispatch and verification based on the number of execution units after slicing.
 
-In the Plane style, smaller selections can receive closer per-report attention because the operator overhead is low.
+Plane style applies to 7 or fewer execution units. It follows a "check first, then dispatch" pattern: each unit is dispatched and checked before the next unit is dispatched.
 
-In the Bus style, larger selections are controlled through selection persistence, selected-count visibility, confirmation before dispatch, and post-dispatch result review.
+Bus style applies to 8 or more execution units. It follows a "dispatch first, then check" pattern: all execution units are dispatched first, then verification and reconciliation run across the batch afterward.
 
-This is an operational design model, not a separate dispatch algorithm. The public documentation should not imply a hard-coded threshold unless that behavior is clearly implemented in public code.
+The threshold is based on post-slicing execution count, not raw selected report count. For example, one report sliced into 30 daily windows produces 30 execution units and uses Bus style.
 
 ## 8. Request-level isolation
 
@@ -116,8 +118,6 @@ Persistent selection is preserved across app/search filtering, so hidden selecte
 ## 11. Batch tracking and accountability
 
 Each regeneration run is assigned a batch ID for traceability. The tool records batch context such as selected reports, slices, timestamps, triggering user, and final outcome. This makes follow-up more precise because users and operators can reference a specific regeneration run instead of vaguely describing "the Monday report" or "the failed resend."
-
-Batch IDs make report resend follow-up more specific.
 
 The repository also includes local journal and recovery behavior for unfinished batches. Operators can inspect, reconcile/finalize, or dismiss archived unfinished work instead of blindly rerunning overlapping work.
 
@@ -200,14 +200,17 @@ Repository security rules:
 
 ## 18. Validation status
 
-This documentation update is documentation-only.
+This implementation update includes source, test, and documentation changes for the Bus vs Plane execution model.
 
-Validation for this branch should include:
+For this documentation update, validation consisted of:
 
+- `python -m py_compile main.py splunk_report_tk.py splunk_engine.py`
+- Focused unit tests for Bus vs Plane execution behavior
 - `git diff --check`
 - Sensitive-value scan of changed documentation files
+- Targeted overclaim scan of changed documentation files
 
-The broader test-stabilization branch is intentionally tracked separately because it was based on a different source/test baseline from the current public `main` branch. This documentation validation is not equivalent to source-code or unit-test validation.
+The broader test-stabilization branch is intentionally tracked separately because it was based on a different source/test baseline from the current public `main` branch.
 
 ## 19. Boundaries and non-goals
 
