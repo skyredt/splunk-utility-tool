@@ -8,6 +8,10 @@ Project status: working tool used/tested in realistic Splunk operations workflow
 
 The tool runs as a desktop client outside Splunk. It does not replace Splunk's scheduler, does not run inside Splunk Web, and acts as a client-side orchestration layer over Splunk saved-search dispatch workflows. The public repository is sanitized and does not include real production configuration or runtime artifacts.
 
+## Who this page is for
+
+This page is intended for technical readers who want to understand the design decisions behind the public-safe Splunk Utility Tool project. It focuses on workflow control, dispatch safety, request handling, and documentation boundaries rather than production environment details.
+
 ## 2. Problem statement
 
 When users do not receive scheduled Splunk reports, the Splunk team should not need to manually locate, rerun, check, and resend every report through Splunk Web.
@@ -24,7 +28,7 @@ Before the tool, the manual process was:
 
 The operational pain points are repeated regeneration requests, manual report handling, slow bulk resend work after an incident, weak evidence that a submitted Splunk job was actually sent, and weak accountability when tracing who triggered a resend, when, and for which batch.
 
-Bulk resend after an incident could take 1 to 2 days manually. A submitted Splunk job did not always mean the report was successfully sent.
+For larger recovery work, the expected benefit is reduced manual coordination and more repeatable dispatch review, not a formally benchmarked performance claim. A submitted Splunk job did not always mean the report was successfully sent.
 
 ## 3. Design goals
 
@@ -41,7 +45,7 @@ The tool provides a controlled regeneration workflow for Splunk saved reports. O
 - Reconcile uncertain results where possible.
 - Produce an acknowledgment summary with batch context.
 
-Confirmed implementation themes in the repository include a Tkinter desktop UI, Splunk saved-search dispatch, date/time slicing, slice-by-slice tracking, bounded retry and reconciliation, post-dispatch verification using Splunk-accessible evidence, optional MergeReport-based verification where available, optional acknowledgment email summaries, batch ID tracking, local broker/session/request isolation for safer Splunk REST execution, Windows desktop packaging support with PyInstaller, configuration examples using fake Splunk values, and a security-conscious public repo that avoids real config, secrets, logs, hostnames, or production artifacts.
+Confirmed implementation themes in the repository include a Tkinter desktop UI, Splunk saved-search dispatch, date/time slicing, slice-by-slice tracking, bounded retry and reconciliation, post-dispatch verification using Splunk-accessible evidence, optional MergeReport-based verification where available, optional acknowledgment email summaries, batch ID tracking, request-level isolation for safer Splunk REST execution, Windows desktop packaging support with PyInstaller, configuration examples using fake Splunk values, and a security-conscious public repo that avoids real config, secrets, logs, hostnames, or production artifacts.
 
 ## 4. Operational workflow
 
@@ -67,7 +71,7 @@ At a high level, the workflow is:
 
 ## 5. Check and Dispatch workflow
 
-The strongest workflow in the tool is Check and Dispatch. The tool does not assume that a submitted Splunk dispatch means the report was successfully delivered. It dispatches selected reports or slices, checks available Splunk/tool evidence, reconciles uncertain results where possible, and then produces a final result summary.
+The Check and Dispatch workflow follows the core dispatch, verification, reconciliation, and finalization sequence described above. The tool does not assume that a submitted Splunk dispatch means the report was successfully delivered.
 
 If a report has uncertain status, the tool can move it into reconciliation instead of immediately marking it failed. If the issue cannot be safely resolved, the operator can escalate using the batch ID and summary context.
 
@@ -81,22 +85,19 @@ In the current engine, the run plan is built before dispatch. Non-custom date mo
 
 ## 7. Bus vs Plane execution model
 
-The tool uses two execution patterns depending on batch size.
+The Bus vs Plane model is a shorthand for choosing the right level of review for a dispatch set.
 
-| Batch size | Model | Behavior |
-|---:|---|---|
-| 1 to 7 reports | Plane model | Dispatch one report or slice, check status, then continue |
-| 8 or more reports | Bus model | Dispatch selected reports/slices first, then verify each report or slice afterward |
+In the Plane style, smaller selections can receive closer per-report attention because the operator overhead is low.
 
-The Plane model is used for smaller resend requests where safety and immediate checking matter more. The Bus model is used for larger batches where waiting after each report would waste operator time. This keeps small batches deliberate and safe, while larger recovery batches avoid unnecessary operator waiting time.
+In the Bus style, larger selections are controlled through selection persistence, selected-count visibility, confirmation before dispatch, and post-dispatch result review.
 
-In code, this is represented by a selected-report-count handling threshold. Larger batches enter the throughput path and log that planned executions are dispatched first, with verification following afterward.
+This is an operational design model, not a separate dispatch algorithm. The public documentation should not imply a hard-coded threshold unless that behavior is clearly implemented in public code.
 
-## 8. Broker/session/request isolation
+## 8. Request-level isolation
 
-The tool implements local broker/session isolation for dispatch-critical Splunk REST calls. Dispatch and verification paths can use isolated client/request transport instead of relying on one shared long-lived HTTP connection, helping prevent one timeout, stale connection, or interrupted request from contaminating later dispatch work.
+The dispatch path is documented in terms of request-level isolation: each dispatch request should avoid contaminating subsequent request handling when a timeout or transport failure occurs. This is narrower than claiming full process-wide or authentication-session isolation.
 
-The implementation supports isolated Splunk client/request transport, not necessarily a new authentication login for every slice. Relevant code paths include isolated client cloning, isolated dispatch/rest client creation, fresh `requests.Session()` creation, one-shot request transport, and dispatch metadata such as `transport_mode = "oneshot_request"` and `transport_freshness = "fresh_oneshot_session"`.
+Implementation notes: where the public code exposes request-transport behavior, the relevant concern is HTTP session isolation and bounded handling of dispatch-critical REST calls. The documentation does not claim a new authentication login for every slice.
 
 ## 9. Handling uncertainty and reconciliation
 
@@ -116,7 +117,7 @@ Persistent selection is preserved across app/search filtering, so hidden selecte
 
 Each regeneration run is assigned a batch ID for traceability. The tool records batch context such as selected reports, slices, timestamps, triggering user, and final outcome. This makes follow-up more precise because users and operators can reference a specific regeneration run instead of vaguely describing "the Monday report" or "the failed resend."
 
-Batch IDs turn report resends into traceable operational events.
+Batch IDs make report resend follow-up more specific.
 
 The repository also includes local journal and recovery behavior for unfinished batches. Operators can inspect, reconcile/finalize, or dismiss archived unfinished work instead of blindly rerunning overlapping work.
 
@@ -126,28 +127,13 @@ The repository also includes local journal and recovery behavior for unfinished 
 |---|---|
 | UI layer | Tkinter desktop interface for app/report selection, time range selection, progress, and logs |
 | Engine layer | Dispatch orchestration, slicing, state tracking, timeout handling, and reconciliation |
-| Broker/API layer | Local broker/session/request isolation and controlled Splunk Management API access |
+| Request transport/API layer | Request-level isolation and controlled Splunk Management API access |
 | Verification layer | Post-dispatch checking using native Splunk evidence and optional MergeReport evidence |
 | Packaging layer | Windows desktop packaging support using PyInstaller |
 
 ## 13. Splunk concepts demonstrated
 
-The project demonstrates implementation-level handling of these Splunk concepts:
-
-- Saved searches.
-- Scheduled reports.
-- Splunk Management API.
-- `/servicesNS/-/{app}/saved/searches`.
-- Saved-search dispatch.
-- Search jobs.
-- SID tracking.
-- Scheduler/email workflow awareness.
-- Native Splunk evidence.
-- Optional MergeReport verification.
-- App scoping.
-- Report ownership/app namespace handling.
-- Splunk REST timeout behavior.
-- Post-dispatch monitoring.
+The tool interacts with Splunk saved-search dispatch workflows, including saved-search execution, SID tracking, app scoping, and post-dispatch status review through Splunk-accessible evidence.
 
 ## 14. Tech stack
 
@@ -164,14 +150,9 @@ The project demonstrates implementation-level handling of these Splunk concepts:
 | Configuration | Local config files with fake public examples |
 | Security posture | Sanitized public repo, no real credentials, no internal hostnames, no production logs |
 
-## 15. Estimated operational impact
+## 15. Expected operational impact
 
-These are operational estimates based on the manual steps involved, not formal benchmark results.
-
-| Scenario | Manual process | With tool |
-|---|---:|---:|
-| Normal resend request, 4 to 10 reports | Around 30 minutes | Around 5 minutes |
-| Large recovery involving hundreds of scheduled reports | 1 to 2 days | Under 30 minutes operator handling time |
+The expected benefit is reduced manual coordination and more repeatable dispatch review, not a formally benchmarked performance claim. The tool is intended to make repeated report regeneration easier to plan, review, and follow up through explicit selection state, batch context, and post-dispatch review.
 
 ## 16. Public-safe documentation and security controls
 
@@ -211,25 +192,22 @@ Repository security rules:
 
 | Capability | Demonstrated through |
 |---|---|
-| Splunk administration | Saved-search discovery, dispatch, scheduler/email workflow awareness |
-| SIEM operations | Report regeneration, recovery handling, controlled operator workflow |
-| Python automation | Desktop orchestration tool with dispatch, slicing, verification, and state tracking |
-| Reliability engineering | Timeout handling, bounded reconciliation, retry behavior, and batch status tracking |
-| Security-conscious design | Sanitized config, no exposed internal details, public-safe proof |
-| Operator UX | Multi-app selection, confirmation workflow, progress tracking, acknowledgment summary |
-| API integration | Controlled Splunk Management API calls and request isolation |
+| Python desktop automation | Tkinter workflow for saved-report regeneration |
+| Controlled Splunk API workflow | Saved-search selection, dispatch, status review, and batch context |
+| Selection-state handling | Multi-app selection and confirmation before dispatch |
+| Asynchronous dispatch safety | Timeout handling, bounded reconciliation, and request-level isolation |
+| Public-safe documentation discipline | Sanitized examples, explicit non-goals, and no exposed environment details |
 
 ## 18. Validation status
 
-This documentation page is part of a public-safe documentation update for the Splunk Utility Tool repository.
+This documentation update is documentation-only.
 
-For this documentation-only branch, validation consisted of:
+Validation for this branch should include:
 
-```bash
-git diff --check
-```
+- `git diff --check`
+- Sensitive-value scan of changed documentation files
 
-No source-code or unit-test stabilization changes are included in this branch.
+The broader test-stabilization branch is intentionally tracked separately because it was based on a different source/test baseline from the current public `main` branch. This documentation validation is not equivalent to source-code or unit-test validation.
 
 ## 19. Boundaries and non-goals
 
