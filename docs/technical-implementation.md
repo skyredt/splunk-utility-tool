@@ -81,16 +81,13 @@ In the current engine, the run plan is built before dispatch. Non-custom date mo
 
 ## 7. Bus vs Plane execution model
 
-The tool uses two execution patterns depending on batch size.
+This is an operational design model, not a separate dispatch algorithm. It describes a practical dispatch trade-off between per-report review and batch-style review.
 
-| Batch size | Model | Behavior |
-|---:|---|---|
-| 1 to 7 reports | Plane model | Dispatch one report or slice, check status, then continue |
-| 8 or more reports | Bus model | Dispatch selected reports/slices first, then verify each report or slice afterward |
+For very small selections, the workflow can favor stricter per-report review because the manual overhead is still low. This is the Plane model: each report receives more individual attention before dispatch.
 
-The Plane model is used for smaller resend requests where safety and immediate checking matter more. The Bus model is used for larger batches where waiting after each report would waste operator time. This keeps small batches deliberate and safe, while larger recovery batches avoid unnecessary operator waiting time.
+For larger selections, the workflow favors batch-style execution with consolidated review. This is the Bus model: the operator confirms the full selected set before dispatch, then reviews the combined status afterward.
 
-In code, this is represented by a selected-report-count handling threshold. Larger batches enter the throughput path and log that planned executions are dispatched first, with verification following afterward.
+The purpose of this model is not to skip safety checks. It moves the safety checkpoint to the right level. Small dispatches can be reviewed individually, while larger dispatches are controlled through selection persistence, selected-count visibility, confirmation prompts, and post-dispatch result review.
 
 ## 8. Broker/session/request isolation
 
