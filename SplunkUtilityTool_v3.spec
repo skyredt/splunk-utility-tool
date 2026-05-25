@@ -70,11 +70,16 @@ def _find_vc_runtime_bins():
 
 
 datas = []
+top_level_datas = []
 app_icon = _repo_root() / "assets" / "app_icon.ico"
 if app_icon.exists():
     datas.append((str(app_icon), "assets"))
 else:
     print("Warning: assets/app_icon.ico not found; build will use default icon.")
+for config_template in ("config.ini.example", "config.example.ini"):
+    template_path = _repo_root() / config_template
+    if template_path.exists():
+        top_level_datas.append((config_template, str(template_path), "PKG"))
 
 binaries = _find_vc_runtime_bins()
 if binaries:
@@ -144,6 +149,7 @@ exe = EXE(
 
 coll = COLLECT(
     exe,
+    top_level_datas,
     a.binaries,
     a.datas,
     strip=False,
