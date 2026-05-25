@@ -4,7 +4,7 @@
 
 Splunk Utility Tool 4.0 is a Python/Tkinter desktop operations utility for controlled Splunk saved-report regeneration. It is designed around practical Splunk administration workflows involving saved-search discovery, report selection, time slicing, dispatch, verification, reconciliation, batch tracking, and optional acknowledgment summaries.
 
-Project status: Functional operational utility.
+Project status: Functional public-safe demonstration utility.
 
 The tool runs as a desktop client outside Splunk. It does not replace Splunk's scheduler, does not run inside Splunk Web, and acts as a client-side orchestration layer over Splunk saved-search dispatch workflows. The public repository is sanitized and does not include real production configuration or runtime artifacts.
 
@@ -45,7 +45,7 @@ The tool provides a controlled regeneration workflow for Splunk saved reports. O
 - Reconcile uncertain results where possible.
 - Produce an acknowledgment summary with batch context.
 
-Confirmed implementation themes in the repository include a Tkinter desktop UI, Splunk saved-search dispatch, date/time slicing, slice-by-slice tracking, bounded retry and reconciliation, post-dispatch verification using Splunk-accessible evidence, optional MergeReport-based verification where available, optional acknowledgment email summaries, batch ID tracking, request-level isolation for safer Splunk REST execution, Windows desktop packaging support with PyInstaller, configuration examples using fake Splunk values, and a security-conscious public repo that avoids real config, secrets, logs, hostnames, or production artifacts.
+Confirmed implementation themes in the repository include a Tkinter desktop UI, Splunk saved-search dispatch, date/time slicing, slice-by-slice tracking, bounded retry and reconciliation, post-dispatch verification using Splunk-accessible evidence, optional MergeReport-based verification where available, optional acknowledgment email summaries, batch ID tracking, request-level isolation for bounded Splunk REST handling, Windows desktop packaging support with PyInstaller, configuration examples using fake Splunk values, and a security-conscious public repo that avoids real config, secrets, logs, hostnames, or production artifacts.
 
 ## 4. Operational workflow
 
@@ -85,21 +85,23 @@ Each slice is treated as a trackable execution unit with its own dispatch status
 
 In the current engine, the run plan is built before dispatch. Non-custom date modes create per-report slice executions, while custom datetime mode creates a single custom execution per selected report. The implementation also guards against date ranges that generate no slices or too many slices.
 
+The current implementation caps per-report slicing at 366 execution units. This supports daily slicing workflows, including cases such as one report sliced across 30 daily windows, and covers up to one leap year of daily slices. This cap is a workflow guardrail, not a performance claim.
+
 ## 7. Bus vs Plane execution model
 
 The Bus vs Plane model controls the order of dispatch and verification based on the number of execution units after slicing.
 
-Plane style applies to 7 or fewer execution units. It follows a "check first, then dispatch" pattern: each unit is dispatched and checked before the next unit is dispatched.
+Plane style applies to 7 or fewer execution units. It follows a one-unit-at-a-time pattern: each execution unit is dispatched and verified before the next execution unit is dispatched.
 
-Bus style applies to 8 or more execution units. It follows a "dispatch first, then check" pattern: all execution units are dispatched first, then verification and reconciliation run across the batch afterward.
+Bus style applies to 8 or more execution units. It follows a dispatch-first-then-verify pattern: all execution units are dispatched first, then the recorded batch is verified afterward.
 
 The threshold is based on post-slicing execution count, not raw selected report count. For example, one report sliced into 30 daily windows produces 30 execution units and uses Bus style.
 
 ## 8. Request-level isolation
 
-The dispatch path is documented in terms of request-level isolation: each dispatch request should avoid contaminating subsequent request handling when a timeout or transport failure occurs. This is narrower than claiming full process-wide or authentication-session isolation.
+The dispatch path uses request-level isolation in a bounded sense: a dispatch request that times out or encounters a transport failure should not carry unstable request state into subsequent dispatch-critical REST calls. This does not imply process isolation, per-slice authentication isolation, or a new login for every slice.
 
-Implementation notes: where the public code exposes request-transport behavior, the relevant concern is HTTP session isolation and bounded handling of dispatch-critical REST calls. The documentation does not claim a new authentication login for every slice.
+At the HTTP/request layer, the tool keeps dispatch-critical REST handling bounded so later dispatch work does not rely on an unstable request path from an earlier failed call.
 
 ## 9. Handling uncertainty and reconciliation
 
@@ -202,13 +204,14 @@ Repository security rules:
 
 This implementation update includes source, test, and documentation changes for the Bus vs Plane execution model.
 
-For this documentation update, validation consisted of:
+For this implementation/documentation update, validation included both feature-level source/test checks and documentation public-safety review:
 
-- `python -m py_compile main.py splunk_report_tk.py splunk_engine.py`
-- Focused unit tests for Bus vs Plane execution behavior
-- `git diff --check`
-- Sensitive-value scan of changed documentation files
-- Targeted overclaim scan of changed documentation files
+- source syntax validation (`python -m py_compile main.py splunk_report_tk.py splunk_engine.py`)
+- focused Bus vs Plane feature tests (`python -m unittest test_bus_plane_execution_model -v`)
+- current public test discovery (`python -m unittest discover -v`)
+- patch hygiene (`git diff --check`)
+- public-safety review (sensitive-value scan)
+- documentation review (targeted overclaim scan)
 
 The broader test-stabilization branch is intentionally tracked separately because it was based on a different source/test baseline from the current public `main` branch.
 

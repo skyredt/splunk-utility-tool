@@ -6,24 +6,24 @@ from tkinter import ttk
 
 FONT_FAMILY = "Segoe UI"
 FONT_FAMILY_BOLD = "Segoe UI Semibold"
-WINDOW_BG = "#F3F7F2"
+WINDOW_BG = "#EDF4FC"
 SURFACE_BG = "#FFFFFF"
-SURFACE_ALT_BG = "#FAFCF9"
-BORDER = "#CDD7D0"
-TEXT = "#1E2821"
-TEXT_MUTED = "#607065"
-ACCENT = "#2E7D4A"
-ACCENT_HOVER = "#27653C"
-ACCENT_SOFT = "#DDEEE2"
-DISABLED_BG = "#E8EEE9"
-DISABLED_TEXT = "#95A39A"
-FOCUS = "#8DBB9A"
+SURFACE_ALT_BG = "#F3F8FE"
+BORDER = "#7FA6D6"
+TEXT = "#0B1F33"
+TEXT_MUTED = "#4F6278"
+ACCENT = "#0057B8"
+ACCENT_HOVER = "#003F87"
+ACCENT_SOFT = "#DCEBFF"
+DISABLED_BG = "#D8E3EF"
+DISABLED_TEXT = "#71869C"
+FOCUS = "#006FE6"
 LIST_BG = "#FFFFFF"
-LOG_BG = "#FBFDFC"
-SUCCESS = "#2E7D4A"
-WARNING = "#9A6A0A"
-ERROR = "#B44F4F"
-OVERLAY_BG = "#243127"
+LOG_BG = "#F6FAFF"
+SUCCESS = "#2E7D32"
+WARNING = "#B7791F"
+ERROR = "#C62828"
+OVERLAY_BG = "#0B1F33"
 OVERLAY_ALPHA = 0.16
 
 
@@ -49,7 +49,7 @@ def apply_splunk_light_theme(root: tk.Misc) -> ttk.Style:
     style.configure(".", background=WINDOW_BG, foreground=TEXT, font=_font_spec(FONT_FAMILY, 10))
     style.configure("App.TFrame", background=WINDOW_BG)
     style.configure("TFrame", background=WINDOW_BG)
-    style.configure("Card.TFrame", background=SURFACE_BG, borderwidth=1, relief="solid")
+    style.configure("Card.TFrame", background=SURFACE_BG, borderwidth=1, relief="solid", bordercolor=BORDER)
     style.configure("Dialog.TFrame", background=SURFACE_BG)
     style.configure("CardInset.TFrame", background=SURFACE_ALT_BG)
 
@@ -73,7 +73,7 @@ def apply_splunk_light_theme(root: tk.Misc) -> ttk.Style:
     )
     style.map(
         "TButton",
-        background=[("active", "#EEF4EF"), ("pressed", "#E4ECE6"), ("disabled", DISABLED_BG)],
+        background=[("active", "#E7F1FC"), ("pressed", ACCENT_SOFT), ("disabled", DISABLED_BG)],
         foreground=[("disabled", DISABLED_TEXT)],
         bordercolor=[("focus", FOCUS)],
     )
@@ -89,8 +89,8 @@ def apply_splunk_light_theme(root: tk.Misc) -> ttk.Style:
     )
     style.map(
         "Primary.TButton",
-        background=[("active", ACCENT_HOVER), ("pressed", "#1F5331"), ("disabled", "#A7BAAD")],
-        foreground=[("disabled", "#F4F7F2")],
+        background=[("active", ACCENT_HOVER), ("pressed", "#002F66"), ("disabled", "#9DB2C8")],
+        foreground=[("disabled", "#F5F8FC")],
         bordercolor=[("focus", FOCUS)],
     )
 
@@ -104,7 +104,7 @@ def apply_splunk_light_theme(root: tk.Misc) -> ttk.Style:
         "TCheckbutton",
         foreground=[("disabled", DISABLED_TEXT)],
         indicatorcolor=[("selected", ACCENT), ("!selected", SURFACE_BG)],
-        background=[("active", SURFACE_BG)],
+        background=[("active", ACCENT_SOFT), ("disabled", SURFACE_BG)],
     )
 
     style.configure(
@@ -121,7 +121,7 @@ def apply_splunk_light_theme(root: tk.Misc) -> ttk.Style:
         "TEntry",
         fieldbackground=[("disabled", DISABLED_BG)],
         foreground=[("disabled", DISABLED_TEXT)],
-        bordercolor=[("focus", FOCUS)],
+        bordercolor=[("focus", FOCUS), ("disabled", BORDER)],
         lightcolor=[("focus", FOCUS)],
     )
 
@@ -139,9 +139,10 @@ def apply_splunk_light_theme(root: tk.Misc) -> ttk.Style:
     style.map(
         "TCombobox",
         fieldbackground=[("readonly", SURFACE_BG), ("disabled", DISABLED_BG)],
-        background=[("readonly", SURFACE_BG), ("disabled", DISABLED_BG)],
+        background=[("active", ACCENT_SOFT), ("readonly", SURFACE_BG), ("disabled", DISABLED_BG)],
         foreground=[("disabled", DISABLED_TEXT)],
-        bordercolor=[("focus", FOCUS)],
+        arrowcolor=[("disabled", DISABLED_TEXT), ("active", ACCENT), ("readonly", TEXT_MUTED)],
+        bordercolor=[("focus", FOCUS), ("disabled", BORDER)],
         lightcolor=[("focus", FOCUS)],
         selectbackground=[("readonly", ACCENT)],
         selectforeground=[("readonly", "#FFFFFF")],
@@ -156,12 +157,12 @@ def apply_splunk_light_theme(root: tk.Misc) -> ttk.Style:
     )
     style.map(
         "TScrollbar",
-        background=[("active", "#E2EAE3"), ("pressed", "#D8E2DA")],
+        background=[("active", "#DCEBFA"), ("pressed", "#C8DBF0")],
     )
 
     style.configure(
         "TProgressbar",
-        troughcolor="#E3ECE5",
+        troughcolor=ACCENT_SOFT,
         background=ACCENT,
         bordercolor=BORDER,
         lightcolor=ACCENT,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
+from app_icon import apply_window_icon
 from overlay import create_overlay, remove_overlay
 from ui_theme import SURFACE_BG, style_window
 
@@ -37,6 +38,7 @@ def show_modal_prompt(
     overlay = create_overlay(parent)
     result = {"value": False if kind == "confirm" else None}
     dialog = tk.Toplevel(parent)
+    apply_window_icon(dialog)
     dialog.title(title)
     dialog.transient(parent)
     dialog.resizable(False, False)
@@ -90,6 +92,7 @@ def show_choice_prompt(
     overlay = create_overlay(parent)
     result = {"value": str(default_value or "").strip()}
     dialog = tk.Toplevel(parent)
+    apply_window_icon(dialog)
     dialog.title(title)
     dialog.transient(parent)
     dialog.resizable(False, False)
