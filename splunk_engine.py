@@ -3278,6 +3278,7 @@ class SplunkClient(QObject):
             ids: List[str] = []
             names: List[str] = []
             email_flags: List[bool] = []
+            saved_time_ranges: List[Tuple[str, str]] = []
             for entry in data.get("entry", []):
                 acl = entry.get("acl", {})
                 if acl.get("app") != app:
@@ -3286,6 +3287,12 @@ class SplunkClient(QObject):
                 names.append(entry.get("name", ""))
                 # Detect if the saved search has an email action enabled.
                 content = entry.get("content", {})
+                saved_time_ranges.append(
+                    (
+                        str(content.get("dispatch.earliest_time", "") or "").strip(),
+                        str(content.get("dispatch.latest_time", "") or "").strip(),
+                    )
+                )
                 flag = False
                 # Common Splunk saved search structures may include 'action.email'
                 # or an 'actions' collection indicating enabled actions.
@@ -3315,7 +3322,7 @@ class SplunkClient(QObject):
                 email_flags.append(flag)
             # Keep existing signal for compatibility (two-arg signature).
             self.searches_loaded.emit(ids, names)
-            return ids, names, email_flags
+            return ids, names, email_flags, saved_time_ranges
         except Exception as e:
             self.error.emit(f"Failed to list saved searches for app '{app}': {e!r}")
         finally:
@@ -3838,6 +3845,11 @@ class SplunkClient(QObject):
 def build_slices(start: datetime, end: datetime, frequency: str):
     starts: List[datetime] = []
     ends: List[datetime] = []
+
+    if frequency == "Custom":
+        if end <= start:
+            return starts, ends
+        return [start], [end]
 
     pointer = start
 

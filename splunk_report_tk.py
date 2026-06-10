@@ -5,7 +5,7 @@ import queue
 import re
 import socket
 import sys
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 from typing import Callable, Optional
 
 import tkinter as tk
@@ -68,6 +68,103 @@ from ui_prompt import show_choice_prompt, show_modal_prompt
 
 TOOL_VERSION = "v4"
 _RUNNING_SLICE_RE = re.compile(r"^Running slice (\d+) of (\d+)\.\.\.$")
+
+
+def build_manual_regen_mode_text(
+    *,
+    frequency: str,
+    selected_report_count: int,
+    slice_count: int,
+) -> str:
+    total_runs = selected_report_count * slice_count
+    if frequency == "Custom":
+        return f"custom range, 1 dispatch per selected report ({total_runs} total)"
+    return f"{frequency.lower()} slices: {slice_count} per report ({total_runs} total)"
+
+
+def _parse_epoch_seconds(value: str) -> int | None:
+    text = str(value or "").strip()
+    if not text or not re.fullmatch(r"[+-]?\d+", text):
+        return None
+    try:
+        epoch = int(text)
+        datetime.fromtimestamp(epoch, timezone.utc)
+        return epoch
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _format_epoch_seconds_sgt(epoch_seconds: int) -> str:
+    sgt = timezone(timedelta(hours=8))
+    return datetime.fromtimestamp(epoch_seconds, sgt).strftime("%Y-%m-%d %H:%M:%S SGT")
+
+
+def _format_duration(start_epoch: int, end_epoch: int) -> str:
+    seconds = end_epoch - start_epoch
+    if seconds < 0:
+        return "negative range"
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    parts = []
+    if days:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    if seconds or not parts:
+        parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+    return ", ".join(parts)
+
+
+def _format_saved_search_time_range(earliest: str, latest: str) -> str:
+    safe_earliest = str(earliest or "").strip()
+    safe_latest = str(latest or "").strip()
+    earliest_epoch = _parse_epoch_seconds(safe_earliest)
+    latest_epoch = _parse_epoch_seconds(safe_latest)
+    earliest_display = (
+        _format_epoch_seconds_sgt(earliest_epoch)
+        if earliest_epoch is not None
+        else f"earliest={safe_earliest or '(unset)'}"
+    )
+    latest_display = (
+        _format_epoch_seconds_sgt(latest_epoch)
+        if latest_epoch is not None
+        else f"latest={safe_latest or '(unset)'}"
+    )
+
+    if earliest_epoch is not None or latest_epoch is not None:
+        lines = [
+            f"{earliest_display} to {latest_display}",
+            f"Raw Splunk range: earliest={safe_earliest or '(unset)'}, latest={safe_latest or '(unset)'}",
+        ]
+        if earliest_epoch is not None and latest_epoch is not None:
+            lines.append(f"Duration: {_format_duration(earliest_epoch, latest_epoch)}")
+        else:
+            lines.append("Duration: mixed absolute/relative range, resolved by Splunk at dispatch time")
+        return "\n" + "\n".join(lines)
+
+    return (
+        f"earliest={safe_earliest or '(unset)'}, latest={safe_latest or '(unset)'}\n"
+        "Duration: relative range, resolved by Splunk at dispatch time"
+    )
+
+
+def build_saved_search_time_range_text(saved_ranges: list[tuple[str, str]]) -> str:
+    normalized_ranges = {
+        (str(earliest or "").strip(), str(latest or "").strip())
+        for earliest, latest in saved_ranges
+    }
+    if not normalized_ranges:
+        return "using configured saved-search time range (not overridden)"
+    if len(normalized_ranges) > 1:
+        return "varies by selected report"
+
+    earliest, latest = next(iter(normalized_ranges))
+    if not earliest and not latest:
+        return "using configured saved-search time range (not overridden)"
+    return _format_saved_search_time_range(earliest, latest)
 _RECOVERY_BATCH_RE = re.compile(r"batch_id=([A-Za-z0-9_.:-]+)")
 
 
@@ -241,6 +338,7 @@ class ReportsApp(ttk.Frame):
         self.report_ids: list[str] = []
         self.report_names: list[str] = []
         self.report_email_flags: list[bool] = []
+        self.report_saved_time_ranges: list[tuple[str, str]] = []
         self.filtered_indices: list[int] = []
         self._dispatch_in_progress = False
         self._dispatch_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
@@ -351,11 +449,11 @@ class ReportsApp(ttk.Frame):
         # Frequency
         ttk.Label(right, text="Dispatch Options", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
         ttk.Label(right, text="Frequency:", style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=(0, 4))
-        self.frequency_var = tk.StringVar(value="Daily")
+        self.frequency_var = tk.StringVar(value="Custom")
         self.frequency_combo = ttk.Combobox(
             right,
             textvariable=self.frequency_var,
-            values=["Daily", "Weekly", "Monthly"],
+            values=["Custom", "Daily", "Weekly", "Monthly"],
             state="readonly",
             width=15,
         )
@@ -467,6 +565,7 @@ class ReportsApp(ttk.Frame):
             self.report_ids = []
             self.report_names = []
             self.report_email_flags = []
+            self.report_saved_time_ranges = []
             self.filtered_indices = []
             self.search_var.set("")
 
@@ -812,10 +911,18 @@ class ReportsApp(ttk.Frame):
             return self.client.list_saved_searches(app)
 
         def _on_success(payload: object) -> None:
-            ids, names, email_flags = payload  # type: ignore[misc]
+            if isinstance(payload, tuple) and len(payload) == 4:
+                ids, names, email_flags, saved_time_ranges = payload  # type: ignore[misc]
+            else:
+                ids, names, email_flags = payload  # type: ignore[misc]
+                saved_time_ranges = [("", "") for _ in names]
             self.report_ids = ids
             self.report_names = names
             self.report_email_flags = email_flags
+            self.report_saved_time_ranges = [
+                (str(earliest or "").strip(), str(latest or "").strip())
+                for earliest, latest in saved_time_ranges
+            ]
             self._apply_search_filter()
             self._append_log(f"Loaded {len(names)} report(s).")
 
@@ -829,6 +936,7 @@ class ReportsApp(ttk.Frame):
             self.report_ids = []
             self.report_names = []
             self.report_email_flags = []
+            self.report_saved_time_ranges = []
             self.reports_list.delete(0, "end")
             self.filtered_indices = []
 
@@ -980,6 +1088,7 @@ class ReportsApp(ttk.Frame):
     def _manual_regen_prompt_text(
         self,
         selected_report_names: list[str],
+        range_label: str,
         range_text: str,
         mode_text: str,
     ) -> str:
@@ -988,14 +1097,15 @@ class ReportsApp(ttk.Frame):
         else:
             shown = ", ".join(selected_report_names[:5])
             report_label = f"{shown} (+{len(selected_report_names) - 5} more)"
+        range_separator = "" if str(range_text or "").startswith("\n") else " "
 
         return (
             "This will produce a manually regenerated report run "
             "(different from scheduled automation).\n"
             "An acknowledgement email will be sent only when final status is known, or when pending verification emails are explicitly enabled.\n\n"
             f"Report(s): {report_label}\n"
-            f"Date range: {range_text}\n"
-            f"Slice mode: {mode_text}\n"
+            f"{range_label}:{range_separator}{range_text}\n"
+            f"Dispatch plan: {mode_text}\n"
         )
 
     def on_send_clicked(self) -> None:
@@ -1054,27 +1164,27 @@ class ReportsApp(ttk.Frame):
                 )
                 return
             range_text = f"{start_d.isoformat()} to {end_d.isoformat()}"
-            total_runs = len(starts) * len(selected_indices)
-            mode_text = (
-                f"{frequency.lower()} slices: {len(starts)} per report "
-                f"({total_runs} total)"
+            mode_text = build_manual_regen_mode_text(
+                frequency=frequency,
+                selected_report_count=len(selected_indices),
+                slice_count=len(starts),
             )
+            range_label = "Date range override"
         else:
-            start_d = self._get_date_from_widget(self.start_date_widget)
-            end_d = self._get_date_from_widget(self.end_date_widget)
-            if start_d is not None and end_d is not None:
-                start = datetime(start_d.year, start_d.month, start_d.day)
-                end = datetime(end_d.year, end_d.month, end_d.day)
-                range_text = f"{start_d.isoformat()} to {end_d.isoformat()} (saved search time range in effect)"
-            else:
-                today = date.today()
-                start = datetime(today.year, today.month, today.day)
-                end = start
-                range_text = "saved search time range (no override)"
-            mode_text = f"single run per report ({len(selected_indices)} total)"
+            today = date.today()
+            start = datetime(today.year, today.month, today.day)
+            end = start
+            saved_ranges = [
+                self.report_saved_time_ranges[i] if i < len(self.report_saved_time_ranges) else ("", "")
+                for i in selected_indices
+            ]
+            range_label = "Saved search time range"
+            range_text = build_saved_search_time_range_text(saved_ranges)
+            mode_text = f"single run per selected report using saved-search time range ({len(selected_indices)} total)"
 
         prompt_text = self._manual_regen_prompt_text(
             selected_report_names=selected_report_names,
+            range_label=range_label,
             range_text=range_text,
             mode_text=mode_text,
         )
