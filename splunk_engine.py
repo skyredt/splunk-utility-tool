@@ -283,6 +283,10 @@ def _parse_bool(value: object, default: bool = False) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _splunk_truthy(value: object) -> bool:
+    return _parse_bool(value, False)
+
+
 def _parse_int(value: object, default: int) -> int:
     try:
         return int(str(value).strip())
@@ -3283,10 +3287,12 @@ class SplunkClient(QObject):
                 acl = entry.get("acl", {})
                 if acl.get("app") != app:
                     continue
+                content = entry.get("content", {})
+                if _splunk_truthy(content.get("disabled")):
+                    continue
                 ids.append(entry.get("id", ""))
                 names.append(entry.get("name", ""))
                 # Detect if the saved search has an email action enabled.
-                content = entry.get("content", {})
                 saved_time_ranges.append(
                     (
                         str(content.get("dispatch.earliest_time", "") or "").strip(),
