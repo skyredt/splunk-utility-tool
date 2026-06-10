@@ -960,13 +960,25 @@ class SplunkBrokerProxyClient:
             ids = result.get("ids", [])
             names = result.get("names", [])
             email_flags = result.get("email_flags", [])
-            if not (isinstance(ids, list) and isinstance(names, list) and isinstance(email_flags, list)):
+            saved_time_ranges = result.get("saved_time_ranges", [])
+            if not (
+                isinstance(ids, list)
+                and isinstance(names, list)
+                and isinstance(email_flags, list)
+                and isinstance(saved_time_ranges, list)
+            ):
                 raise RuntimeError("Invalid saved-search payload from local broker.")
             ids_out = [str(x) for x in ids]
             names_out = [str(x) for x in names]
             flags_out = [bool(x) for x in email_flags]
+            ranges_out = []
+            for item in saved_time_ranges:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    ranges_out.append((str(item[0] or "").strip(), str(item[1] or "").strip()))
+                else:
+                    ranges_out.append(("", ""))
             self.searches_loaded.emit(ids_out, names_out)
-            return ids_out, names_out, flags_out
+            return ids_out, names_out, flags_out, ranges_out
         except Exception as exc:
             self.error.emit(f"Failed to list saved searches: {exc!r}")
             raise
@@ -2142,15 +2154,27 @@ class _SplunkBrokerState:
             raise
         finally:
             self._close_operation_client(op_client, client)
-        if not (isinstance(payload, tuple) and len(payload) == 3):
+        if not (isinstance(payload, tuple) and len(payload) in (3, 4)):
             raise _BrokerError(502, "list_saved_searches_failed", "Failed to list saved searches.")
-        ids, names, email_flags = payload
+        if len(payload) == 4:
+            ids, names, email_flags, saved_time_ranges = payload
+        else:
+            ids, names, email_flags = payload
+            saved_time_ranges = []
         if not (isinstance(ids, list) and isinstance(names, list) and isinstance(email_flags, list)):
             raise _BrokerError(502, "list_saved_searches_failed", "Failed to list saved searches.")
+        ranges_out = []
+        if isinstance(saved_time_ranges, list):
+            for item in saved_time_ranges:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    ranges_out.append([str(item[0] or "").strip(), str(item[1] or "").strip()])
+                else:
+                    ranges_out.append(["", ""])
         return {
             "ids": [str(x) for x in ids],
             "names": [str(x) for x in names],
             "email_flags": [bool(x) for x in email_flags],
+            "saved_time_ranges": ranges_out,
         }
 
     def op_dispatch_saved_search(self, args: dict[str, Any]) -> dict[str, Any]:
